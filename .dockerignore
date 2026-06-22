@@ -1,0 +1,15 @@
+.env
+.venv
+__pycache__
+*.pyc
+input
+output
+work
+models
+*.onnx
+*.pt
+*.pth
+*.safetensors
+Dockerfile
+.dockerignore
+.git

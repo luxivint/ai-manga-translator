@@ -1,0 +1,29 @@
+# Byte-compiled / cache
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Secrets - never commit real env values
+.env
+.env.local
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Runtime working directories (created by the worker at runtime)
+work/
+input/
+output/
+
+# Auto-downloaded model weights (fetched on first run via modules/utils/download.py)
+models/
+*.onnx
+*.pt
+*.pth
+*.safetensors
+
+# OS / editor noise
+.DS_Store
+Thumbs.db
