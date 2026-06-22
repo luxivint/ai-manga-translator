@@ -1317,6 +1317,10 @@ def _batch_translate_all(page_results: list, args: argparse.Namespace) -> None:
             resp_data = resp.json()
             from modules.translation.llm.gpt import _log_openai_usage
             _log_openai_usage(model, resp_data.get("usage") or {})
+            usage_dbg_path = os.environ.get("BATCH_TRANSLATE_USAGE_PATH")
+            if usage_dbg_path:
+                with open(usage_dbg_path, "a", encoding="utf-8") as fh:
+                    fh.write(json.dumps(resp_data.get("usage") or {}) + "\n")
             content = resp_data["choices"][0]["message"]["content"] or ""
             m = re.search(r"\{[\s\S]*\}", content)
             if m:

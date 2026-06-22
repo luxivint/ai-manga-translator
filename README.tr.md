@@ -8,6 +8,31 @@ balonları temizle → çevir → çevrilmiş metni render et → sonucu yükle.
 GUI yok, ekransız (offscreen) metin render etmek için gerekenden başka
 masaüstü bağımlılığı yok.
 
+## Hız & maliyet
+
+Bu serinin 67 sayfalık bir bölümünü varsayılan motorlarla (RT-DETR v4-s int8
+detector, Qwen3-VL-Flash Grid OCR, GPT-5.4-mini çeviri), `BATCH_PIPELINE=true`,
+3 paralel worker ile, sıradan bir CPU'da çevirirken ölçülen gerçek sayılar:
+
+| | OCR (Qwen3-VL-Flash) | Çeviri (GPT-5.4-mini) | Toplam |
+|---|---|---|---|
+| Token (giriş / çıkış) | 16.234 / 1.723 | 1.629 / 2.000 | 21.586 |
+| 1M token başına fiyat (giriş / çıkış) | $0.10 / $0.40 | $0.75 / $4.50 | — |
+| **Bu bölümün maliyeti** | $0.0023 | $0.0102 | **~$0.0125** |
+
+Detection ve render lokalde çalışıyor, hiçbir ücreti yok — tek harcama OCR
++ çeviri API çağrıları. Bölüm başına ~$0.0125 ile, **bu büyüklükte 1.000
+bölüm çevirmek API kullanımında toplam ~$12–13** tutuyor. Bu bölümün
+toplam süresi (detect → OCR → temizle → çevir → render → kaydet)
+**~90–115 saniye** oldu.
+
+Kendi sayılarınız sayfa başına diyalog yoğunluğuna ve o anki sağlayıcı
+fiyatlandırmasına göre değişir. Gerçek, çağrı başına token kullanımını bir
+dosyaya dökmek için `QWEN_GRID_OCR_USAGE_PATH` / `BATCH_TRANSLATE_USAGE_PATH`
+ayarlayın (bkz. `.env.example`), kalıcı maliyet takibi için ise
+`LOG_OPENAI_USAGE=true` ve bir `DATABASE_URL` kullanın (bkz.
+[Yapılandırma](#yapılandırma)).
+
 ## Hiç bilgisi olmayanlar için adım adım kurulum
 
 Python projesi çalıştırmayı hiç denemediysen, aşağıdakileri sırasıyla yap.

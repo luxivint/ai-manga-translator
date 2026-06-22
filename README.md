@@ -7,6 +7,31 @@ end: download raw pages → detect text → OCR → clean bubbles → translate 
 render translated text → upload the result. No GUI, no desktop dependencies
 beyond what's needed to render text offscreen.
 
+## Speed & cost
+
+Real numbers from translating a 67-page chapter end to end with the
+default engines (RT-DETR v4-s int8 detector, Qwen3-VL-Flash Grid OCR,
+GPT-5.4-mini translation), `BATCH_PIPELINE=true`, 3 parallel workers on a
+plain CPU machine:
+
+| | OCR (Qwen3-VL-Flash) | Translation (GPT-5.4-mini) | Total |
+|---|---|---|---|
+| Tokens (in / out) | 16,234 / 1,723 | 1,629 / 2,000 | 21,586 |
+| Price per 1M tokens (in / out) | $0.10 / $0.40 | $0.75 / $4.50 | — |
+| **Cost for this chapter** | $0.0023 | $0.0102 | **~$0.0125** |
+
+Detection and rendering run locally and cost nothing — the only spend is
+OCR + translation API calls. At roughly $0.0125/chapter, **1,000 chapters
+of this size cost about $12–13 in API usage**. Total wall-clock time for
+this chapter (detect → OCR → clean → translate → render → save) was
+**~90–115 seconds**.
+
+Your own numbers will vary with dialogue density per page and current
+provider pricing. Set `QWEN_GRID_OCR_USAGE_PATH` / `BATCH_TRANSLATE_USAGE_PATH`
+(see `.env.example`) to dump real per-call token usage to a file, or
+`LOG_OPENAI_USAGE=true` with a `DATABASE_URL` for persistent cost tracking
+(see [Configuration](#configuration)).
+
 ## Absolute beginner walkthrough (no prior knowledge needed)
 
 If you've never run a Python project before, do exactly this, in order.
