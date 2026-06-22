@@ -1306,19 +1306,28 @@ def _batch_translate_all(page_results: list, args: argparse.Namespace) -> None:
                     ],
                     "temperature": 1.0,
                     "top_p": 0.95,
-                    "max_completion_tokens": 16000,
+                    "max_completion_tokens": max(16000, len(batch_keys) * 300),
                 }),
                 timeout=180,
             )
+            if not resp.ok:
+                print(f"  batch {bi+1} translate FAILED: {resp.status_code} {resp.text}", flush=True)
+                continue
             resp.raise_for_status()
             resp_data = resp.json()
             from modules.translation.llm.gpt import _log_openai_usage
             _log_openai_usage(model, resp_data.get("usage") or {})
-            m = re.search(r"\{[\s\S]*\}", resp_data["choices"][0]["message"]["content"])
+            content = resp_data["choices"][0]["message"]["content"] or ""
+            m = re.search(r"\{[\s\S]*\}", content)
             if m:
                 results.update(json.loads(m.group(0)))
             else:
-                print(f"  batch {bi+1}: yanıtta JSON bulunamadı", flush=True)
+                finish_reason = resp_data["choices"][0].get("finish_reason")
+                print(
+                    f"  batch {bi+1}: yanıtta JSON bulunamadı "
+                    f"(finish_reason={finish_reason}, content_len={len(content)})",
+                    flush=True,
+                )
         except Exception as exc:
             print(f"  batch {bi+1} translate FAILED: {exc}", flush=True)
 
@@ -1776,6 +1785,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--r2-delete-input", action=argparse.BooleanOptionalAction, default=os.environ.get("R2_DELETE_RAW_AFTER_TRANSLATE", "true").lower() == "true")
     parser.add_argument("--r2-workdir", default=os.environ.get("R2_WORKDIR", "work/r2"))
     parser.add_argument("--r2-keep-workdir", action="store_true", default=os.environ.get("R2_KEEP_WORKDIR", "false").lower() == "true")
+    parser.add_argument("--zip-output", action=argparse.BooleanOptionalAction, default=os.environ.get("ZIP_OUTPUT", "false").lower() == "true",
+                         help="Zip the output folder into <output>.zip after a local (non-R2) run finishes")
     return parser.parse_args()
 
 
@@ -1855,6 +1866,11 @@ def main() -> int:
             shutil.rmtree(chapter_work, ignore_errors=True)
     elif using_r2 and failed:
         print("R2 upload/delete skipped because translation had failures.", file=sys.stderr, flush=True)
+
+    if not using_r2 and args.zip_output and not failed:
+        zip_base = str(output_dir)
+        zip_path = shutil.make_archive(zip_base, "zip", root_dir=output_dir)
+        print(f"Zipped output -> {zip_path}", flush=True)
 
     app.quit()
     return 1 if failed else 0

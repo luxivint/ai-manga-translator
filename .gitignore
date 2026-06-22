@@ -14,8 +14,13 @@ env/
 
 # Runtime working directories (created by the worker at runtime)
 work/
-input/
-output/
+
+# Local input/output folders - keep the folders, ignore their contents
+input/*
+!input/.gitkeep
+output/*
+!output/.gitkeep
+*.zip
 
 # Auto-downloaded model weights (fetched on first run via modules/utils/download.py)
 models/
