@@ -61,17 +61,9 @@ class DetectionEngineFactory:
 
     @staticmethod
     def _create_rtdetr_v2(settings, backend: str = 'onnx'):
-        """Create and initialize RT-DETR-v2 detection engine."""
         device = resolve_device(settings.is_gpu_enabled(), backend)
-        
-        if backend.lower() == 'torch' and torch_available():
-            from .rtdetr_v2 import RTDetrV2Detection
-            engine = RTDetrV2Detection(settings)
-            engine.initialize(device=device)
-        else:
-            engine = RTDetrV2ONNXDetection(settings)
-            engine.initialize(device=device)
-
+        engine = RTDetrV2ONNXDetection(settings)
+        engine.initialize(device=device)
         return engine
 
     @staticmethod
