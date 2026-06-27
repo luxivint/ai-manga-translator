@@ -326,9 +326,13 @@ def _get_lama():
     return _LAMA
 
 
-def build_segmenter_mask(image: np.ndarray) -> np.ndarray:
+def build_segmenter_mask(image: np.ndarray, blocks=None) -> np.ndarray:
     """Pixel-perfect metin maskesi: YOLOv8 segmentasyonu + balon-içi Otsu (izole
-    işaretleri toplar, balon kenarına değmez) + closing/dilation."""
+    işaretleri toplar, balon kenarına değmez) + closing/dilation.
+
+    blocks verilirse, maske SADECE OCR metni OKUNAN blokların bölgesine
+    sınırlanır. Böylece OCR'ın okuyamadığı SFX / ses efektleri / yalın
+    işaretler (!, ? gibi) temizlenmez, orijinal haliyle bırakılır."""
     h, w = image.shape[:2]
     conf = float(os.environ.get("SEG_CONF", "0.25"))
     close_k = int(os.environ.get("MASK_CLOSE", "13"))
@@ -347,6 +351,24 @@ def build_segmenter_mask(image: np.ndarray) -> np.ndarray:
             seg[sm > 127] = 255
     if seg.sum() == 0:
         return seg
+
+    # Sadece OCR metni okunan blokların bölgesini temizle; okunamayanları (SFX,
+    # işaretler) olduğu gibi bırak.
+    if blocks is not None:
+        pad = int(os.environ.get("CLEAN_TEXT_PAD", "20"))
+        keep = np.zeros((h, w), np.uint8)
+        has_text = False
+        for blk in blocks:
+            if not (getattr(blk, "text", "") or "").strip():
+                continue
+            has_text = True
+            x1, y1, x2, y2 = [int(v) for v in getattr(blk, "xyxy", (0, 0, 0, 0))]
+            keep[max(0, y1 - pad):min(h, y2 + pad), max(0, x1 - pad):min(w, x2 + pad)] = 255
+        if not has_text:
+            return np.zeros((h, w), np.uint8)
+        seg = cv2.bitwise_and(seg, keep)
+        if seg.sum() == 0:
+            return seg
 
     # Her segmenter bileşeninin etrafında, balon kenarına değmeden Otsu ile
     # izole işaretleri (ünlem kuyruğu vb.) topla.
@@ -1243,7 +1265,7 @@ def process_image(path: Path, output_dir: Path, args: argparse.Namespace) -> Pat
 
     print("[3/6] clean: segmenter + block-aware LaMa", flush=True)
     config = Config(hd_strategy="Resize", hd_strategy_resize_limit=2048)
-    mask = build_segmenter_mask(image)
+    mask = build_segmenter_mask(image, blocks)
     if mask.sum() == 0:
         cleaned = image.copy()
     else:
@@ -1450,7 +1472,7 @@ def _stage_clean(task: tuple) -> tuple:
     idx, path, image, blocks, args = task
     config = Config(hd_strategy="Resize", hd_strategy_resize_limit=2048)
 
-    mask = build_segmenter_mask(image)
+    mask = build_segmenter_mask(image, blocks)
     if mask.sum() == 0:
         cleaned = image.copy()
     else:
