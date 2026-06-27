@@ -358,19 +358,26 @@ def build_segmenter_mask(image: np.ndarray, blocks=None) -> np.ndarray:
     # (çevirileri olmadığı için) orijinal kalır.
     if blocks is not None:
         pad = int(os.environ.get("CLEAN_TEXT_PAD", "20"))
+        ad_min_ratio = float(os.environ.get("AD_MIN_AREA_RATIO", "0.015"))
+        page_area = h * w
         keep = np.zeros((h, w), np.uint8)
         has_target = False
         for blk in blocks:
-            tr = (getattr(blk, "translation", "") or "").strip()
-            txt = (getattr(blk, "text", "") or "").strip()
-            # Çeviri varsa render kriterini (len>1) uygula; çeviri henüz
-            # yapılmadıysa (non-batch yolunda clean translate'den önce) OCR
-            # metnine düş.
-            render_ok = (len(tr) > 1) if tr else bool(txt)
-            if not render_ok:
+            x1, y1, x2, y2 = [int(v) for v in getattr(blk, "xyxy", (0, 0, 0, 0))]
+            if getattr(blk, "is_ad", False):
+                # Reklam: SADECE yeterince büyükse temizle. Küçük köşe
+                # watermark'larına (alan eşiğinin altında) dokunma.
+                area = max(0, x2 - x1) * max(0, y2 - y1)
+                clean_it = area >= page_area * ad_min_ratio
+            else:
+                # Normal blok: render kriteriyle aynı (çeviri varsa len>1, yoksa
+                # OCR metnine düş).
+                tr = (getattr(blk, "translation", "") or "").strip()
+                txt = (getattr(blk, "text", "") or "").strip()
+                clean_it = (len(tr) > 1) if tr else bool(txt)
+            if not clean_it:
                 continue
             has_target = True
-            x1, y1, x2, y2 = [int(v) for v in getattr(blk, "xyxy", (0, 0, 0, 0))]
             keep[max(0, y1 - pad):min(h, y2 + pad), max(0, x1 - pad):min(w, x2 + pad)] = 255
         if not has_target:
             return np.zeros((h, w), np.uint8)
@@ -1403,6 +1410,7 @@ def _batch_translate_all(page_results: list, args: argparse.Namespace) -> None:
 
     api_key = os.environ.get("OPENAI_API_KEY", "")
     model = MODEL_MAP.get(args.translator, "gpt-5.4-mini")
+    own_brand = os.environ.get("SEO_SITE_NAME", "TrendManga")
     system_prompt = (
         f"You are an expert translator who translates {args.source_lang} to {args.target_lang}. "
         f"You pay attention to style, formality, idioms, slang etc and try to convey it in the way "
@@ -1410,7 +1418,13 @@ def _batch_translate_all(page_results: list, args: argparse.Namespace) -> None:
         f"BE MORE NATURAL. NEVER USE 당신, 그녀, 그 or its Japanese equivalents.\n"
         f"You will translate text OCR'd from a comic. The OCR is not always perfect.\n"
         f"Return only the JSON with translated values. Do NOT translate the keys. "
-        f"If a block is already in {args.target_lang} or looks like gibberish, output it as-is."
+        f"If a block is already in {args.target_lang} or looks like gibberish, output it as-is.\n"
+        f"AD DETECTION: If a block is NOT part of the comic's story but a "
+        f"scanlation/fansub group's advertisement or promo — links to their site, "
+        f"Discord invites, 'read at X.com', 'premium/advance chapters', 'join us', "
+        f"'support us', QR/scan prompts, watermark site names, etc. — do NOT translate "
+        f"it. Output exactly the string \"[[AD]]\" as that block's value. "
+        f"'{own_brand}' is our OWN brand; never mark our own brand as an ad."
     )
 
     batch_size = int(os.environ.get("BATCH_TRANSLATE_SIZE", "400"))
@@ -1471,7 +1485,12 @@ def _batch_translate_all(page_results: list, args: argparse.Namespace) -> None:
     for pi, (_path, _img, blocks) in enumerate(page_results):
         for bi, blk in enumerate(blocks):
             val = results.get(f"p{pi}_b{bi}")
-            if val is not None:
+            if val is None:
+                continue
+            if isinstance(val, str) and "[[AD]]" in val.upper().replace(" ", ""):
+                blk.is_ad = True
+                blk.translation = ""  # reklam: çevirme/yazma
+            else:
                 blk.translation = val
 
 
@@ -1767,8 +1786,16 @@ def process_all_batched(images: list[Path], output_dir: Path, args: argparse.Nam
     print(f"[BATCH] clean bitti: {time.perf_counter()-t3:.1f}s", flush=True)
 
     # ── Faz 3b: Sequential render + save (Qt main thread) ───────────────────
+    skip_full_ad = os.environ.get("SKIP_FULL_AD_PAGES", "true").lower() == "true"
     failed = 0
     for idx, path, image, blocks, cleaned in clean_results:
+        # Tam reklam sayfası: metinli bloklar var ama HEPSİ reklam (gerçek
+        # diyalog yok) -> sayfayı tamamen atla (Discord/QR/WARNING sayfaları).
+        if skip_full_ad:
+            text_blocks = [b for b in blocks if (getattr(b, "text", "") or "").strip()]
+            if text_blocks and all(getattr(b, "is_ad", False) for b in text_blocks):
+                print(f"  [{idx+1}/{len(pending)}] tam reklam sayfası, atlandı: {path.name}", flush=True)
+                continue
         os.environ["TRANSLATION_SOURCE_FILE"] = path.name
         for attempt in range(1, max_retries + 1):
             try:
