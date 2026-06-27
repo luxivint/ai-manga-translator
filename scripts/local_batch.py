@@ -1407,12 +1407,14 @@ _AD_URL_RE = re.compile(
 )
 
 _AD_VISION_PROMPT = (
-    "You are looking at one page from a comic/webtoon chapter. Is this page "
-    "ENTIRELY a scanlation/fansub group's advertisement or promo (e.g. a QR "
-    "code, site links, Discord invite, 'read premium/advance chapters at ...', "
-    "a grid/collage of other series covers, a 'WARNING read only at ...' notice) "
-    "rather than actual comic story art? Answer with ONLY one word: YES if the "
-    "page is purely such an ad/promo, NO if it contains real comic story content."
+    "You are looking at one page from a comic/webtoon chapter. Answer YES ONLY "
+    "if the ENTIRE page is a scanlation/fansub advertisement with NO real comic "
+    "artwork at all — e.g. a page that is only a QR code, site links, a Discord "
+    "invite, a grid/collage of other series' cover thumbnails, or a 'WARNING "
+    "read only at ...' notice. Answer NO if the page contains ANY real comic "
+    "panel, character, scene or story art — EVEN IF there is an ad banner, logo "
+    "or site name at the very top or bottom. When unsure, answer NO. "
+    "Reply with ONLY one word: YES or NO."
 )
 
 
@@ -1894,9 +1896,16 @@ def process_all_batched(images: list[Path], output_dir: Path, args: argparse.Nam
     for idx, path, image, blocks, cleaned in clean_results:
         # GPT-Vision baştan sona reklam dedi -> sayfayı tamamen atla (görsel
         # reklamlar: QR/kapak kolajı, detection/OCR'ın göremediği sayfalar).
+        # Ek güvenlik: sayfada gerçek (reklam-olmayan) diyalog OCR edildiyse,
+        # bu yarı-reklam/içerik sayfasıdır -> kesme (vision yanlış pozitifi).
         if idx in vision_ad_pages:
-            print(f"  [{idx+1}/{len(pending)}] görsel reklam sayfası (vision), atlandı: {path.name}", flush=True)
-            continue
+            real_dialog = [b for b in blocks
+                           if (getattr(b, "text", "") or "").strip() and not getattr(b, "is_ad", False)]
+            if real_dialog:
+                print(f"  [{idx+1}/{len(pending)}] vision reklam dedi ama gerçek diyalog var, kesilmiyor: {path.name}", flush=True)
+            else:
+                print(f"  [{idx+1}/{len(pending)}] görsel reklam sayfası (vision), atlandı: {path.name}", flush=True)
+                continue
         # Tam reklam sayfası: metinli bloklar var ama HEPSİ reklam (gerçek
         # diyalog yok) -> sayfayı tamamen atla (Discord/QR/WARNING sayfaları).
         if skip_full_ad:
