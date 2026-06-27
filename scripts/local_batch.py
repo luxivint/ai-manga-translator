@@ -1381,10 +1381,20 @@ def process_image(path: Path, output_dir: Path, args: argparse.Namespace) -> Pat
 
 def _stage_detect_ocr(task: tuple) -> tuple:
     """Phase-1 worker: detect + OCR for one page (thread-safe, fresh instances per call)."""
-    idx, path, args = task
+    idx, path, args, crop = task
     settings = LocalSettings(args)
     main = LocalMain(settings, args.source_lang, args.target_lang)
     image = imk.read_image(str(path))
+    # GPT-Vision reklam bölgesi: görseli en başta kırp (üstten top%, alttan
+    # bottom%). Geri kalan tüm pipeline kırpılmış görselde tutarlı çalışır.
+    if crop:
+        top, bottom = crop
+        h = image.shape[0]
+        y1 = int(h * top / 100)
+        y2 = int(h * (100 - bottom) / 100)
+        if y2 - y1 >= h * 0.08:  # en az %8 gerçek içerik kalıyorsa kırp
+            image = image[y1:y2].copy()
+            print(f"  [vision-crop] [{idx+1}] {path.name}: üst%={top} alt%={bottom} kırpıldı", flush=True)
     blocks = TextBlockDetector(settings).detect(image)
     if blocks:
         ocr = OCRProcessor()
@@ -1407,35 +1417,41 @@ _AD_URL_RE = re.compile(
 )
 
 _AD_VISION_PROMPT = (
-    "You are looking at one page from a comic/webtoon chapter. Answer YES ONLY "
-    "if the ENTIRE page is a scanlation/fansub advertisement with NO real comic "
-    "artwork at all — e.g. a page that is only a QR code, site links, a Discord "
-    "invite, a grid/collage of other series' cover thumbnails, or a 'WARNING "
-    "read only at ...' notice. Answer NO if the page contains ANY real comic "
-    "panel, character, scene or story art — EVEN IF there is an ad banner, logo "
-    "or site name at the very top or bottom. When unsure, answer NO. "
-    "Reply with ONLY one word: YES or NO."
+    "You are viewing one page of a comic/webtoon chapter. Scanlation/fansub PROMO "
+    "content (QR codes, the group's website/domain, Discord invites, 'read/premium/"
+    "advance chapters at ...', a grid/collage of OTHER series' cover thumbnails, "
+    "'WARNING read only at ...') almost always sits at the very TOP or very BOTTOM "
+    "of the page, with the real comic art in between. "
+    "Respond with STRICT JSON ONLY: {\"top\": T, \"bottom\": B} where T is the "
+    "percent (0-100) of the page HEIGHT, measured from the TOP edge, that is promo, "
+    "and B is the percent from the BOTTOM edge that is promo. Use 0 for a side with "
+    "no promo. If the WHOLE page is promo use {\"top\":100,\"bottom\":0}. If there "
+    "is no promo at all use {\"top\":0,\"bottom\":0}. Only count clear fansub promo; "
+    "NEVER count real story panels, characters, speech bubbles, or the comic's own "
+    "author/credit text."
 )
 
 
-def detect_full_ad_pages(pending: list, args: argparse.Namespace) -> set:
-    """İlk N + son N sayfayı GPT-Vision'a sorarak baştan sona reklam olan
-    sayfaları bul. Detection/OCR'dan bağımsız (görsel reklamları da yakalar).
+def detect_ad_regions(pending: list, args: argparse.Namespace) -> dict:
+    """İlk N + son N sayfayı GPT-Vision'a sorarak reklam BÖLGELERİNİ bul.
+    Detection/OCR'dan bağımsız (görsel reklamları da yakalar). Her sayfa için
+    (top%, bottom%) döndürür: üstten/alttan ne kadarının reklam olduğu. Böylece
+    reklam üstte de altta da olsa sadece o bölge kırpılır, ortadaki içerik kalır.
     Her çağrının token kullanımı loglanır (maliyet ölçümü)."""
     if os.environ.get("AD_VISION_ENABLED", "true").lower() != "true":
-        return set()
+        return {}
     api_key = os.environ.get("OPENAI_API_KEY", "")
     if not api_key:
-        return set()
+        return {}
     edge = int(os.environ.get("AD_VISION_EDGE_PAGES", "3"))
     n = len(pending)
     if n == 0 or edge <= 0:
-        return set()
+        return {}
     idxs = sorted(set(range(min(edge, n))) | set(range(max(0, n - edge), n)))
     model = os.environ.get("OPENAI_MODEL", "gpt-5.4-mini")
     from modules.translation.llm.gpt import _log_openai_usage
 
-    ad_pages: set = set()
+    regions: dict = {}
     tot_in = tot_out = 0
     for i in idxs:
         path = pending[i]
@@ -1459,7 +1475,7 @@ def detect_full_ad_pages(pending: list, args: argparse.Namespace) -> set:
                                 "url": f"data:image/jpeg;base64,{b64}", "detail": "low"}},
                         ],
                     }],
-                    "max_completion_tokens": 4,
+                    "max_completion_tokens": 24,
                     "temperature": 0,
                 }),
                 timeout=60,
@@ -1472,21 +1488,28 @@ def detect_full_ad_pages(pending: list, args: argparse.Namespace) -> set:
             tot_in += int(usage.get("prompt_tokens", 0) or 0)
             tot_out += int(usage.get("completion_tokens", 0) or 0)
             _log_openai_usage(model, usage)
-            ans = (data["choices"][0]["message"]["content"] or "").strip().upper()
-            is_ad = ans.startswith("Y")
-            if is_ad:
-                ad_pages.add(i)
-            print(f"  [vision] sayfa {i+1}: reklam={'EVET' if is_ad else 'hayır'} "
+            content = (data["choices"][0]["message"]["content"] or "")
+            top = bottom = 0
+            m = re.search(r"\{[^}]*\}", content)
+            if m:
+                try:
+                    d = json.loads(m.group(0))
+                    top = max(0, min(100, int(d.get("top", 0))))
+                    bottom = max(0, min(100, int(d.get("bottom", 0))))
+                except Exception:
+                    pass
+            if top > 0 or bottom > 0:
+                regions[i] = (top, bottom)
+            print(f"  [vision] sayfa {i+1}: üst%={top} alt%={bottom} "
                   f"(tok in/out {usage.get('prompt_tokens')}/{usage.get('completion_tokens')})", flush=True)
         except Exception as exc:
             print(f"  [vision] sayfa {i+1} hata: {exc}", flush=True)
-    # Maliyet özeti
     in_price = float(os.environ.get("OPENAI_INPUT_PRICE_PER_1M", "0.75") or "0.75")
     out_price = float(os.environ.get("OPENAI_OUTPUT_PRICE_PER_1M", "4.50") or "4.50")
     cost = tot_in / 1e6 * in_price + tot_out / 1e6 * out_price
-    print(f"  [vision] {len(idxs)} sayfa tarandı, {len(ad_pages)} reklam; "
+    print(f"  [vision] {len(idxs)} sayfa tarandı, {len(regions)} reklam bölgesi; "
           f"toplam tok {tot_in}+{tot_out}, ~${cost:.5f}", flush=True)
-    return ad_pages
+    return regions
 
 
 def _batch_translate_all(page_results: list, args: argparse.Namespace) -> None:
@@ -1855,15 +1878,21 @@ def process_all_batched(images: list[Path], output_dir: Path, args: argparse.Nam
     except Exception as _warmup_exc:
         print(f"[BATCH] Warm-up uyarı: {_warmup_exc}", flush=True)
 
-    # ── GPT-Vision: ilk/son N sayfada baştan sona reklam olanları bul ────────
-    vision_ad_pages = detect_full_ad_pages(pending, args)
+    # ── GPT-Vision: ilk/son N sayfada reklam bölgelerini bul (üst%/alt%) ─────
+    ad_regions = detect_ad_regions(pending, args)
+    # Kırpınca %8'den az içerik kalan sayfalar tam reklam -> tamamen atla.
+    vision_ad_pages = {i for i, (t, b) in ad_regions.items() if (100 - t - b) < 8}
 
-    # ── Faz 1: Parallel detect + OCR ────────────────────────────────────────
+    # ── Faz 1: Parallel detect + OCR (reklam bölgesi kırpılmış görselde) ─────
     w1 = _dynamic_workers(base_workers)
     print(f"\n[BATCH] Faz 1/3  detect+ocr  {len(pending)} sayfa  {w1} worker", flush=True)
     t1 = time.perf_counter()
     with ThreadPoolExecutor(max_workers=w1) as pool:
-        phase1 = list(pool.map(_stage_detect_ocr, [(i, p, args) for i, p in enumerate(pending)]))
+        phase1 = list(pool.map(
+            _stage_detect_ocr,
+            [(i, p, args, None if i in vision_ad_pages else ad_regions.get(i))
+             for i, p in enumerate(pending)],
+        ))
     page_results = [(r[1], r[2], r[3]) for r in phase1]
     n_blk = sum(len(bl) for _, _, bl in page_results)
     print(f"[BATCH] Faz 1 bitti: {time.perf_counter()-t1:.1f}s  toplam {n_blk} blok", flush=True)
@@ -1894,18 +1923,12 @@ def process_all_batched(images: list[Path], output_dir: Path, args: argparse.Nam
     skip_full_ad = os.environ.get("SKIP_FULL_AD_PAGES", "true").lower() == "true"
     failed = 0
     for idx, path, image, blocks, cleaned in clean_results:
-        # GPT-Vision baştan sona reklam dedi -> sayfayı tamamen atla (görsel
-        # reklamlar: QR/kapak kolajı, detection/OCR'ın göremediği sayfalar).
-        # Ek güvenlik: sayfada gerçek (reklam-olmayan) diyalog OCR edildiyse,
-        # bu yarı-reklam/içerik sayfasıdır -> kesme (vision yanlış pozitifi).
+        # GPT-Vision baştan sona reklam dedi (kırpınca içerik kalmıyor) -> atla.
+        # Yarı-reklam sayfalarda zaten reklam bölgesi Faz1'de kırpıldı; bu liste
+        # yalnızca tamamen reklam olan sayfaları içerir.
         if idx in vision_ad_pages:
-            real_dialog = [b for b in blocks
-                           if (getattr(b, "text", "") or "").strip() and not getattr(b, "is_ad", False)]
-            if real_dialog:
-                print(f"  [{idx+1}/{len(pending)}] vision reklam dedi ama gerçek diyalog var, kesilmiyor: {path.name}", flush=True)
-            else:
-                print(f"  [{idx+1}/{len(pending)}] görsel reklam sayfası (vision), atlandı: {path.name}", flush=True)
-                continue
+            print(f"  [{idx+1}/{len(pending)}] görsel reklam sayfası (vision), atlandı: {path.name}", flush=True)
+            continue
         # Tam reklam sayfası: metinli bloklar var ama HEPSİ reklam (gerçek
         # diyalog yok) -> sayfayı tamamen atla (Discord/QR/WARNING sayfaları).
         if skip_full_ad:
