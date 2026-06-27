@@ -1399,6 +1399,14 @@ def _stage_detect_ocr(task: tuple) -> tuple:
     return idx, path, image, blocks
 
 
+# Açık domain / URL / davet bağlantısı tespiti (reklam güvenlik ağı).
+_AD_URL_RE = re.compile(
+    r"(?:https?://|www\.|discord\.gg/|t\.me/|"
+    r"\b[a-z0-9][a-z0-9-]+\.(?:com|net|org|gg|io|co|me|xyz|info|app|club|site|online)\b)",
+    re.IGNORECASE,
+)
+
+
 def _batch_translate_all(page_results: list, args: argparse.Namespace) -> None:
     """Phase-2: translate all pages together in as few GPT requests as possible."""
     combined: dict[str, str] = {}
@@ -1419,11 +1427,15 @@ def _batch_translate_all(page_results: list, args: argparse.Namespace) -> None:
         f"You will translate text OCR'd from a comic. The OCR is not always perfect.\n"
         f"Return only the JSON with translated values. Do NOT translate the keys. "
         f"If a block is already in {args.target_lang} or looks like gibberish, output it as-is.\n"
-        f"AD DETECTION: If a block is NOT part of the comic's story but a "
-        f"scanlation/fansub group's advertisement or promo — links to their site, "
-        f"Discord invites, 'read at X.com', 'premium/advance chapters', 'join us', "
-        f"'support us', QR/scan prompts, watermark site names, etc. — do NOT translate "
-        f"it. Output exactly the string \"[[AD]]\" as that block's value. "
+        f"AD DETECTION: Mark scanlation/fansub promo blocks as ads — do NOT "
+        f"translate them; output exactly the string \"[[AD]]\" as that block's "
+        f"value. A block is an AD if it contains ANY of: a website/domain name "
+        f"(e.g. something.com / .net / .org / .gg), a URL or invite/link code "
+        f"(discord.gg/xxx, /AbCdEf123), a QR/scan instruction, or it pitches "
+        f"reading chapters elsewhere ('read/continue at...', 'premium/advance "
+        f"chapters', 'more at our site', 'join/support us'). THIS APPLIES EVEN IF "
+        f"the text is phrased like in-story dialogue — real comic dialogue NEVER "
+        f"contains real-world website domains or invite links. "
         f"'{own_brand}' is our OWN brand; never mark our own brand as an ad."
     )
 
@@ -1482,12 +1494,20 @@ def _batch_translate_all(page_results: list, args: argparse.Namespace) -> None:
         except Exception as exc:
             print(f"  batch {bi+1} translate FAILED: {exc}", flush=True)
 
+    # Güvenlik ağı: GPT bir reklamı kaçırsa bile, blok metninde açık bir
+    # domain / URL / davet kodu varsa reklam say (kendi markamız hariç).
+    # Gerçek çizgi roman diyaloğunda gerçek site adresleri geçmez.
+    own_key = os.environ.get("SEO_IMAGE_BRAND", os.environ.get("SEO_SITE_NAME", "trendmanga")).lower()
     for pi, (_path, _img, blocks) in enumerate(page_results):
         for bi, blk in enumerate(blocks):
             val = results.get(f"p{pi}_b{bi}")
             if val is None:
                 continue
-            if isinstance(val, str) and "[[AD]]" in val.upper().replace(" ", ""):
+            src_text = (getattr(blk, "text", "") or "")
+            looks_ad = isinstance(val, str) and "[[AD]]" in val.upper().replace(" ", "")
+            if not looks_ad and own_key not in src_text.lower() and _AD_URL_RE.search(src_text):
+                looks_ad = True
+            if looks_ad:
                 blk.is_ad = True
                 blk.translation = ""  # reklam: çevirme/yazma
             else:
