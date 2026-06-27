@@ -352,19 +352,27 @@ def build_segmenter_mask(image: np.ndarray, blocks=None) -> np.ndarray:
     if seg.sum() == 0:
         return seg
 
-    # Sadece OCR metni okunan blokların bölgesini temizle; okunamayanları (SFX,
-    # işaretler) olduğu gibi bırak.
+    # Temizleme kriteri = render kriteri: SADECE yazısı basılacak (çevirisi olan)
+    # blokların bölgesini temizle. Çevirisi olmayan balon hiç dokunulmaz ->
+    # "temizlenmiş ama boş" balon oluşamaz. Okunamayan SFX / işaretler de
+    # (çevirileri olmadığı için) orijinal kalır.
     if blocks is not None:
         pad = int(os.environ.get("CLEAN_TEXT_PAD", "20"))
         keep = np.zeros((h, w), np.uint8)
-        has_text = False
+        has_target = False
         for blk in blocks:
-            if not (getattr(blk, "text", "") or "").strip():
+            tr = (getattr(blk, "translation", "") or "").strip()
+            txt = (getattr(blk, "text", "") or "").strip()
+            # Çeviri varsa render kriterini (len>1) uygula; çeviri henüz
+            # yapılmadıysa (non-batch yolunda clean translate'den önce) OCR
+            # metnine düş.
+            render_ok = (len(tr) > 1) if tr else bool(txt)
+            if not render_ok:
                 continue
-            has_text = True
+            has_target = True
             x1, y1, x2, y2 = [int(v) for v in getattr(blk, "xyxy", (0, 0, 0, 0))]
             keep[max(0, y1 - pad):min(h, y2 + pad), max(0, x1 - pad):min(w, x2 + pad)] = 255
-        if not has_text:
+        if not has_target:
             return np.zeros((h, w), np.uint8)
         seg = cv2.bitwise_and(seg, keep)
         if seg.sum() == 0:
