@@ -295,7 +295,13 @@ _MODEL_LOCK = threading.Lock()
 
 
 def _get_segmenter():
-    """ogkalu comic-text-segmenter (YOLOv8) — pixel-level metin maskesi. Thread-safe lazy init."""
+    """ogkalu comic-text-segmenter (YOLOv8) — pixel-level metin maskesi. Thread-safe lazy init.
+
+    Önemli: YOLO modeli ilk inference'da kendini fuse eder (Conv+BN birleştirip
+    'bn' attribute'unu siler). Birden fazla worker thread aynı anda ilk kez
+    çağırırsa fuse race oluşur ("'Conv' object has no attribute 'bn'"). Bunu
+    önlemek için modeli lock İÇİNDE bir kez ısıtıp fuse'u tetikliyoruz ve
+    _SEGMENTER'ı ancak ondan SONRA set ediyoruz."""
     global _SEGMENTER
     if _SEGMENTER is None:
         with _MODEL_LOCK:
@@ -304,7 +310,10 @@ def _get_segmenter():
                 from modules.utils.download import ModelDownloader, ModelID
                 ModelDownloader.get(ModelID.COMIC_TEXT_SEGMENTER)
                 path = ModelDownloader.primary_path(ModelID.COMIC_TEXT_SEGMENTER)
-                _SEGMENTER = YOLO(str(path))
+                model = YOLO(str(path))
+                # Warm-up: fuse'u tek thread'de tetikle (paralel kullanım öncesi)
+                model.predict(np.zeros((640, 640, 3), np.uint8), verbose=False, imgsz=640)
+                _SEGMENTER = model
     return _SEGMENTER
 
 
