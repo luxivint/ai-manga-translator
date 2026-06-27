@@ -56,6 +56,12 @@ class ModelID(Enum):
     RTDETR_V2_ONNX = "rtdetr-v2-onnx"
     RTDETR_V4S_INT8_ONNX = "rtdetr-v4s-int8-onnx"
 
+    # Inpainting (ONNX)
+    LAMA_ONNX = "lama-manga-dynamic"
+
+    # Text segmentation (YOLOv8, pixel-level mask)
+    COMIC_TEXT_SEGMENTER = "comic-text-segmenter"
+
     # PPOCRv5 Detection Models
     PPOCR_V5_DET_MOBILE = "ppocr-v5-det-mobile"
     PPOCR_V5_DET_SERVER = "ppocr-v5-det-server"
@@ -379,6 +385,24 @@ def _register_defaults():
         files=['detector-v4-s_int8.onnx'],
         sha256=['5fe9e4f576e49d4e7e8b0e029d6d3cdc252abd4694113e1cae120e62c931ea79'],
         save_dir=os.path.join(models_base_dir, 'detection')
+    ))
+
+    # Inpainting: LaMa ONNX (anime/manga, dynamic)
+    ModelDownloader.register(ModelSpec(
+        id=ModelID.LAMA_ONNX,
+        url='https://huggingface.co/ogkalu/lama-manga-onnx-dynamic/resolve/main/',
+        files=['lama-manga-dynamic.onnx'],
+        sha256=['de31ffa5ba26916b8ea35319f6c12151ff9654d4261bccf0583a69bb095315f9'],
+        save_dir=os.path.join(models_base_dir, 'inpainting')
+    ))
+
+    # Text segmentation: comic-text-segmenter (YOLOv8, pixel-level text mask)
+    ModelDownloader.register(ModelSpec(
+        id=ModelID.COMIC_TEXT_SEGMENTER,
+        url='https://huggingface.co/ogkalu/comic-text-segmenter-yolov8m/resolve/main/',
+        files=['comic-text-segmenter.pt'],
+        sha256=[None],
+        save_dir=os.path.join(models_base_dir, 'segmentation')
     ))
 
     # PPOCRv5 Detection Models

@@ -9,6 +9,7 @@ import re
 import requests
 import shutil
 import sys
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
@@ -35,7 +36,7 @@ from app.ui.canvas.text.text_item_properties import TextItemProperties
 from app.ui.canvas.text_item import OutlineInfo, OutlineType
 from modules.detection.processor import TextBlockDetector
 from modules.inpainting.schema import Config
-from modules.inpainting.smart_cv2 import SmartCV2
+from modules.inpainting.lama import LaMa
 from modules.ocr.processor import OCRProcessor
 from modules.rendering.render import get_best_render_area, is_vertical_block, pyside_word_wrap
 from modules.translation.processor import Translator
@@ -285,10 +286,111 @@ class LocalMain:
         )
 
 
-def make_inpainter(name: str, device: str):
-    if name == "SmartCV2":
-        return SmartCV2(device=device)
-    raise ValueError(f"Unsupported inpainter: {name}")
+# ─────────────────────────────────────────────────────────────────────────────
+# Temizleme reçetesi: YOLOv8 metin segmentasyonu + balon-içi Otsu + block-aware LaMa
+# ─────────────────────────────────────────────────────────────────────────────
+_SEGMENTER = None
+_LAMA = None
+_MODEL_LOCK = threading.Lock()
+
+
+def _get_segmenter():
+    """ogkalu comic-text-segmenter (YOLOv8) — pixel-level metin maskesi. Thread-safe lazy init."""
+    global _SEGMENTER
+    if _SEGMENTER is None:
+        with _MODEL_LOCK:
+            if _SEGMENTER is None:
+                from ultralytics import YOLO
+                from modules.utils.download import ModelDownloader, ModelID
+                ModelDownloader.get(ModelID.COMIC_TEXT_SEGMENTER)
+                path = ModelDownloader.primary_path(ModelID.COMIC_TEXT_SEGMENTER)
+                _SEGMENTER = YOLO(str(path))
+    return _SEGMENTER
+
+
+def _get_lama():
+    global _LAMA
+    if _LAMA is None:
+        with _MODEL_LOCK:
+            if _LAMA is None:
+                _LAMA = LaMa(device="cpu", backend="onnx")
+    return _LAMA
+
+
+def build_segmenter_mask(image: np.ndarray) -> np.ndarray:
+    """Pixel-perfect metin maskesi: YOLOv8 segmentasyonu + balon-içi Otsu (izole
+    işaretleri toplar, balon kenarına değmez) + closing/dilation."""
+    h, w = image.shape[:2]
+    conf = float(os.environ.get("SEG_CONF", "0.25"))
+    close_k = int(os.environ.get("MASK_CLOSE", "13"))
+    dilate_k = int(os.environ.get("MASK_DILATE", "13"))
+
+    segmenter = _get_segmenter()
+    res = segmenter.predict(image[..., ::-1], conf=conf, verbose=False, imgsz=1024)
+    seg = np.zeros((h, w), np.uint8)
+    for r in res:
+        if r.masks is None:
+            continue
+        for s in r.masks.data:
+            sm = s.cpu().numpy().astype(np.uint8) * 255
+            if sm.shape[:2] != (h, w):
+                sm = cv2.resize(sm, (w, h), interpolation=cv2.INTER_NEAREST)
+            seg[sm > 127] = 255
+    if seg.sum() == 0:
+        return seg
+
+    # Her segmenter bileşeninin etrafında, balon kenarına değmeden Otsu ile
+    # izole işaretleri (ünlem kuyruğu vb.) topla.
+    otsu_full = np.zeros((h, w), np.uint8)
+    n, labels = cv2.connectedComponents(seg)
+    for lbl in range(1, n):
+        ys, xs = np.where(labels == lbl)
+        y1, y2, x1, x2 = ys.min(), ys.max(), xs.min(), xs.max()
+        ey, ex = int((y2 - y1) * 0.12), int((x2 - x1) * 0.06)
+        by1, bx1 = max(0, y1 - ey), max(0, x1 - ex)
+        by2, bx2 = min(h, y2 + ey), min(w, x2 + ex)
+        roi = image[by1:by2, bx1:bx2]
+        if roi.size == 0:
+            continue
+        gray = cv2.cvtColor(roi, cv2.COLOR_RGB2GRAY)
+        _, dark = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+        nn, lab2, st, _ = cv2.connectedComponentsWithStats(dark, connectivity=8)
+        roi_area = roi.shape[0] * roi.shape[1]
+        for i in range(1, nn):
+            a = st[i, cv2.CC_STAT_AREA]
+            if 8 <= a <= roi_area * 0.5:  # çok büyük (kenar sızması) hariç
+                otsu_full[by1:by2, bx1:bx2][lab2 == i] = 255
+
+    mask = cv2.bitwise_or(seg, otsu_full)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (close_k, close_k)))
+    mask = cv2.dilate(mask, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (dilate_k, dilate_k)))
+    return mask
+
+
+def block_inpaint(image: np.ndarray, mask: np.ndarray, config) -> np.ndarray:
+    """Block-aware full-res LaMa: her metin bölgesini 1.7x bağlamla kırpıp ayrı
+    inpaint eder (tüm sayfayı küçültmeden → keskin sonuç)."""
+    h, w = image.shape[:2]
+    lama = _get_lama()
+    result = image.copy()
+    n, labels = cv2.connectedComponents((mask > 0).astype(np.uint8))
+    for lbl in range(1, n):
+        ys, xs = np.where(labels == lbl)
+        if len(ys) < 10:
+            continue
+        y1, y2, x1, x2 = ys.min(), ys.max(), xs.min(), xs.max()
+        bw, bh = x2 - x1, y2 - y1
+        mx, my = int(bw * 0.35) + 12, int(bh * 0.35) + 12
+        cy1, cx1 = max(0, y1 - my), max(0, x1 - mx)
+        cy2, cx2 = min(h, y2 + my), min(w, x2 + mx)
+        crop = image[cy1:cy2, cx1:cx2].copy()
+        cmask = mask[cy1:cy2, cx1:cx2].copy()
+        if cmask.sum() == 0:
+            continue
+        out = imk.convert_scale_abs(lama(crop, cmask, config))
+        cm = cmask > 0
+        result[cy1:cy2, cx1:cx2][cm] = out[cm]
+    return result
 
 
 def resolve_font(args: argparse.Namespace) -> str:
@@ -1130,21 +1232,13 @@ def process_image(path: Path, output_dir: Path, args: argparse.Namespace) -> Pat
     strip_translation_garbage_letters(blocks)
     blocks = sort_blk_list(blocks, right_to_left=args.source_lang == "Japanese")
 
-    print(f"[3/6] clean: {args.inpainter}", flush=True)
-    config = Config(hd_strategy=args.hd_strategy, hd_strategy_resize_limit=args.resize_limit)
-    h, w = image.shape[:2]
-    mask = np.zeros((h, w), dtype=np.uint8)
-    for block in blocks:
-        x1, y1, x2, y2 = [int(v) for v in getattr(block, "xyxy", (0, 0, 0, 0))]
-        mask[max(0, y1):min(h, y2), max(0, x1):min(w, x2)] = 255
-    outline_protect = bubble_outline_protection_mask(image, blocks)
-    outline_protect = remove_text_regions_from_protection(outline_protect, blocks, image.shape)
-    if outline_protect.any():
-        mask[outline_protect] = 0
-    prefilled, mask = fill_easy_light_text_regions(image, blocks, mask)
-    cleaned = make_inpainter(args.inpainter, device)(prefilled, mask, config)
-    cleaned = imk.convert_scale_abs(cleaned)
-    cleaned = restore_protected_pixels(image, cleaned, outline_protect)
+    print("[3/6] clean: segmenter + block-aware LaMa", flush=True)
+    config = Config(hd_strategy="Resize", hd_strategy_resize_limit=2048)
+    mask = build_segmenter_mask(image)
+    if mask.sum() == 0:
+        cleaned = image.copy()
+    else:
+        cleaned = block_inpaint(image, mask, config)
 
     print(f"[4/6] translate: {args.translator}", flush=True)
     os.environ["TRANSLATION_SOURCE_FILE"] = path.name
@@ -1343,27 +1437,15 @@ def _batch_translate_all(page_results: list, args: argparse.Namespace) -> None:
 
 
 def _stage_clean(task: tuple) -> tuple:
-    """Phase-3a worker: inpainting clean only (thread-safe with SmartCV2/ONNX)."""
+    """Phase-3a worker: YOLOv8 segmentasyon maskesi + block-aware LaMa ile temizlik."""
     idx, path, image, blocks, args = task
-    device = "cuda" if args.gpu else "cpu"
-    config = Config(hd_strategy=args.hd_strategy, hd_strategy_resize_limit=args.resize_limit)
+    config = Config(hd_strategy="Resize", hd_strategy_resize_limit=2048)
 
-    if not blocks:
-        return idx, path, image, blocks, image.copy()
-
-    h, w = image.shape[:2]
-    mask = np.zeros((h, w), dtype=np.uint8)
-    for blk in blocks:
-        x1, y1, x2, y2 = [int(v) for v in getattr(blk, "xyxy", (0, 0, 0, 0))]
-        mask[max(0, y1):min(h, y2), max(0, x1):min(w, x2)] = 255
-    outline_protect = bubble_outline_protection_mask(image, blocks)
-    outline_protect = remove_text_regions_from_protection(outline_protect, blocks, image.shape)
-    if outline_protect.any():
-        mask[outline_protect] = 0
-    prefilled, mask = fill_easy_light_text_regions(image, blocks, mask)
-    cleaned = make_inpainter(args.inpainter, device)(prefilled, mask, config)
-    cleaned = imk.convert_scale_abs(cleaned)
-    cleaned = restore_protected_pixels(image, cleaned, outline_protect)
+    mask = build_segmenter_mask(image)
+    if mask.sum() == 0:
+        cleaned = image.copy()
+    else:
+        cleaned = block_inpaint(image, mask, config)
 
     suppress_noisy_ocr_blocks(blocks, args.source_lang)
     strip_translation_garbage_letters(blocks)
