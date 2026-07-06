@@ -1098,10 +1098,14 @@ def clear_light_free_text_render_regions(image: np.ndarray, blocks) -> np.ndarra
 
     result = image.copy()
     height, width = image.shape[:2]
-    pad_x = int(os.environ.get("LIGHT_RENDER_CLEAR_PAD_X", "220"))
-    pad_y = int(os.environ.get("LIGHT_RENDER_CLEAR_PAD_Y", "58"))
+    # Small padding: just enough to absorb anti-aliasing halo right around the
+    # glyphs. No sideways/row growth — this never touches pixels outside the
+    # block's own (lightly padded) box, so it can't bleed into unrelated
+    # artwork (a character's face, hair, etc.) that happens to share the same
+    # row elsewhere on the page.
+    pad_x = int(os.environ.get("LIGHT_RENDER_CLEAR_PAD_X", "16"))
+    pad_y = int(os.environ.get("LIGHT_RENDER_CLEAR_PAD_Y", "10"))
     white_ratio_min = float(os.environ.get("LIGHT_RENDER_CLEAR_WHITE_RATIO", "0.52"))
-    band_white_ratio_min = float(os.environ.get("LIGHT_RENDER_CLEAR_BAND_WHITE_RATIO", "0.70"))
     gray_min = int(os.environ.get("LIGHT_RENDER_CLEAR_GRAY_MIN", "180"))
     sat_max = int(os.environ.get("LIGHT_RENDER_CLEAR_SAT_MAX", "100"))
 
@@ -1120,29 +1124,13 @@ def clear_light_free_text_render_regions(image: np.ndarray, blocks) -> np.ndarra
         gray = cv2.cvtColor(crop, cv2.COLOR_RGB2GRAY)
         hsv = cv2.cvtColor(crop, cv2.COLOR_RGB2HSV)
         light_pixels = (gray >= gray_min) & (hsv[:, :, 1] <= sat_max)
-        fill_target = (x1, y1, x2, y2)
-        band = result[y1:y2, 0:width]
-        band_light = None
-        if band.size:
-            band_gray = cv2.cvtColor(band, cv2.COLOR_RGB2GRAY)
-            band_hsv = cv2.cvtColor(band, cv2.COLOR_RGB2HSV)
-            band_light = (band_gray >= gray_min) & (band_hsv[:, :, 1] <= sat_max)
-            if float(band_light.mean()) >= band_white_ratio_min:
-                fill_target = (0, y1, width, y2)
-                light_pixels = band_light
-                crop = band
+        if float(light_pixels.mean()) < white_ratio_min:
+            continue
 
-        if fill_target == (x1, y1, x2, y2) and float(light_pixels.mean()) < white_ratio_min:
-            if band_light is None or float(band_light.mean()) < band_white_ratio_min:
-                continue
-            fill_target = (0, y1, width, y2)
-            light_pixels = band_light
-            crop = band
         fill = np.median(crop[light_pixels], axis=0).astype(np.uint8) if light_pixels.any() else np.array([255, 255, 255], dtype=np.uint8)
         if int(fill.mean()) < 210:
             fill = np.array([255, 255, 255], dtype=np.uint8)
-        fx1, fy1, fx2, fy2 = fill_target
-        result[fy1:fy2, fx1:fx2] = fill
+        result[y1:y2, x1:x2] = fill
 
     return result
 
