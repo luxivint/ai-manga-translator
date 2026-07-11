@@ -59,6 +59,7 @@ def claim_job(conn):
                   FROM pipeline_jobs
                   WHERE status = 'QUEUED'
                     AND job_type = ANY(%s)
+                    AND (next_retry_at IS NULL OR next_retry_at <= now())
                   ORDER BY priority ASC, created_at ASC
                   FOR UPDATE SKIP LOCKED
                   LIMIT 1
@@ -68,6 +69,48 @@ def claim_job(conn):
                 (list(JOB_TYPES),),
             )
             return cur.fetchone()
+
+
+MAX_JOB_RETRIES = 5
+JOB_RETRY_DELAY_MINUTES = 30
+
+
+def mark_failed_or_retry(conn, job_id: str, error: str):
+    """FAILED yerine, deneme hakkı varsa job'u belirli bir süre sonra tekrar
+    denenmek üzere QUEUED'a döndürür. Sunucu/PC yarıda kesilse, GPT API anlık
+    hata verse bile elle 'Yeniden Dene' basmaya gerek kalmadan otomatik
+    kurtarma sağlar. MAX_JOB_RETRIES denemesi tükenince kalıcı FAILED olur."""
+    with conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT retry_count FROM pipeline_jobs WHERE id = %s", [job_id])
+            row = cur.fetchone()
+            retry_count = int(row["retry_count"]) if row else MAX_JOB_RETRIES
+            if retry_count < MAX_JOB_RETRIES:
+                cur.execute(
+                    """
+                    UPDATE pipeline_jobs
+                    SET status = 'QUEUED',
+                        retry_count = retry_count + 1,
+                        next_retry_at = now() + (%s || ' minutes')::interval,
+                        progress = 0,
+                        started_at = NULL,
+                        error_message = %s,
+                        updated_at = now()
+                    WHERE id = %s
+                    """,
+                    [str(JOB_RETRY_DELAY_MINUTES), f"(deneme {retry_count + 1}/{MAX_JOB_RETRIES}) {error[:1900]}", job_id],
+                )
+            else:
+                cur.execute(
+                    """
+                    UPDATE pipeline_jobs
+                    SET status = 'FAILED',
+                        error_message = %s,
+                        finished_at = now(), updated_at = now()
+                    WHERE id = %s
+                    """,
+                    [f"({MAX_JOB_RETRIES} deneme tükendi) {error[:1900]}", job_id],
+                )
 
 
 def set_job(conn, job_id: str, status: str | None = None, progress: int | None = None, error: str | None = None):
@@ -107,18 +150,16 @@ def heartbeat(conn, job_id: str):
 
 
 def startup_cleanup(conn):
-    """Worker başlarken kendi job türlerindeki zombi RUNNING jobları FAILED yap."""
-    with conn:
-        cur = execute(conn, """
-            UPDATE pipeline_jobs
-            SET status = 'FAILED',
-                error_message = 'Translator worker yeniden başlatıldı, iş yarıda kesildi.',
-                finished_at = now(), updated_at = now()
-            WHERE status = 'RUNNING'
-              AND job_type = ANY(%s)
-        """, [list(JOB_TYPES)])
-        if cur.rowcount:
-            print(f"startup_cleanup: {cur.rowcount} orphan RUNNING → FAILED", flush=True)
+    """Worker başlarken kendi job türlerindeki zombi RUNNING jobları, deneme
+    hakkı varsa tekrar kuyruğa alır (PC/worker yarıda kapandıysa böyle
+    kurtarılır), yoksa FAILED yapar."""
+    with conn.cursor() as cur:
+        cur.execute("SELECT id FROM pipeline_jobs WHERE status = 'RUNNING' AND job_type = ANY(%s)", [list(JOB_TYPES)])
+        orphan_ids = [row["id"] for row in cur.fetchall()]
+    for job_id in orphan_ids:
+        mark_failed_or_retry(conn, job_id, "Translator worker yeniden başlatıldı, iş yarıda kesildi.")
+    if orphan_ids:
+        print(f"startup_cleanup: {len(orphan_ids)} orphan RUNNING job işlendi (retry/FAILED)", flush=True)
     with conn:
         cur = execute(conn, """
             UPDATE pipeline_jobs
@@ -133,17 +174,16 @@ def startup_cleanup(conn):
 
 
 def reap_dead_jobs(conn):
-    """20 dakika güncellenmeyen çeviri joblarını FAILED yap (çeviri uzun sürer)."""
-    with conn:
-        execute(conn, """
-            UPDATE pipeline_jobs
-            SET status = 'FAILED',
-                error_message = 'Translator worker 20 dakika yanıt vermedi, otomatik iptal.',
-                finished_at = now(), updated_at = now()
-            WHERE status = 'RUNNING'
-              AND job_type = ANY(%s)
-              AND updated_at < now() - interval '20 minutes'
+    """20 dakika güncellenmeyen çeviri joblarını, deneme hakkı varsa tekrar
+    kuyruğa alır (bkz. mark_failed_or_retry), yoksa FAILED yapar."""
+    with conn.cursor() as cur:
+        cur.execute("""
+            SELECT id FROM pipeline_jobs
+            WHERE status = 'RUNNING' AND job_type = ANY(%s) AND updated_at < now() - interval '20 minutes'
         """, [list(JOB_TYPES)])
+        stale_ids = [row["id"] for row in cur.fetchall()]
+    for job_id in stale_ids:
+        mark_failed_or_retry(conn, job_id, "Translator worker 20 dakika yanıt vermedi, otomatik iptal.")
     with conn:
         execute(conn, """
             UPDATE pipeline_jobs
@@ -534,7 +574,7 @@ def run_once(conn) -> bool:
         set_job(conn, job["id"], status="CANCELLED", error=str(exc))
     except Exception as exc:
         print(f"job failed {job['id']}: {exc}", flush=True)
-        set_job(conn, job["id"], status="FAILED", error=str(exc))
+        mark_failed_or_retry(conn, job["id"], str(exc))
     return True
 
 

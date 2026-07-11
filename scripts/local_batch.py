@@ -1384,15 +1384,31 @@ def _stage_detect_ocr(task: tuple) -> tuple:
             image = image[y1:y2].copy()
             print(f"  [vision-crop] [{idx+1}] {path.name}: üst%={top} alt%={bottom} kırpıldı", flush=True)
     blocks = TextBlockDetector(settings).detect(image)
+    n_detected = len(blocks)
     if blocks:
         ocr = OCRProcessor()
         ocr.initialize(main, args.source_lang)
         ocr.process(image, blocks)
+    n_empty_after_ocr = sum(1 for b in blocks if getattr(b, "text_class", None) == "text_bubble" and not (getattr(b, "text", "") or "").strip())
     recover_empty_bubble_text_with_gpt(image, blocks, args)
+    n_before_filters = len(blocks)
     blocks = drop_non_english_ocr_blocks(blocks)
+    n_after_non_english = len(blocks)
     blocks = prune_ocr_blocks(blocks, image)
+    n_after_prune = len(blocks)
     strip_translation_garbage_letters(blocks)
     blocks = sort_blk_list(blocks, right_to_left=args.source_lang == "Japanese")
+    dropped_non_english = n_before_filters - n_after_non_english
+    dropped_prune = n_after_non_english - n_after_prune
+    if n_empty_after_ocr or dropped_non_english or dropped_prune:
+        print(
+            f"  [filtre] [{idx+1}] {path.name}: tespit={n_detected}"
+            f" | OCR-boş-kalan={n_empty_after_ocr}"
+            f" | non-english-filtre -{dropped_non_english}"
+            f" | prune-filtre -{dropped_prune}"
+            f" | kalan={len(blocks)}",
+            flush=True,
+        )
     print(f"  detect+ocr [{idx+1}] {path.name}: {len(blocks)} blok", flush=True)
     return idx, path, image, blocks
 
@@ -1537,55 +1553,72 @@ def _batch_translate_all(page_results: list, args: argparse.Namespace) -> None:
     batches = [keys[i : i + batch_size] for i in range(0, len(keys), batch_size)]
     results: dict[str, str] = {}
 
-    for bi, batch_keys in enumerate(batches):
-        batch_dict = {k: combined[k] for k in batch_keys}
+    def _call_batch_translate(batch_dict: dict[str, str]) -> dict[str, str] | None:
+        """One GPT call for a batch. Returns the parsed {key: translation} dict,
+        or None if the call failed / the response had no parseable JSON."""
         user_prompt = (
             f"{args.extra_context}\n"
             f"Make the translation sound as natural as possible.\n"
             f"Translate this:\n"
             f"{json.dumps(batch_dict, ensure_ascii=False, indent=2)}"
         )
+        resp = requests.post(
+            "https://api.openai.com/v1/chat/completions",
+            headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+            data=json.dumps({
+                "model": model,
+                "messages": [
+                    {"role": "system", "content": [{"type": "text", "text": system_prompt}]},
+                    {"role": "user", "content": [{"type": "text", "text": user_prompt}]},
+                ],
+                "temperature": 1.0,
+                "top_p": 0.95,
+                "max_completion_tokens": max(16000, len(batch_dict) * 300),
+            }),
+            timeout=180,
+        )
+        if not resp.ok:
+            raise RuntimeError(f"{resp.status_code} {resp.text}")
+        resp_data = resp.json()
+        from modules.translation.llm.gpt import _log_openai_usage
+        _log_openai_usage(model, resp_data.get("usage") or {})
+        usage_dbg_path = os.environ.get("BATCH_TRANSLATE_USAGE_PATH")
+        if usage_dbg_path:
+            with open(usage_dbg_path, "a", encoding="utf-8") as fh:
+                fh.write(json.dumps(resp_data.get("usage") or {}) + "\n")
+        content = resp_data["choices"][0]["message"]["content"] or ""
+        m = re.search(r"\{[\s\S]*\}", content)
+        if not m:
+            finish_reason = resp_data["choices"][0].get("finish_reason")
+            raise RuntimeError(f"yanıtta JSON bulunamadı (finish_reason={finish_reason}, content_len={len(content)})")
+        return json.loads(m.group(0))
+
+    max_attempts = int(os.environ.get("BATCH_TRANSLATE_RETRY_ATTEMPTS", "3"))
+    retry_delay = float(os.environ.get("BATCH_TRANSLATE_RETRY_DELAY_SECONDS", "30"))
+
+    for bi, batch_keys in enumerate(batches):
+        pending = {k: combined[k] for k in batch_keys}
         print(f"  GPT call [{bi+1}/{len(batches)}]: {len(batch_keys)} blok", flush=True)
-        try:
-            resp = requests.post(
-                "https://api.openai.com/v1/chat/completions",
-                headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
-                data=json.dumps({
-                    "model": model,
-                    "messages": [
-                        {"role": "system", "content": [{"type": "text", "text": system_prompt}]},
-                        {"role": "user", "content": [{"type": "text", "text": user_prompt}]},
-                    ],
-                    "temperature": 1.0,
-                    "top_p": 0.95,
-                    "max_completion_tokens": max(16000, len(batch_keys) * 300),
-                }),
-                timeout=180,
-            )
-            if not resp.ok:
-                print(f"  batch {bi+1} translate FAILED: {resp.status_code} {resp.text}", flush=True)
-                continue
-            resp.raise_for_status()
-            resp_data = resp.json()
-            from modules.translation.llm.gpt import _log_openai_usage
-            _log_openai_usage(model, resp_data.get("usage") or {})
-            usage_dbg_path = os.environ.get("BATCH_TRANSLATE_USAGE_PATH")
-            if usage_dbg_path:
-                with open(usage_dbg_path, "a", encoding="utf-8") as fh:
-                    fh.write(json.dumps(resp_data.get("usage") or {}) + "\n")
-            content = resp_data["choices"][0]["message"]["content"] or ""
-            m = re.search(r"\{[\s\S]*\}", content)
-            if m:
-                results.update(json.loads(m.group(0)))
-            else:
-                finish_reason = resp_data["choices"][0].get("finish_reason")
-                print(
-                    f"  batch {bi+1}: yanıtta JSON bulunamadı "
-                    f"(finish_reason={finish_reason}, content_len={len(content)})",
-                    flush=True,
-                )
-        except Exception as exc:
-            print(f"  batch {bi+1} translate FAILED: {exc}", flush=True)
+
+        for attempt in range(1, max_attempts + 1):
+            try:
+                batch_result = _call_batch_translate(pending) or {}
+            except Exception as exc:
+                print(f"  batch {bi+1} translate FAILED (attempt {attempt}/{max_attempts}): {exc}", flush=True)
+                batch_result = {}
+
+            results.update(batch_result)
+            # Only stop once every key we asked for came back; a partial JSON
+            # (GPT silently dropping some keys) retries too, asking only for
+            # what's still missing so later attempts do less redundant work.
+            pending = {k: v for k, v in pending.items() if k not in batch_result}
+            if not pending:
+                break
+            if len(batch_result) > 0:
+                print(f"  batch {bi+1} (attempt {attempt}/{max_attempts}): {len(pending)} blok yanıtta eksik", flush=True)
+            if attempt < max_attempts:
+                print(f"  batch {bi+1}: {retry_delay:.0f}sn sonra tekrar denenecek", flush=True)
+                time.sleep(retry_delay)
 
     # Güvenlik ağı: GPT bir reklamı kaçırsa bile, blok metninde açık bir
     # domain / URL / davet kodu varsa reklam say (kendi markamız hariç).
@@ -1892,7 +1925,20 @@ def process_all_batched(images: list[Path], output_dir: Path, args: argparse.Nam
         t2 = time.perf_counter()
         _batch_translate_all(page_results, args)
         print(f"[BATCH] Faz 2 bitti: {time.perf_counter()-t2:.1f}s", flush=True)
-        _rate_translation_quality(page_results, args)
+
+        quality_threshold = float(os.environ.get("QUALITY_SCORE_RETRY_THRESHOLD", "2.5"))
+        quality_max_retries = int(os.environ.get("QUALITY_SCORE_MAX_RETRIES", "1"))
+        score = _rate_translation_quality(page_results, args)
+        retry_n = 0
+        while 0 < score < quality_threshold and retry_n < quality_max_retries:
+            retry_n += 1
+            print(
+                f"  [KALITE] skor eşiğin altında ({score:.1f} < {quality_threshold}), "
+                f"tüm bölüm tekrar çevriliyor ({retry_n}/{quality_max_retries})",
+                flush=True,
+            )
+            _batch_translate_all(page_results, args)
+            score = _rate_translation_quality(page_results, args)
     else:
         print(f"\n[BATCH] Faz 2/3  translate atlandi (metin bulunamadi)", flush=True)
 
