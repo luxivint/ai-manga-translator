@@ -17,6 +17,22 @@ from io import BytesIO
 from pathlib import Path
 from types import SimpleNamespace
 
+# Windows + GPU: torch and onnxruntime each need CUDA/cuDNN DLLs findable
+# on the process DLL search path (pip-installed nvidia-* packages and
+# torch/lib don't land on PATH automatically). Widen it here, before any
+# torch/onnxruntime session is created. No-op on Linux (the server) or
+# wherever these folders don't exist (CPU-only installs).
+if sys.platform == "win32":
+    _venv_site_packages = Path(__file__).resolve().parents[1] / ".venv" / "Lib" / "site-packages"
+    for _dll_dir in [
+        _venv_site_packages / "torch" / "lib",
+        _venv_site_packages / "nvidia" / "cudnn" / "bin",
+        _venv_site_packages / "nvidia" / "cu13" / "bin" / "x86_64",
+        _venv_site_packages / "nvidia" / "cu12" / "bin" / "x86_64",
+    ]:
+        if _dll_dir.is_dir():
+            os.add_dll_directory(str(_dll_dir))
+
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 os.environ.setdefault("OMP_NUM_THREADS", "2")
 os.environ.setdefault("OPENBLAS_NUM_THREADS", "2")
