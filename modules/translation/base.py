@@ -122,11 +122,22 @@ class LLMTranslation(TranslationEngine):
         Returns:
             Formatted system prompt
         """
+        turkish_rule = ""
+        if target_lang and "turk" in target_lang.lower():
+            turkish_rule = (
+                "\n        IMPORTANT (Turkish output): Use ONLY the modern Turkish alphabet "
+                "(a b c ç d e f g ğ h ı i j k l m n o ö p r s ş t u ü v y z). "
+                "NEVER use circumflex/accented letters such as â, î, û (and Â, Î, Û). "
+                "These are NOT in the render font and come out as blank/empty boxes. "
+                "Always write the plain letter instead: â->a, î->i, û->u "
+                "(e.g. 'kâğıt'->'kağıt', 'âlem'->'alem', 'hâlâ'->'hala', 'rüzgâr'->'rüzgar')."
+            )
+
         return f"""You are an expert translator who translates {source_lang} to {target_lang}. You pay attention to style, formality, idioms, slang etc and try to convey it in the way a {target_lang} speaker would understand.
         BE MORE NATURAL. NEVER USE 당신, 그녀, 그 or its Japanese equivalents.
         Specifically, you will be translating text OCR'd from a comic. The OCR is not perfect and as such you may receive text with typos or other mistakes.
         To aid you and provide context, You may be given the image of the page and/or extra context about the comic. You will be given a json string of the detected text blocks and the text to translate. Return the json string with the texts translated. DO NOT translate the keys of the json. For each block:
         - If it's already in {target_lang} or looks like gibberish, OUTPUT IT AS IT IS instead
-        - DO NOT give explanations
+        - DO NOT give explanations{turkish_rule}
         Do Your Best! I'm really counting on you."""
     
