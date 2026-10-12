@@ -71,6 +71,9 @@ from modules.utils.image_utils import generate_mask, get_smart_text_color
 from modules.utils.language_utils import get_language_code, get_layout_direction, is_no_space_lang
 from modules.utils.textblock import sort_blk_list
 from modules.utils.translator_utils import MODEL_MAP, format_translations
+from modules.utils import gateway
+from modules.utils import watermark as watermark_lib
+from modules.utils.gateway import AdaptiveLimiter, GatewayError, OCRFailedError
 from modules.utils.openai_endpoint import get_openai_chat_completions_url, get_openai_model
 from scripts.storage import delete_prefix, download_prefix, normalize_key, upload_directory
 
@@ -618,35 +621,43 @@ def _tiled_segment(segmenter, image: np.ndarray, conf: float) -> tuple[np.ndarra
     return seg, fine
 
 
-_WATERMARK_PATTERNS = (
-    r"vortex\s*scans",
-    r"[a-z0-9-]+\.(?:com|net|org|io|me|gg|xyz|co|to)\b",
-    r"read\s+(?:this\s+series\s+)?first\s+at",
-    r"discord\.gg|t\.me/|www\.|https?://",
-    r"\b(?:patreon|ko-?fi)\b",
-)
+_WATERMARK_PATTERNS = watermark_lib.WATERMARK_PATTERNS
+
+
+def watermark_policy() -> str:
+    """WATERMARK_POLICY=clean (default: competitor scanlation watermarks/banners are erased whole) | keep
+    (leave them untouched). The site's own brand is never treated as a watermark."""
+    return "keep" if os.environ.get("WATERMARK_POLICY", "clean").strip().lower() == "keep" else "clean"
+
+
+def watermark_match(blk) -> str | None:
+    """Rule name when the block text is a competitor watermark (regardless of policy), else None."""
+    return watermark_lib.match_watermark(getattr(blk, "text", "") or "")
 
 
 def watermark_rule(blk, page_w: int, page_h: int) -> str | None:
-    """Scan-group watermark / banner / logo blokları TEMİZLENMEZ (yarım maskelenip
-    bozulmasın). Dönen değer = eşleşen kuralın adı, yoksa None.
-    WATERMARK_POLICY=keep (varsayılan) | clean ; WATERMARK_PATTERNS=ek|regex'ler."""
-    if os.environ.get("WATERMARK_POLICY", "keep").strip().lower() != "keep":
+    """Only with WATERMARK_POLICY=keep: scan-group watermark / banner blocks are left untouched.
+    Returns the matching rule name, otherwise None (also always None under the 'clean' policy)."""
+    if watermark_policy() != "keep":
         return None
     if getattr(blk, "is_ad", False):
         return "is_ad"
-    txt = (getattr(blk, "text", "") or "").strip().lower()
-    if not txt:
-        return None
-    extra = os.environ.get("WATERMARK_PATTERNS", "").strip()
-    pats = list(_WATERMARK_PATTERNS) + ([extra] if extra else [])
-    for pat in pats:
-        try:
-            if re.search(pat, txt, re.IGNORECASE):
-                return f"pattern:{pat[:28]}"
-        except re.error:
-            continue
-    return None
+    return watermark_match(blk)
+
+
+def watermark_clear_mask(image: np.ndarray, blocks) -> np.ndarray:
+    """Union of whole-watermark regions to erase under WATERMARK_POLICY=clean (empty mask under 'keep')."""
+    h, w = image.shape[:2]
+    out = np.zeros((h, w), np.uint8)
+    if watermark_policy() != "clean":
+        return out
+    ratio = float(os.environ.get("AD_MIN_AREA_RATIO", "0.015"))
+    pad = int(os.environ.get("WATERMARK_PAD", "12"))
+    for blk in blocks or []:
+        x1, y1, x2, y2 = [int(v) for v in getattr(blk, "xyxy", (0, 0, 0, 0))]
+        if watermark_match(blk) or (getattr(blk, "is_ad", False) and max(0, x2 - x1) * max(0, y2 - y1) >= h * w * ratio):
+            out |= watermark_lib.region_mask(image, (x1, y1, x2, y2), pad)
+    return out
 
 
 def build_segmenter_mask(image: np.ndarray, blocks=None, require_translation: bool = False) -> np.ndarray:
@@ -683,9 +694,20 @@ def build_segmenter_mask(image: np.ndarray, blocks=None, require_translation: bo
         tb_pad = int(os.environ.get("CLEAN_FINE_MISSING_PAD", "14"))
         has_target = False
         wm_exclude = np.zeros((h, w), np.uint8)
+        wm_clear = np.zeros((h, w), np.uint8)  # WATERMARK_POLICY=clean: whole banner regions to erase
         wm_pad = int(os.environ.get("WATERMARK_PAD", "12"))
+        clean_wm = watermark_policy() == "clean"
         for blk in blocks:
             x1, y1, x2, y2 = [int(v) for v in getattr(blk, "xyxy", (0, 0, 0, 0))]
+            if clean_wm:
+                wm_hit = watermark_match(blk)
+                if wm_hit or (getattr(blk, "is_ad", False)
+                              and max(0, x2 - x1) * max(0, y2 - y1) >= page_area * ad_min_ratio):
+                    # Erase the WHOLE watermark (tag/plate included), never only its glyphs.
+                    wm_clear |= watermark_lib.region_mask(image, (x1, y1, x2, y2), wm_pad)
+                    print(f"  [clean] watermark erased whole rule={wm_hit or 'is_ad'} box={x1},{y1},{x2},{y2}",
+                          flush=True)
+                    continue
             wm = watermark_rule(blk, w, h)
             if wm:
                 # Watermark/banner: hiç dokunma (maskeye girmez, çevresi de korunur).
@@ -715,7 +737,7 @@ def build_segmenter_mask(image: np.ndarray, blocks=None, require_translation: bo
             if not getattr(blk, "is_ad", False):
                 target_boxes.append((x1, y1, x2, y2))
         if not has_target:
-            return np.zeros((h, w), np.uint8)
+            return wm_clear
         # Detector kutusu bir satırın yalnızca bir kısmını kapsıyorsa (ör. baştaki
         # harfler kutu dışında kalır) satırı tamamla: kutuyla yeterince örtüşen
         # segmenter bileşenini bütün olarak kabul et. Kutuyla ilgisiz metin
@@ -748,7 +770,7 @@ def build_segmenter_mask(image: np.ndarray, blocks=None, require_translation: bo
         seg = cv2.bitwise_and(seg, keep)
         fine = cv2.bitwise_and(fine, keep)
         if seg.sum() == 0:
-            return seg
+            return wm_clear
 
     if os.environ.get("MASK_TIGHT", "true").lower() == "true":
         mask = _tight_glyph_mask(image, seg, close_k, dilate_k, fine, text_boxes)
@@ -759,6 +781,8 @@ def build_segmenter_mask(image: np.ndarray, blocks=None, require_translation: bo
         mask = constrain_mask_to_allowed_regions(mask, allowed_mask, protected)
         if wm_exclude.any():
             mask[wm_exclude > 0] = 0
+        if wm_clear.any():
+            mask[wm_clear > 0] = 255
     return mask
 
 
@@ -965,8 +989,10 @@ def recover_empty_bubble_text_with_gpt(image: np.ndarray, blocks, args: argparse
 
     model = get_openai_model(MODEL_MAP.get(args.translator), "gpt-5.4-mini")
     try:
-        response = requests.post(
+        response = gateway.resilient_post(
             get_openai_chat_completions_url(),
+            kind="ocr-empty-bubble",
+            limiter=gateway.ocr_limiter(),
             headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
             data=json.dumps(
                 {
@@ -1818,23 +1844,29 @@ def _stage_detect_ocr(task: tuple) -> tuple:
             found = split_merged_blocks_ocr(img, found, ocr)
         return found
 
-    blocks = _detect_ocr(image)
-    # GPT-Vision reklam bölgesi: görseli kırp (üstten top%, alttan bottom%).
-    # Vision tek başına güvenilmez (aynı sayfada %11 / %17 gibi değişken ve
-    # gerçek hikâye karesini kırpabiliyor) -> kırpma SADECE kırpılacak şeritte
-    # OCR ile doğrulanmış reklam/watermark metni varsa uygulanır.
-    if crop:
-        top, bottom = crop
-        h = image.shape[0]
-        y1 = int(h * top / 100)
-        y2 = int(h * (100 - bottom) / 100)
-        if y2 - y1 >= h * 0.08 and crop_has_ad_evidence(blocks, y1, y2, image.shape[1], h):
-            image = image[y1:y2].copy()
-            print(f"  [vision-crop] [{idx+1}] {path.name}: üst%={top} alt%={bottom} kırpıldı", flush=True)
-            blocks = _detect_ocr(image)
-        else:
-            print(f"  [vision-crop] [{idx+1}] {path.name}: üst%={top} alt%={bottom} REDDEDİLDİ "
-                  f"(şeritte OCR reklam kanıtı yok; sayfa kırpılmadı)", flush=True)
+    try:
+        blocks = _detect_ocr(image)
+        # GPT-Vision reklam bölgesi: görseli kırp (üstten top%, alttan bottom%).
+        # Vision tek başına güvenilmez (aynı sayfada %11 / %17 gibi değişken ve
+        # gerçek hikâye karesini kırpabiliyor) -> kırpma SADECE kırpılacak şeritte
+        # OCR ile doğrulanmış reklam/watermark metni varsa uygulanır.
+        if crop:
+            top, bottom = crop
+            h = image.shape[0]
+            y1 = int(h * top / 100)
+            y2 = int(h * (100 - bottom) / 100)
+            if y2 - y1 >= h * 0.08 and crop_has_ad_evidence(blocks, y1, y2, image.shape[1], h):
+                image = image[y1:y2].copy()
+                print(f"  [vision-crop] [{idx+1}] {path.name}: üst%={top} alt%={bottom} kırpıldı", flush=True)
+                blocks = _detect_ocr(image)
+            else:
+                print(f"  [vision-crop] [{idx+1}] {path.name}: üst%={top} alt%={bottom} REDDEDİLDİ "
+                      f"(şeritte OCR reklam kanıtı yok; sayfa kırpılmadı)", flush=True)
+    except OCRFailedError as exc:
+        # OCR could not be read (503 / timeout / broken stream after all retries): NOT the same as a page without
+        # text. Flag it; the caller re-runs it later and fails the job if it stays unreadable.
+        print(f"  [ocr-FAILED] [{idx+1}] {path.name}: {exc}", flush=True)
+        return idx, path, image, [], {"ocr_failed": True, "detected": 0, "empty": 0, "kept": 0}
     n_detected = len(blocks)
     n_empty_after_ocr = sum(1 for b in blocks if getattr(b, "text_class", None) == "text_bubble" and not (getattr(b, "text", "") or "").strip())
     recover_empty_bubble_text_with_gpt(image, blocks, args)
@@ -1857,7 +1889,7 @@ def _stage_detect_ocr(task: tuple) -> tuple:
             flush=True,
         )
     print(f"  detect+ocr [{idx+1}] {path.name}: {len(blocks)} blok", flush=True)
-    return idx, path, image, blocks
+    return idx, path, image, blocks, {"ocr_failed": False, "detected": n_detected, "empty": n_empty_after_ocr, "kept": len(blocks)}
 
 
 # Açık domain / URL / davet bağlantısı tespiti (reklam güvenlik ağı).
@@ -1913,8 +1945,9 @@ def detect_ad_regions(pending: list, args: argparse.Namespace) -> dict:
                 buf = BytesIO()
                 im.save(buf, format="JPEG", quality=80)
             b64 = base64.b64encode(buf.getvalue()).decode("ascii")
-            resp = requests.post(
+            resp = gateway.resilient_post(
                 get_openai_chat_completions_url(),
+                kind="vision",
                 headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
                 data=json.dumps({
                     "model": model,
@@ -2061,9 +2094,17 @@ def _batch_translate_all(page_results: list, args: argparse.Namespace) -> None:
         got.update(best)
         return got
 
-    # BATCH_TRANSLATE_CONCURRENCY GPT calls in flight at once (default 4; 1 = sequential). Each batch owns
-    # disjoint keys, so results merge without conflicts; retries stay per batch.
-    concurrency = max(1, min(len(batches), int(os.environ.get("BATCH_TRANSLATE_CONCURRENCY", "4"))))
+    # BATCH_TRANSLATE_CONCURRENCY GPT calls in flight at once (default 3; 1 = sequential). Each batch owns
+    # disjoint keys, so results merge without conflicts; retries stay per batch. While the gateway circuit
+    # breaker is open (repeated 503 / timeouts) only ONE call runs at a time so a struggling upstream is not
+    # hammered. Measured on a healthy gateway: 4 -> 26 s, 3 -> 37 s for a 73-page chapter (3 is the safer default).
+    concurrency = max(1, min(len(batches), int(os.environ.get("BATCH_TRANSLATE_CONCURRENCY", "3"))))
+    translate_limiter = AdaptiveLimiter(concurrency, breaker=gateway.get_breaker())
+
+    def _translate_gated(item):
+        with translate_limiter.slot():
+            return _translate_one_batch(*item)
+
     if concurrency == 1:
         for bi, batch_keys in enumerate(batches):
             results.update(_translate_one_batch(bi, batch_keys))
@@ -2071,7 +2112,7 @@ def _batch_translate_all(page_results: list, args: argparse.Namespace) -> None:
         saved_max_tokens = engine.max_tokens  # translate_keyed temporarily raises it; undo any drift
         try:
             with ThreadPoolExecutor(max_workers=concurrency) as tpool:
-                for part in tpool.map(lambda a: _translate_one_batch(*a), list(enumerate(batches))):
+                for part in tpool.map(_translate_gated, list(enumerate(batches))):
                     results.update(part)
         finally:
             engine.max_tokens = saved_max_tokens
@@ -2139,6 +2180,7 @@ def _stage_clean(task: tuple) -> tuple:
         cleaned = image.copy()
     else:
         cleaned = block_inpaint(image, mask, config)
+        cleaned = watermark_lib.flat_fill(image, cleaned, watermark_clear_mask(image, blocks))
     assert cleaned.shape == image.shape, f"cleaned shape {cleaned.shape} != page {image.shape}"
     cleaned = restore_untranslated_regions(image, cleaned, blocks)
     print(f"  clean [{idx+1}] {path.name}: OK", flush=True)
@@ -2259,8 +2301,9 @@ def _rate_translation_quality(page_results: list, args: argparse.Namespace) -> f
         f"Return only compact JSON: {{\"scores\": [1, 4, ...]}}.\n{sample_json}"
     )
     try:
-        resp = requests.post(
+        resp = gateway.resilient_post(
             get_openai_chat_completions_url(),
+            kind="quality",
             headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
             data=json.dumps({
                 "model": model,
@@ -2292,6 +2335,93 @@ def _stage_clean_safe(task: tuple) -> tuple:
         idx, path, image, blocks, args = task
         print(f"  clean FAILED [{idx+1}] {path.name}: {exc}, passthrough", file=sys.stderr, flush=True)
         return idx, path, image, [], image.copy()
+
+
+class BatchValidationError(RuntimeError):
+    """The batch finished but its result must not be published (OCR/translation failures, suspicious passthrough).
+    main() prints 'FAILED: ...' as the last log line and exits with EXIT_VALIDATION_FAILED so the worker keeps the
+    raw pages, marks nothing as translated and re-queues the job."""
+
+
+EXIT_VALIDATION_FAILED = 3
+
+
+def _float_env(name: str, default: float) -> float:
+    try:
+        return float(os.environ.get(name, "").strip() or default)
+    except ValueError:
+        return default
+
+
+def enforce_page_failures(what: str, names: list, total: int) -> None:
+    """Raise BatchValidationError when more than OCR_MAX_FAIL_RATIO (default 0.0 = any failure) of the pages failed."""
+    if not names:
+        return
+    ratio = len(names) / max(1, total)
+    limit = _float_env("OCR_MAX_FAIL_RATIO", 0.0)
+    if ratio > limit:
+        raise BatchValidationError(f"{what} on {len(names)} pages: {list(names)}")
+    print(f"[BATCH] WARNING: {what} on {len(names)}/{total} pages {list(names)} "
+          f"(within OCR_MAX_FAIL_RATIO={limit}); raw pages will be kept", flush=True)
+
+
+def rerun_failed_ocr(phase1: list, tasks: list, run=None, cooldown: float | None = None, sleep=None) -> tuple[list, list]:
+    """After phase 1: wait for the gateway to calm down, then re-run the OCR-failed pages ONE AT A TIME.
+    Returns (updated phase1, names of pages that are still failed)."""
+    run = run or _stage_detect_ocr
+    sleep = sleep or time.sleep
+    failed_idx = [r[0] for r in phase1 if r[4].get("ocr_failed")]
+    if not failed_idx:
+        return phase1, []
+    if cooldown is None:
+        cooldown = _float_env("OCR_RERUN_COOLDOWN_SECONDS", 30.0)
+    print(f"[BATCH] {len(failed_idx)} sayfada OCR başarısız; {cooldown:.0f}s bekleyip tek tek yeniden denenecek", flush=True)
+    sleep(cooldown)
+    by_idx = {t[0]: t for t in tasks}
+    out = {r[0]: r for r in phase1}
+    for i in failed_idx:
+        out[i] = run(by_idx[i])
+    result = [out[r[0]] for r in phase1]
+    still = [r[1].name for r in result if r[4].get("ocr_failed")]
+    print(f"[BATCH] OCR yeniden deneme: {len(failed_idx) - len(still)} kurtarıldı, {len(still)} hâlâ başarısız", flush=True)
+    return result, still
+
+
+def passthrough_suspects(phase1: list) -> tuple[list, int]:
+    """(names of pages the detector found text bubbles on but that ended with 0 blocks because OCR came back empty,
+    number of pages with detected blocks). A page with no detections or whose blocks were all filtered for another
+    reason (non-English, ads) is NOT suspect."""
+    with_text = [r for r in phase1 if r[4].get("detected", 0) > 0 and not r[4].get("ocr_failed")]
+    suspects = [r[1].name for r in with_text if r[4].get("kept", 0) == 0 and r[4].get("empty", 0) > 0]
+    return suspects, len(with_text)
+
+
+def check_passthrough_sanity(phase1: list) -> None:
+    suspects, with_text = passthrough_suspects(phase1)
+    if not suspects:
+        return
+    ratio = len(suspects) / max(1, with_text)
+    limit = _float_env("PASSTHROUGH_SUSPECT_RATIO", 0.5)
+    min_pages = int(_float_env("PASSTHROUGH_SUSPECT_MIN_PAGES", 3))
+    msg = (f"{len(suspects)}/{with_text} pages with detected text bubbles ended with 0 blocks "
+           f"(OCR returned nothing): {suspects[:20]}")
+    if ratio > limit and len(suspects) >= min_pages:
+        raise BatchValidationError(f"suspicious passthrough, {msg} (> PASSTHROUGH_SUSPECT_RATIO={limit})")
+    print(f"[BATCH] WARNING passthrough: {msg}", flush=True)
+
+
+def unresolved_translation_pages(page_results: list, source_lang: str) -> list[str]:
+    """Pages holding a block with OCR text that is neither an ad nor noise but has no translation after all
+    retries and the consistency guard."""
+    names = []
+    for path, _img, blocks in page_results:
+        for b in blocks:
+            text = (getattr(b, "text", "") or "").strip()
+            if (text and not getattr(b, "is_ad", False) and not (getattr(b, "translation", "") or "").strip()
+                    and not looks_like_noisy_ocr(text, source_lang)):
+                names.append(path.name)
+                break
+    return names
 
 
 def process_all_batched(images: list[Path], output_dir: Path, args: argparse.Namespace) -> int:
@@ -2347,12 +2477,15 @@ def process_all_batched(images: list[Path], output_dir: Path, args: argparse.Nam
     w1 = _dynamic_workers(base_workers)
     print(f"\n[BATCH] Faz 1/3  detect+ocr  {len(pending)} sayfa  {w1} worker", flush=True)
     t1 = time.perf_counter()
+    phase1_tasks = [(i, p, args, None if i in vision_ad_pages else ad_regions.get(i))
+                    for i, p in enumerate(pending)]
     with ThreadPoolExecutor(max_workers=w1) as pool:
-        phase1 = list(pool.map(
-            _stage_detect_ocr,
-            [(i, p, args, None if i in vision_ad_pages else ad_regions.get(i))
-             for i, p in enumerate(pending)],
-        ))
+        phase1 = list(pool.map(_stage_detect_ocr, phase1_tasks))
+    phase1, ocr_failed_pages = rerun_failed_ocr(phase1, phase1_tasks)
+    # Fail BEFORE spending translate/clean time on a result that must not be published.
+    enforce_page_failures("OCR failed", ocr_failed_pages, len(pending))
+    degraded = list(ocr_failed_pages)
+    check_passthrough_sanity(phase1)
     page_results = [(r[1], r[2], r[3]) for r in phase1]
     n_blk = sum(len(bl) for _, _, bl in page_results)
     print(f"[BATCH] Faz 1 bitti: {time.perf_counter()-t1:.1f}s  toplam {n_blk} blok", flush=True)
@@ -2378,6 +2511,11 @@ def process_all_batched(images: list[Path], output_dir: Path, args: argparse.Nam
             )
             _batch_translate_all(page_results, args)
             score = _rate_translation_quality(page_results, args)
+        # A page with OCR text whose translation is still missing after all retries + the consistency guard
+        # must not be published as if it were translated.
+        unresolved = unresolved_translation_pages(page_results, args.source_lang)
+        enforce_page_failures("translation unresolved", unresolved, len(pending))
+        degraded += [n for n in unresolved if n not in degraded]
     else:
         print(f"\n[BATCH] Faz 2/3  translate atlandi (metin bulunamadi)", flush=True)
 
@@ -2395,6 +2533,7 @@ def process_all_batched(images: list[Path], output_dir: Path, args: argparse.Nam
     # ── Faz 3b: Sequential render + save (Qt main thread) ───────────────────
     skip_full_ad = os.environ.get("SKIP_FULL_AD_PAGES", "true").lower() == "true"
     failed = 0
+    render_failed: list[str] = []
     for idx, path, image, blocks, cleaned in clean_results:
         # GPT-Vision baştan sona reklam dedi (kırpınca içerik kalmıyor) -> atla.
         # Yarı-reklam sayfalarda zaten reklam bölgesi Faz1'de kırpıldı; bu liste
@@ -2419,11 +2558,16 @@ def process_all_batched(images: list[Path], output_dir: Path, args: argparse.Nam
                     print(f"  render retry {attempt}/{max_retries} {path.name}: {exc}", flush=True)
                 else:
                     print(f"  render FAILED {path.name}, passthrough kaydediliyor", file=sys.stderr, flush=True)
+                    render_failed.append(path.name)
                     try:
                         _save_passthrough(path, output_dir, args)
                     except Exception:
                         failed += 1
 
+    # A page that fell back to the untranslated image is a failure too (not published silently).
+    enforce_page_failures("render failed (untranslated fallback)", render_failed, len(pending))
+    degraded += [n for n in render_failed if n not in degraded]
+    args.degraded_pages = degraded
     print(f"\n[BATCH] Toplam sure: {time.perf_counter()-t_total:.1f}s  hata: {failed}", flush=True)
     return failed
 
@@ -2623,7 +2767,14 @@ def main() -> int:
         return 0
 
     if os.environ.get("BATCH_PIPELINE", "true").lower() == "true":
-        failed = process_all_batched(images, output_dir, args)
+        try:
+            failed = process_all_batched(images, output_dir, args)
+        except BatchValidationError as exc:
+            # Nothing is uploaded, no raw page is deleted (R2 or local workdir), exit != 0 so the worker retries.
+            app.quit()
+            print(f"R2 upload/delete skipped: {exc}", flush=True)
+            print(f"FAILED: {exc}", flush=True)
+            return EXIT_VALIDATION_FAILED
     else:
         max_retries = int(os.environ.get("PAGE_MAX_RETRIES", "3"))
         # Resume: skip already-done pages
@@ -2632,6 +2783,7 @@ def main() -> int:
         if skipped:
             print(f"[RESUME] {skipped} sayfa zaten mevcut, atlanıyor", flush=True)
         failed = 0
+        page_failed: list[str] = []
         for index, path in enumerate(pending, start=1):
             print(f"\n=== {index}/{len(pending)} {path.name} ===", flush=True)
             for attempt in range(1, max_retries + 1):
@@ -2643,10 +2795,19 @@ def main() -> int:
                         print(f"  retry {attempt}/{max_retries}: {exc}", flush=True)
                     else:
                         print(f"FAILED {path.name}, passthrough kaydediliyor", file=sys.stderr, flush=True)
+                        page_failed.append(path.name)
                         try:
                             _save_passthrough(path, output_dir, args)
                         except Exception:
                             failed += 1
+        args.degraded_pages = list(page_failed)
+        try:
+            enforce_page_failures("page processing failed (untranslated fallback)", page_failed, len(pending))
+        except BatchValidationError as exc:
+            app.quit()
+            print(f"R2 upload/delete skipped: {exc}", flush=True)
+            print(f"FAILED: {exc}", flush=True)
+            return EXIT_VALIDATION_FAILED
 
     if using_r2 and failed == 0:
         out_prefix = args.r2_output_prefix or translated_prefix(args.r2_input_prefix)
@@ -2657,7 +2818,10 @@ def main() -> int:
             print(f"R2 old translated deleted: {deleted_output} objects", flush=True)
         manifest = upload_directory(upload_dir, out_prefix)
         print(f"R2 uploaded: {manifest['count']} images", flush=True)
-        if args.r2_delete_input:
+        degraded_pages = getattr(args, "degraded_pages", None) or []
+        if args.r2_delete_input and degraded_pages:
+            print(f"R2 raw KEPT: {len(degraded_pages)} pages are not fully translated {degraded_pages[:20]}", flush=True)
+        elif args.r2_delete_input:
             deleted = delete_prefix(args.r2_input_prefix)
             print(f"R2 raw deleted: {deleted} objects", flush=True)
         if not args.r2_keep_workdir:

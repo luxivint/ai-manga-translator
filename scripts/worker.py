@@ -439,13 +439,19 @@ def invalidate_web_cache(manga_slug: str):
         req = urllib.request.Request(
             f"{url}/api/internal/revalidate",
             data=payload,
-            headers={"Content-Type": "application/json", "x-internal-key": key},
+            # Cloudflare (error 1010) rejects urllib's default "Python-urllib" User-Agent with 403 before the
+            # request reaches the app, so send an explicit one.
+            headers={"Content-Type": "application/json", "x-internal-key": key,
+                     "User-Agent": "TrendManga-TranslationWorker/1.0"},
             method="POST",
         )
         with urllib.request.urlopen(req, timeout=5) as resp:
             print(f"cache_invalidated: {manga_slug} status={resp.status}", flush=True)
     except Exception as exc:
         print(f"cache_invalidate_warn: {exc}", flush=True)
+
+
+LOCAL_BATCH_VALIDATION_EXIT = 3  # keep in sync with local_batch.EXIT_VALIDATION_FAILED
 
 
 def translate_chapter(chapter: dict, delete_raw: bool, job_id: str):
@@ -479,7 +485,15 @@ def translate_chapter(chapter: dict, delete_raw: bool, job_id: str):
     else:
         command.append("--no-r2-delete-input")
     print("running:", " ".join(command), flush=True)
-    subprocess.run(command, cwd=ROOT, check=True, env=env)
+    try:
+        subprocess.run(command, cwd=ROOT, check=True, env=env)
+    except subprocess.CalledProcessError as exc:
+        # local_batch exits != 0 BEFORE uploading or deleting anything when OCR/translation failed (code 3 =
+        # "FAILED: OCR failed on N pages ..."). Raising here means: no record_translated_assets, no DB raw delete,
+        # not marked translated; run_once() turns it into QUEUED+retry via mark_failed_or_retry.
+        reason = ("OCR/translation validation failed (see translation.log 'FAILED:' line); raw pages kept"
+                  if exc.returncode == LOCAL_BATCH_VALIDATION_EXIT else f"local_batch crashed (exit {exc.returncode})")
+        raise RuntimeError(f"{reason}; exit code {exc.returncode}") from exc
     return raw_prefix, output_prefix
 
 
