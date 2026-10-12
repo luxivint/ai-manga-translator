@@ -33,6 +33,13 @@ if sys.platform == "win32":
         if _dll_dir.is_dir():
             os.add_dll_directory(str(_dll_dir))
 
+# Importing torch first loads the CUDA/cuDNN DLLs that onnxruntime-gpu needs; without it the
+# RT-DETR detector session silently falls back to CPU when it is created before the segmenter.
+try:
+    import torch  # noqa: F401
+except Exception:
+    pass
+
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 os.environ.setdefault("OMP_NUM_THREADS", "2")
 os.environ.setdefault("OPENBLAS_NUM_THREADS", "2")
@@ -111,12 +118,20 @@ def resolve_stamp_path(args: argparse.Namespace) -> Path:
     return raw_path if raw_path.is_absolute() else (ROOT / raw_path).resolve()
 
 
+def image_quality() -> int:
+    """WEBP/JPEG quality for every page we write (IMAGE_QUALITY, default 95)."""
+    try:
+        return max(1, min(100, int(os.environ.get("IMAGE_QUALITY", "95"))))
+    except ValueError:
+        return 95
+
+
 def save_image_for_format(image: Image.Image, out_path: Path) -> None:
     suffix = out_path.suffix.lower()
     if suffix == ".webp":
-        image.save(out_path, quality=95, method=6)
+        image.save(out_path, quality=image_quality(), method=6)
     elif suffix in {".jpg", ".jpeg"}:
-        image.convert("RGB").save(out_path, quality=95, optimize=True)
+        image.convert("RGB").save(out_path, quality=image_quality(), optimize=True)
     else:
         image.save(out_path)
 
@@ -1715,7 +1730,7 @@ def process_image(path: Path, output_dir: Path, args: argparse.Namespace) -> Pat
             source = ImageOps.exif_transpose(source)
             if output_ext.lower() in {".jpg", ".jpeg", ".webp"} and source.mode not in {"RGB", "RGBA"}:
                 source = source.convert("RGBA" if "A" in source.getbands() else "RGB")
-            source.save(out_path)
+            save_image_for_format(source, out_path)
         apply_page_stamp(out_path, path, args)
         return out_path
 
@@ -2010,7 +2025,8 @@ def _batch_translate_all(page_results: list, args: argparse.Namespace) -> None:
     max_attempts = int(os.environ.get("BATCH_TRANSLATE_RETRY_ATTEMPTS", "3"))
     retry_delay = float(os.environ.get("BATCH_TRANSLATE_RETRY_DELAY_SECONDS", "30"))
 
-    for bi, batch_keys in enumerate(batches):
+    def _translate_one_batch(bi: int, batch_keys: list[str]) -> dict[str, tuple[str, str]]:
+        got: dict[str, tuple[str, str]] = {}
         pending = {k: combined[k] for k in batch_keys}
         print(f"  GPT call [{bi+1}/{len(batches)}]: {len(batch_keys)} blok", flush=True)
 
@@ -2021,7 +2037,7 @@ def _batch_translate_all(page_results: list, args: argparse.Namespace) -> None:
                 print(f"  batch {bi+1} translate FAILED (attempt {attempt}/{max_attempts}): {exc}", flush=True)
                 batch_result = {}
 
-            results.update(batch_result)
+            got.update(batch_result)
             # Only stop once every key we asked for came back; a partial JSON
             # (GPT silently dropping some keys) retries too, asking only for
             # what's still missing so later attempts do less redundant work.
@@ -2033,6 +2049,22 @@ def _batch_translate_all(page_results: list, args: argparse.Namespace) -> None:
             if attempt < max_attempts:
                 print(f"  batch {bi+1}: {retry_delay:.0f}sn sonra tekrar denenecek", flush=True)
                 time.sleep(retry_delay)
+        return got
+
+    # BATCH_TRANSLATE_CONCURRENCY GPT calls in flight at once (default 4; 1 = sequential). Each batch owns
+    # disjoint keys, so results merge without conflicts; retries stay per batch.
+    concurrency = max(1, min(len(batches), int(os.environ.get("BATCH_TRANSLATE_CONCURRENCY", "4"))))
+    if concurrency == 1:
+        for bi, batch_keys in enumerate(batches):
+            results.update(_translate_one_batch(bi, batch_keys))
+    else:
+        saved_max_tokens = engine.max_tokens  # translate_keyed temporarily raises it; undo any drift
+        try:
+            with ThreadPoolExecutor(max_workers=concurrency) as tpool:
+                for part in tpool.map(lambda a: _translate_one_batch(*a), list(enumerate(batches))):
+                    results.update(part)
+        finally:
+            engine.max_tokens = saved_max_tokens
 
     # Güvenlik ağı: GPT bir reklamı kaçırsa bile, blok metninde açık bir
     # domain / URL / davet kodu varsa reklam say (kendi markamız hariç).
@@ -2103,7 +2135,7 @@ def _do_render_and_save(
             src = ImageOps.exif_transpose(src)
             if output_ext.lower() in {".jpg", ".jpeg", ".webp"} and src.mode not in {"RGB", "RGBA"}:
                 src = src.convert("RGBA" if "A" in src.getbands() else "RGB")
-            src.save(out_path)
+            save_image_for_format(src, out_path)
         apply_page_stamp(out_path, path, args, idx + 1)
         print(f"  [{idx+1}/{n_total}] passthrough: {out_path.name}", flush=True)
         return out_path
@@ -2134,19 +2166,28 @@ def _save_passthrough(path: Path, output_dir: Path, args: argparse.Namespace) ->
         src = ImageOps.exif_transpose(src)
         if output_ext.lower() in {".jpg", ".jpeg", ".webp"} and src.mode not in {"RGB", "RGBA"}:
             src = src.convert("RGBA" if "A" in src.getbands() else "RGB")
-        src.save(out_path)
+        save_image_for_format(src, out_path)
     return out_path
 
 
 def _dynamic_workers(base: int) -> int:
-    """Scale worker count up/down based on live CPU load."""
+    """Worker count for a thread-pool phase, adapted to live CPU load.
+
+    BATCH_WORKERS (default 3) is the base. With BATCH_WORKERS_AUTO=true (default) it is
+    raised by 1 when the CPU is idle (<35%) and lowered by 1 when busy (>80%).
+    BATCH_WORKERS_MAX (default 4) caps the raise; an explicit BATCH_WORKERS above it is
+    never lowered by the cap. BATCH_WORKERS_AUTO=false uses BATCH_WORKERS exactly."""
+    if os.environ.get("BATCH_WORKERS_AUTO", "true").strip().lower() in ("false", "0", "no", "off"):
+        return base
     try:
         import psutil
         cpu = psutil.cpu_percent(interval=0.3)
         if cpu > 80:
             adjusted = max(1, base - 1)
         elif cpu < 35:
-            adjusted = min(base + 1, os.cpu_count() or base)
+            cap = max(base, int(os.environ.get("BATCH_WORKERS_MAX", "4")))
+            adjusted = min(base + 1, os.cpu_count() or base, cap)
+            adjusted = max(adjusted, base)
         else:
             return base
         if adjusted != base:
@@ -2258,6 +2299,10 @@ def process_all_batched(images: list[Path], output_dir: Path, args: argparse.Nam
     try:
         _warmup_settings = LocalSettings(args)
         TextBlockDetector(_warmup_settings).detect(imk.read_image(str(pending[0])))
+        from modules.detection.factory import DetectionEngineFactory
+        for _eng in DetectionEngineFactory._engines.values():
+            _prov = getattr(getattr(_eng, "session", None), "get_providers", lambda: ["?"])()
+            print(f"[BATCH] detector device: {'cuda' if _prov[0] == 'CUDAExecutionProvider' else 'cpu'} ({_prov[0]})", flush=True)
         print("[BATCH] Model hazır.", flush=True)
     except Exception as _warmup_exc:
         print(f"[BATCH] Warm-up uyarı: {_warmup_exc}", flush=True)
@@ -2366,6 +2411,14 @@ def verify_output_dims(saved_paths: list, image: np.ndarray) -> None:
         raise ValueError(f"output size {width}x{total_h} != page size {exp_w}x{exp_h}")
 
 
+def _write_array(path: Path, array: np.ndarray) -> None:
+    """Write a page array; webp/jpg use IMAGE_QUALITY (imk.write_image would use Pillow's default 80)."""
+    if path.suffix.lower() in {".webp", ".jpg", ".jpeg"}:
+        save_image_for_format(Image.fromarray(np.ascontiguousarray(array.astype(np.uint8, copy=False))), path)
+    else:
+        imk.write_image(str(path), array)
+
+
 def save_rendered_output(renderer: ImageSaveRenderer, out_path: Path) -> list[Path]:
     final_rgb = renderer.render_to_image()
     max_dimension = int(os.environ.get("WEBP_MAX_DIMENSION", "16000"))
@@ -2377,12 +2430,12 @@ def save_rendered_output(renderer: ImageSaveRenderer, out_path: Path) -> list[Pa
         while top < final_rgb.shape[0]:
             bottom = min(final_rgb.shape[0], top + max_dimension)
             target = out_path.with_name(f"{stem}_part{part:03d}{out_path.suffix}")
-            imk.write_image(str(target), final_rgb[top:bottom, :, :])
+            _write_array(target, final_rgb[top:bottom, :, :])
             saved.append(target)
             top = bottom
             part += 1
         return saved
-    imk.write_image(str(out_path), final_rgb)
+    _write_array(out_path, final_rgb)
     return [out_path]
 
 
@@ -2475,6 +2528,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--font-file", default=os.environ.get("FONT_FILE", ""))
     parser.add_argument("--min-font-size", type=int, default=int(os.environ.get("MIN_FONT_SIZE", "14")))
     parser.add_argument("--max-font-size", type=int, default=int(os.environ.get("MAX_FONT_SIZE", "58")))
+    # An empty suffix is valid (`--suffix=` or OUTPUT_SUFFIX=). Unset OUTPUT_SUFFIX -> "_translated".
     parser.add_argument("--suffix", default=os.environ.get("OUTPUT_SUFFIX", "_translated"))
     parser.add_argument("--output-format", default=os.environ.get("OUTPUT_FORMAT", "webp"), choices=["source", "webp", "png", "jpg", "jpeg"])
     parser.add_argument("--stamp-enabled", default=os.environ.get("STAMP_ENABLED", "true"), choices=["true", "false"])
@@ -2483,7 +2537,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--stamp-opacity", type=float, default=float(os.environ.get("STAMP_OPACITY", "1.0")))
     parser.add_argument("--stamp-width-ratio", type=float, default=float(os.environ.get("STAMP_WIDTH_RATIO", "0.2")))
     parser.add_argument("--stamp-black-background", default=os.environ.get("STAMP_BLACK_BACKGROUND", "false"), choices=["true", "false"])
-    parser.add_argument("--gpu", action="store_true", default=os.environ.get("USE_GPU", "false").lower() == "true")
+    # GPU is ON by default when CUDA is available (USE_GPU=auto|true|false); --gpu/--no-gpu override.
+    # It selects the device of the RT-DETR detector; the segmenter/LaMa follow SEG_DEVICE/LAMA_DEVICE (auto).
+    parser.add_argument("--gpu", action=argparse.BooleanOptionalAction,
+                        default=compute_device.resolve_use_gpu(os.environ.get("USE_GPU"), compute_device.ort_cuda_available()))
     parser.add_argument("--uppercase", action=argparse.BooleanOptionalAction, default=os.environ.get("UPPERCASE", "true").lower() == "true")
     parser.add_argument("--no-outline", action="store_true", default=os.environ.get("NO_OUTLINE", "false").lower() == "true")
     parser.add_argument("--r2-input-prefix", default=os.environ.get("R2_INPUT_PREFIX", ""))
@@ -2499,6 +2556,10 @@ def parse_args() -> argparse.Namespace:
 def main() -> int:
     args = parse_args()
     os.environ["MASK_REFINER"] = args.mask_refiner
+    if not args.gpu:
+        # --no-gpu / USE_GPU=false: cleaning also stays on CPU unless SEG_DEVICE/LAMA_DEVICE say otherwise
+        os.environ.setdefault("SEG_DEVICE", "cpu")
+        os.environ.setdefault("LAMA_DEVICE", "cpu")
     load_env((ROOT / args.env).resolve())
     app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
     args.resolved_font = resolve_font(args)

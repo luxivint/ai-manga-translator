@@ -280,7 +280,7 @@ the full list with defaults and comments. The major groups:
 | Languages | `SOURCE_LANG`, `TARGET_LANG` |
 | Engine selection | `DETECTOR`, `OCR`, `TRANSLATOR`, `OPENAI_API_KEY`, `OPENAI_MODEL` |
 | Font / rendering | `FONT_FAMILY`, `FONT_FILE`, `MIN_FONT_SIZE`, `MAX_FONT_SIZE`, `UPPERCASE`, `NO_OUTLINE` |
-| Output | `OUTPUT_SUFFIX`, `OUTPUT_FORMAT`, `WEBP_MAX_DIMENSION` |
+| Output | `OUTPUT_SUFFIX`, `OUTPUT_FORMAT`, `IMAGE_QUALITY`, `WEBP_MAX_DIMENSION` |
 | Cleanup tuning | `BUBBLE_*`, `LIGHT_*`, `CROP_CLEAN_*`, `PANEL_SKIP_*` heuristics |
 
 ### Branding and SEO are fully overridable
@@ -324,18 +324,31 @@ The extra comic fonts used by the style-aware renderer are not committed, becaus
 
 ## GPU
 
-The cleaning stage (YOLO text segmenter + LaMa inpainting) runs on an NVIDIA GPU when one is available and falls back to CPU otherwise. `requirements.txt` is the CPU baseline. To switch a venv to GPU:
+The GPU is **on by default when CUDA is available** and falls back to CPU otherwise (`USE_GPU=auto`). It covers the RT-DETR detector (`USE_GPU` / `--gpu` / `--no-gpu`), and the YOLO text segmenter and LaMa inpainting (`SEG_DEVICE` / `LAMA_DEVICE`, `auto|cuda|cpu`, default `auto`). `USE_GPU=false` or `--no-gpu` turns everything to CPU (unless `SEG_DEVICE`/`LAMA_DEVICE` are set explicitly); `USE_GPU=true` forces it on but still falls back to CPU when CUDA is missing. OCR and translation are remote API calls and do not use the local GPU. `requirements.txt` is the CPU baseline. To switch a venv to GPU:
 
 ```
 pip uninstall -y onnxruntime torch torchvision
 pip install -r requirements-gpu.txt
 ```
 
-This installs CUDA 13 builds of torch/torchvision and `onnxruntime-gpu` (needs an NVIDIA driver with CUDA 13 support). Never keep `onnxruntime` and `onnxruntime-gpu` installed together. At startup the log shows `[clean] segmenter device: cuda` and `[clean] LaMa device: cuda` when the GPU is used. `SEG_DEVICE` and `LAMA_DEVICE` (`auto|cuda|cpu`) override the choice.
+This installs CUDA 13 builds of torch/torchvision and `onnxruntime-gpu` (needs an NVIDIA driver with CUDA 13 support). Never keep `onnxruntime` and `onnxruntime-gpu` installed together. At startup the log shows `[BATCH] detector device: cuda`, `[clean] segmenter device: cuda` and `[clean] LaMa device: cuda` when the GPU is used. The TensorRT execution provider is not used unless `USE_TENSORRT=true`.
 
 ## Defaults
 
-Out of the box `local_batch.py` and the worker use `RENDER_V2=true` (balloon- and style-aware typesetting), `RENDER_STYLE_TAGS=true` (the translator tags each line's style), `BATCH_PIPELINE=true` (3-phase batch pipeline) and `BATCH_WORKERS=3`. Set the matching environment variable to override any of them, for example `BATCH_PIPELINE=false`.
+Out of the box `local_batch.py` and the worker use:
+
+| Setting | Default | Notes |
+|---|---|---|
+| `USE_GPU` | `auto` | GPU when CUDA is available, else CPU; `--no-gpu` to opt out |
+| `OUTPUT_FORMAT` | `webp` | quality `IMAGE_QUALITY=95` (about 230 KB per 800x1600 page vs about 1.2 MB PNG); the worker always uploads webp |
+| `OUTPUT_SUFFIX` | `_translated` | may be empty: `--suffix=` or `OUTPUT_SUFFIX=` (a bare `--suffix ""` is dropped by some shells) |
+| `BATCH_PIPELINE` | `true` | 3-phase batch pipeline |
+| `BATCH_WORKERS` | `3` | thread-pool base for detect+OCR and clean phases |
+| `BATCH_WORKERS_AUTO` / `BATCH_WORKERS_MAX` | `true` / `4` | with auto on, the base goes +1 when the CPU is idle (<35%) and -1 when busy (>80%), never above `BATCH_WORKERS_MAX`; the log shows `[CPU n%] worker: 3 -> 4`. Set `BATCH_WORKERS_AUTO=false` for exactly `BATCH_WORKERS` |
+| `BATCH_TRANSLATE_CONCURRENCY` | `4` | parallel GPT translate calls (each call is 3 pages); `1` = sequential |
+| `RENDER_V2`, `RENDER_STYLE_TAGS` | `true` | balloon- and style-aware typesetting |
+
+Set the matching environment variable to override any of them, for example `BATCH_PIPELINE=false`.
 
 ## License
 

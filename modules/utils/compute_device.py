@@ -23,6 +23,17 @@ def env_device(var: str, cuda_available: bool) -> str:
     return resolve_setting(os.environ.get(var, "auto"), cuda_available)
 
 
+def resolve_use_gpu(setting: str | None, cuda_available: bool) -> bool:
+    """USE_GPU -> bool. unset/empty/auto = on when CUDA is available; true/1/yes/on = on;
+    false/0/no/off = off. Unknown values behave like auto."""
+    s = (setting or "auto").strip().lower()
+    if s in ("false", "0", "no", "off"):
+        return False
+    if s in ("true", "1", "yes", "on"):
+        return True
+    return bool(cuda_available)
+
+
 def torch_cuda_available() -> bool:
     try:
         import torch

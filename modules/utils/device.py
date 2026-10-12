@@ -184,6 +184,11 @@ def get_providers(device: Optional[str] = None) -> list[Any]:
         }
     }
 
+    # TensorRT is opt-in (USE_TENSORRT=true): when its DLLs (nvinfer) are missing ORT prints a
+    # load error before falling back to CUDA, and the engine build is slow anyway.
+    if os.environ.get("USE_TENSORRT", "false").strip().lower() not in ("true", "1", "yes", "on"):
+        available = [p for p in available if p != 'TensorrtExecutionProvider'] or ['CPUExecutionProvider']
+
     configured: list[Any] = []
     for p in available:
         if p in provider_options:

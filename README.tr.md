@@ -333,18 +333,31 @@ Stile duyarlı renderer'ın kullandığı ek çizgi roman fontları, yeniden da�
 
 ## GPU
 
-Temizleme aşaması (YOLO metin segmenter + LaMa inpainting) NVIDIA GPU varsa onu kullanır, yoksa CPU'ya düşer. `requirements.txt` CPU tabanıdır. Bir venv'i GPU'ya geçirmek için:
+CUDA varsa GPU **varsayılan olarak açıktır**, yoksa CPU'ya düşülür (`USE_GPU=auto`). RT-DETR dedektörünü (`USE_GPU` / `--gpu` / `--no-gpu`), YOLO metin segmenter'ı ve LaMa inpainting'i (`SEG_DEVICE` / `LAMA_DEVICE`, `auto|cuda|cpu`, varsayılan `auto`) kapsar. `USE_GPU=false` veya `--no-gpu` her şeyi CPU'ya alır (`SEG_DEVICE`/`LAMA_DEVICE` açıkça verilmedikçe); `USE_GPU=true` zorla açar, CUDA yoksa yine CPU'ya düşer. OCR ve çeviri uzak API çağrılarıdır, yerel GPU kullanmaz. `requirements.txt` CPU tabanıdır. Bir venv'i GPU'ya geçirmek için:
 
 ```
 pip uninstall -y onnxruntime torch torchvision
 pip install -r requirements-gpu.txt
 ```
 
-Bu komut torch/torchvision'ın CUDA 13 sürümlerini ve `onnxruntime-gpu`'yu kurar (CUDA 13 destekli NVIDIA sürücüsü gerekir). `onnxruntime` ile `onnxruntime-gpu` aynı anda kurulu kalmamalı. GPU kullanıldığında günlükte `[clean] segmenter device: cuda` ve `[clean] LaMa device: cuda` satırları görünür. `SEG_DEVICE` ve `LAMA_DEVICE` (`auto|cuda|cpu`) seçimi değiştirir.
+Bu komut torch/torchvision'ın CUDA 13 sürümlerini ve `onnxruntime-gpu`'yu kurar (CUDA 13 destekli NVIDIA sürücüsü gerekir). `onnxruntime` ile `onnxruntime-gpu` aynı anda kurulu kalmamalı. GPU kullanıldığında günlükte `[BATCH] detector device: cuda`, `[clean] segmenter device: cuda` ve `[clean] LaMa device: cuda` satırları görünür. TensorRT sağlayıcısı `USE_TENSORRT=true` verilmedikçe kullanılmaz.
 
 ## Varsayılanlar
 
-`local_batch.py` ve worker varsayılan olarak `RENDER_V2=true` (balon ve stile duyarlı dizgi), `RENDER_STYLE_TAGS=true` (çevirmen her satırın stilini etiketler), `BATCH_PIPELINE=true` (3 aşamalı toplu işlem) ve `BATCH_WORKERS=3` ile çalışır. Herhangi birini değiştirmek için aynı adlı ortam değişkenini ayarlayın, örneğin `BATCH_PIPELINE=false`.
+`local_batch.py` ve worker varsayılan olarak şunlarla çalışır:
+
+| Ayar | Varsayılan | Not |
+|---|---|---|
+| `USE_GPU` | `auto` | CUDA varsa GPU, yoksa CPU; kapatmak için `--no-gpu` |
+| `OUTPUT_FORMAT` | `webp` | kalite `IMAGE_QUALITY=95`; worker her zaman webp yükler |
+| `OUTPUT_SUFFIX` | `_translated` | boş olabilir: `--suffix=` veya `OUTPUT_SUFFIX=` (bazı kabuklar çıplak `--suffix ""` değerini düşürür) |
+| `BATCH_PIPELINE` | `true` | 3 aşamalı toplu işlem |
+| `BATCH_WORKERS` | `3` | detect+OCR ve temizleme aşamaları için thread havuzu tabanı |
+| `BATCH_WORKERS_AUTO` / `BATCH_WORKERS_MAX` | `true` / `4` | auto açıkken CPU boşta (<%35) ise taban +1, meşgulse (>%80) -1 olur, `BATCH_WORKERS_MAX` değerini aşmaz; günlükte `[CPU n%] worker: 3 -> 4` görünür. Tam `BATCH_WORKERS` için `BATCH_WORKERS_AUTO=false` |
+| `BATCH_TRANSLATE_CONCURRENCY` | `4` | paralel GPT çeviri çağrısı (her çağrı 3 sayfa); `1` = sıralı |
+| `RENDER_V2`, `RENDER_STYLE_TAGS` | `true` | balon ve stile duyarlı dizgi |
+
+Herhangi birini değiştirmek için aynı adlı ortam değişkenini ayarlayın, örneğin `BATCH_PIPELINE=false`.
 
 ## Lisans
 

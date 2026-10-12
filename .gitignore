@@ -62,3 +62,8 @@ FONT KLASÖR/
 .vscode/
 .idea/
 *.swp
+
+# Local benchmark/smoke scratch dirs
+output_smoke/
+output_chapter_in/
+output_chapter_test/
