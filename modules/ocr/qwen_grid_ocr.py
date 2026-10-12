@@ -13,6 +13,9 @@ from PIL import Image, ImageDraw, ImageFont
 from modules.utils.textblock import TextBlock, adjust_text_line_coordinates
 from modules.utils.openai_endpoint import get_openai_chat_completions_url, get_openai_model
 
+from modules.utils import gateway
+from modules.utils.gateway import GatewayError, OCRFailedError
+
 from .base import OCREngine
 
 
@@ -82,18 +85,27 @@ class QwenGridOCR(OCREngine):
         parsed: list[dict[str, Any]] = []
         data: dict[str, Any] = {}
         seconds = 0.0
+        content = ""
         for attempt in range(1, max_attempts + 1):
             started = time.time()
-            response = requests.post(
-                self.api_base_url,
-                headers={"Content-Type": "application/json", "Authorization": f"Bearer {self.api_key}"},
-                data=json.dumps(payload),
-                timeout=int(os.environ.get("QWEN_GRID_OCR_TIMEOUT", "90")),
-            )
+            # Transport resilience (retry/backoff, circuit breaker, OCR_CONCURRENCY slot) lives in gateway.
+            # A failed call raises OCRFailedError; it is never turned into "no text on this page".
+            try:
+                response = gateway.resilient_post(
+                    self.api_base_url,
+                    headers={"Content-Type": "application/json", "Authorization": f"Bearer {self.api_key}"},
+                    data=json.dumps(payload),
+                    timeout=int(os.environ.get("QWEN_GRID_OCR_TIMEOUT", "90")),
+                    kind="ocr",
+                    limiter=gateway.ocr_limiter(),
+                )
+            except GatewayError as exc:
+                print(f"Qwen grid OCR failed: {exc}", flush=True)
+                raise OCRFailedError(str(exc)) from exc
             seconds = time.time() - started
             if response.status_code != 200:
-                print(f"Qwen grid OCR API error: {response.status_code} {response.text}", flush=True)
-                return blk_list
+                print(f"Qwen grid OCR API error: {response.status_code} {response.text[:300]}", flush=True)
+                raise OCRFailedError(f"OCR API error {response.status_code}")
 
             data = response.json()
             content = ((data.get("choices") or [{}])[0].get("message") or {}).get("content") or ""
@@ -107,6 +119,10 @@ class QwenGridOCR(OCREngine):
                     flush=True,
                 )
 
+        if not parsed and not self._is_valid_empty_answer(content):
+            # no JSON list at all (empty / prose / cut-off stream): that is a failed read, not "no text"
+            raise OCRFailedError(f"OCR answer is not parseable JSON (len={len(content)})")
+
         for item in parsed:
             try:
                 crop_id = int(item.get("id"))
@@ -118,6 +134,11 @@ class QwenGridOCR(OCREngine):
 
         self._log_usage(data.get("usage") or {}, seconds, len(blk_list))
         return blk_list
+
+    @staticmethod
+    def _is_valid_empty_answer(content: str) -> bool:
+        """True when the model really answered with an empty list ([] / {"items": []})."""
+        return bool(re.search(r"\[\s*\]", content or ""))
 
     @staticmethod
     def _looks_like_failed_batch(parsed: list[dict[str, Any]], crop_count: int) -> bool:

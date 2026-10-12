@@ -8,6 +8,7 @@ import uuid
 from .base import BaseLLMTranslation
 from ...utils.translator_utils import MODEL_MAP
 from ...utils.openai_endpoint import get_openai_chat_completions_url, get_openai_model
+from ...utils import gateway
 
 
 def _float_env(name: str, default: float) -> float:
@@ -233,17 +234,20 @@ class GPTTranslation(BaseLLMTranslation):
         Make API request and process response
         """
         try:
-            response = requests.post(
+            # retry/backoff + shared circuit breaker for 503 / timeouts / broken streams (raises GatewayError)
+            response = gateway.resilient_post(
                 self.api_base_url,
                 headers=headers,
                 data=json.dumps(payload),
-                timeout=self.timeout
+                timeout=self.timeout,
+                kind="translate",
             )
             if response.status_code == 400 and "temperature" in response.text.lower():
                 # some models only accept the default sampling parameters: retry without them
                 payload = {k: v for k, v in payload.items() if k not in ("temperature", "top_p")}
-                response = requests.post(self.api_base_url, headers=headers,
-                                         data=json.dumps(payload), timeout=self.timeout)
+                response = gateway.resilient_post(self.api_base_url, headers=headers,
+                                                  data=json.dumps(payload), timeout=self.timeout,
+                                                  kind="translate")
 
             response.raise_for_status()
             response_data = response.json()
