@@ -167,6 +167,8 @@ class LLMTranslation(TranslationEngine):
             "by \\n in reading order (top to bottom). Words that sit on the same row of the image (menu items) "
             "stay together on one line."
             "\n        - Keep the speaker's person and tone consistent between neighbouring blocks."
+            "\n        - When one sentence continues across two blocks, write each word ONCE: never repeat the "
+            "last word(s) of a block at the start of the next block (no 'I HOPE' / 'HOPE MY COUNTRY' echo)."
         )
         style_rule = block_rules + style_rule
         if ad_detection:

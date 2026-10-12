@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import math
+import statistics
 import os
 from pathlib import Path
 
@@ -18,6 +19,7 @@ from PySide6.QtGui import QColor, QFont, QFontDatabase, QFontMetricsF, QTextBloc
 
 from app.ui.canvas.text.text_item_properties import TextItemProperties
 from app.ui.canvas.text_item import OutlineInfo, OutlineType
+from modules.rendering import balloon_layout as bl
 from modules.rendering import font_metrics as fm
 from modules.rendering import orig_mask
 from modules.rendering import font_profiles as fp
@@ -307,16 +309,24 @@ def lines_inside(plan, text: str, size: int, region, line_spacing: float, frac: 
     if inner is None:
         return True
     width, line_h = make_measure(plan["family"], line_spacing)(size)
+    strict = bool(plan.get("strict"))  # members of a multi-block balloon: every line box (plus clearance) inside
+    side = 0.02 * inner.shape[1] if strict else 0.0  # clearance to the outline on top of the eroded mask
     lines = text.split("\n")
     total = line_h * len(lines)
     cx, cy = (region[0] + region[2]) / 2, (region[1] + region[3]) / 2
     for i, ln in enumerate(lines):
         w = width(ln)
         y0, y1 = cy - total / 2 + i * line_h, cy - total / 2 + (i + 0.9) * line_h
-        x0, x1 = cx - w / 2, cx + w / 2
+        x0, x1 = cx - w / 2 - side, cx + w / 2 + side
         crop = inner[max(0, int(y0 - off[1])):max(0, int(y1 - off[1])), max(0, int(x0 - off[0])):max(0, int(x1 - off[0]))]
         if crop.size == 0 or int(y0 - off[1]) < 0 or int(x0 - off[0]) < 0 or float(crop.mean()) < frac:
             return False
+        if strict:  # the four corners of the line box (plus clearance) must lie inside the balloon, not just 97 percent of its area
+            ih, iw = inner.shape
+            for px, py in ((x0, y0), (x1, y0), (x0, y1), (x1, y1)):
+                qx, qy = int(px - off[0]), int(py - off[1])
+                if qx < 0 or qy < 0 or qx >= iw or qy >= ih or not inner[qy, qx]:
+                    return False
     return True
 
 
@@ -430,6 +440,111 @@ def split_merged_blocks(blocks, orig_boxes, image, cleaned):
     return out_b, out_o
 
 
+def _source_cap(image: np.ndarray, obox) -> float:
+    """Letter height of the original lettering in a box (component based, so multi-row blocks do not inflate it)."""
+    try:
+        mask, _ = tst.ink_mask_original(image, obox)
+        return float(tst.cap_height(mask)) if mask.any() else 0.0
+    except Exception:
+        return 0.0
+
+
+def prepare_balloon_blocks(blocks, orig_boxes, image):
+    """Blocks that share a balloon: drop words one block repeats from the previous one (a sentence continued across
+    blocks that the translator wrote out twice) and, when RENDER_MERGE_BALLOON is on and the blocks read as one
+    continued speech, lay them out as ONE paragraph block (one font, one size, balanced wrapping)."""
+    import copy
+
+    from modules.translation import consistency
+
+    n = len(blocks)
+    if n < 2:
+        return blocks, orig_boxes
+    bubbles = [None if getattr(b, "bubble_xyxy", None) is None else tuple(float(v) for v in b.bubble_xyxy) for b in blocks]
+    boxes = [[float(v) for v in o] for o in orig_boxes]
+    blocks, orig_boxes = list(blocks), list(orig_boxes)
+    drop: set[int] = set()
+    for g in bl.group_by_balloon(bubbles, boxes):
+        g = [i for i in g if (blocks[i].translation or "").strip() and not getattr(blocks[i], "is_ad", False)]
+        if len(g) < 2:
+            continue
+        texts = consistency.dedupe_adjacent([blocks[i].translation.strip() for i in g])
+        for i, t in zip(g, texts):
+            if t != blocks[i].translation.strip():
+                blocks[i] = copy.copy(blocks[i])
+                blocks[i].translation = t
+        if not bl.merge_enabled():
+            continue
+        styles = [((getattr(blocks[i], "style", "") or "normal").lower()) for i in g]
+        styles = [st if st in VALID_STYLES else "normal" for st in styles]
+        rows = [_source_cap(image, orig_boxes[i]) for i in g]
+        gaps = [float(orig_boxes[g[k + 1]][1]) - float(orig_boxes[g[k]][3]) for k in range(len(g) - 1)]
+        texts = [blocks[i].translation for i in g]
+        bases = [i for i in g if bubbles[i] is not None and blocks[i].text_class == "text_bubble"]
+        if os.environ.get("RENDER_DEBUG"):
+            print(f"[merge-check] ids={g} styles={styles} rows={[round(float(r), 1) for r in rows]} gaps={[round(x) for x in gaps]} bases={bases}", flush=True)
+        if not bases or not bl.mergeable(texts, styles, gaps, rows):
+            continue
+        base = max(bases, key=lambda i: (boxes[i][2] - boxes[i][0]) * (boxes[i][3] - boxes[i][1]))
+        merged = copy.copy(blocks[base])
+        merged.translation = " ".join(t.strip() for t in texts)
+        merged.text = " ".join((getattr(blocks[i], "text", "") or "").strip() for i in g).strip()
+        box = np.array([min(boxes[i][0] for i in g), min(boxes[i][1] for i in g),
+                        max(boxes[i][2] for i in g), max(boxes[i][3] for i in g)])
+        merged.xyxy = box.copy()
+        blocks[g[0]], orig_boxes[g[0]] = merged, box
+        drop.update(g[1:])
+        if os.environ.get("RENDER_DEBUG"):
+            print(f"[merge-balloon] {len(g)} blocks -> one paragraph: {merged.translation[:70]!r}", flush=True)
+    if drop:
+        keep = [i for i in range(n) if i not in drop]
+        blocks, orig_boxes = [blocks[i] for i in keep], [orig_boxes[i] for i in keep]
+    return blocks, orig_boxes
+
+
+def resolve_item_overlaps(items: list, plans: list, W: int, H: int, direction) -> int:
+    """Rendered text boxes may not overlap (a later block's glow/outline or glyphs would hide an earlier block).
+    Overlapping boxes are first pushed apart vertically (budget 60 percent of their own height for free text, 15
+    percent inside a balloon), then both shrink one point at a time until clear or at the floor size.
+    Returns the number of overlapping pairs that remain (0 = clean). RENDER_RESOLVE_OVERLAP=false disables."""
+    if not bl.overlap_enabled() or len(items) < 2:
+        return 0
+
+    def poly(d):
+        x, y = d["position"]
+        w, h = float(d["width"]), float(d["height"])
+        ix, iy = 4.0, 4.0 + 0.06 * h  # the document margin and line-spacing slack do not count as ink
+        org = d.get("transform_origin")
+        ox, oy = (org[0], org[1]) if org is not None and len(org) == 2 else (w / 2, h / 2)
+        return bl.rotated_rect(x + ix, y + iy, max(1.0, w - 2 * ix), max(1.0, h - 2 * iy), float(d.get("rotation") or 0.0),
+                               (ox - ix, oy - iy))
+
+    remaining = 0
+    for rnd in range(10):
+        pairs = bl.overlapping_pairs([poly(d) for d in items])
+        remaining = len(pairs)
+        if not pairs:
+            return 0
+        idx = sorted({k for a, b, _ in pairs for k in (a, b)})
+        flat = [k for k in idx if not float(items[k].get("rotation") or 0.0)]
+        if flat and rnd < 4:
+            boxes = [[items[k]["position"][0], items[k]["position"][1], items[k]["width"], items[k]["height"]] for k in flat]
+            shift = [(0.15 if plans[k]["bubble"] else 0.6) * items[k]["height"] for k in flat]
+            for k, b in zip(flat, bl.separate_vertically(boxes, H, shift)):
+                items[k]["position"] = (items[k]["position"][0], int(round(b[1])))
+            continue
+        for k in idx:  # still overlapping after the move budget: shrink about the centre
+            d = items[k]
+            if d["font_size"] <= FLOOR_SIZE:
+                continue
+            cx, cy = d["position"][0] + d["width"] / 2, d["position"][1] + d["height"] / 2
+            size = d["font_size"] - 1
+            w, h = doc_size(d["text"], d["font_family"], size, d["line_spacing"], d["alignment"], direction)
+            d["font_size"], d["width"], d["height"] = size, w, h
+            d["position"] = (int(cx - w / 2), int(cy - h / 2))
+    return remaining
+
+
 def build_items(blocks, image, cleaned, orig_boxes, render_settings, alignment, target_code: str):
     """Returns list of TextItemProperties dicts (V2 layout)."""
     H, W = image.shape[:2]
@@ -437,6 +552,7 @@ def build_items(blocks, image, cleaned, orig_boxes, render_settings, alignment, 
     policy = casing_policy(render_settings.upper_case)
     plans = []
     blocks, orig_boxes = split_merged_blocks(blocks, orig_boxes, image, cleaned)
+    blocks, orig_boxes = prepare_balloon_blocks(blocks, orig_boxes, image)
     for blk, obox in zip(blocks, orig_boxes):
         raw = (blk.translation or "")
         if not raw.strip() or len(raw.strip()) == 1:
@@ -503,6 +619,16 @@ def build_items(blocks, image, cleaned, orig_boxes, render_settings, alignment, 
             cnts, _ = cv2.findContours(inner.astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
             pts = np.concatenate(cnts) if cnts else None
             hull_area = float(cv2.contourArea(cv2.convexHull(pts))) if pts is not None else 0.0
+            if hull_area > 0 and float(inner.sum()) / hull_area < 0.88 and bl.unify_enabled():
+                # the cleaned page can be patchy (light-region wipes, repaint artefacts): the balloon outline is still
+                # intact on the ORIGINAL page, so measure the interior there before giving up on the balloon shape
+                alt_r, alt_inner, alt_off = bubble_interior_ex(image, blk)
+                if alt_inner is not None:
+                    acnts, _ = cv2.findContours(alt_inner.astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+                    apts = np.concatenate(acnts) if acnts else None
+                    a_hull = float(cv2.contourArea(cv2.convexHull(apts))) if apts is not None else 0.0
+                    if a_hull > 0 and float(alt_inner.sum()) / a_hull >= 0.88:
+                        region, inner, ioff, hull_area = alt_r, alt_inner, alt_off, 0.0
             if hull_area > 0 and float(inner.sum()) / hull_area < 0.88:
                 # ragged flood fill (translucent hologram, textured panel): the balloon shape is not trustworthy, so
                 # the text may only use the footprint of the original lettering (+12% sideways, +45% vertically)
@@ -546,6 +672,43 @@ def build_items(blocks, image, cleaned, orig_boxes, render_settings, alignment, 
                           bubble=is_bubble, colors=(text_rgb, bg_rgb, flat), analysis=colors, angle=angle,
                           cap_h=cap_h, list_like=list_like, obox=[int(v) for v in obox], region_kind=("interior" if is_bubble else "other"), src_traits=src_traits, inner=inner, inner_off=ioff,
                           n_src_lines=n_src_lines))
+
+    # balloon groups: blocks sharing one balloon (free text lying inside a balloon counts) get ONE font family and a
+    # source cap-height compressed toward the balloon median (RENDER_BALLOON_UNIFY=false restores per-block sizing)
+    balloon_groups: list[list[int]] = []
+    if bl.unify_enabled() and len(plans) >= 2:
+        speech = [p["style"] in bl.SPEECH_STYLES and not p["list_like"] for p in plans]
+        cand = [i for i in range(len(plans)) if speech[i]]
+        for g in bl.group_by_balloon([None if plans[i]["blk"].bubble_xyxy is None else tuple(float(v) for v in plans[i]["blk"].bubble_xyxy) for i in cand],
+                                     [plans[i]["obox"] for i in cand]):
+            balloon_groups.append([cand[k] for k in g])
+        for g in balloon_groups:
+            for i in g:
+                plans[i]["strict"] = True
+            lead = max(g, key=lambda i: len(plans[i]["text"]))
+            own = [i for i in g if plans[i]["bubble"] and not plans[i]["angle"]]
+            if len(own) >= 2:
+                # several blocks of one balloon would all be centred in the SAME interior and print on top of each
+                # other: each keeps to its own band of the balloon (its original rows +- 25 percent)
+                for i in own:
+                    rx1, ry1, rx2, ry2 = plans[i]["region"]
+                    _, oy1, _, oy2 = [float(v) for v in plans[i]["obox"]]
+                    h = oy2 - oy1
+                    ny1, ny2 = max(ry1, int(oy1 - 0.25 * h)), min(ry2, int(oy2 + 0.25 * h))
+                    if ny2 - ny1 >= 0.6 * h:
+                        plans[i]["region"] = (rx1, ny1, rx2, ny2)
+            shape = next((i for i in g if plans[i]["bubble"] and plans[i]["inner"] is not None), None)
+            for i in g:  # free lettering inside the balloon is held to the same interior mask as its neighbours
+                if shape is not None and plans[i]["inner"] is None and not plans[i]["bubble"] and not plans[i]["angle"]:
+                    plans[i]["inner"], plans[i]["inner_off"] = plans[shape]["inner"], plans[shape]["inner_off"]
+            caps = bl.compress_caps([plans[i]["cap_h"] for i in g])
+            for i, c in zip(g, caps):
+                plans[i]["cap_h"] = c
+                if i != lead and (plans[i]["family"] != plans[lead]["family"] or plans[i]["italic"] != plans[lead]["italic"]):
+                    plans[i].update(family=plans[lead]["family"], font_rel=plans[lead]["font_rel"], italic=plans[lead]["italic"])
+                    plans[i]["text"] = fp.sanitize_for_font(plans[i]["text"], plans[lead]["font_rel"])
+            if os.environ.get("RENDER_DEBUG"):
+                print(f"[balloon-group] {g} family={plans[lead]['family']} caps={[round(plans[i]['cap_h'], 1) for i in g]}", flush=True)
 
     def fit_list(plan, region, max_size):
         """List / status window: every entry stays on ONE row (never wraps); the size shrinks until the widest
@@ -634,15 +797,65 @@ def build_items(blocks, image, cleaned, orig_boxes, render_settings, alignment, 
             if cap < fits[i][1]:
                 fits[i] = fit_once(plans[i], plans[i]["fit_region"], cap)
 
+    def balloon_cap(limit_fn):
+        """Re-fit the members of every balloon group under the size limit limit_fn(sizes, caps) -> [max | None]."""
+        for g in balloon_groups:
+            limits = limit_fn([fits[i][1] for i in g], [plans[i]["cap_h"] for i in g])
+            for i, lim in zip(g, limits):
+                if lim is not None and fits[i][1] > lim:
+                    fits[i] = fit_once(plans[i], plans[i]["fit_region"], max(FLOOR_SIZE, int(lim)))
+
+    # one size band per balloon: nobody above median*(1+band) unless the source clearly had emphasis
+    balloon_cap(bl.size_limits)
+
+    def balloon_raise():
+        """Free-text pieces inside a balloon that came out far smaller than their neighbours (their own tiny box
+        limited them) may grow towards the balloon median inside the balloon interior of the lead block."""
+        for g in balloon_groups:
+            lead = next((i for i in g if plans[i]["bubble"] and plans[i]["inner"] is not None), None)
+            if lead is None:
+                continue
+            sizes = [fits[i][1] for i in g]
+            med = statistics.median(sizes)
+            lo = int(med * (1.0 - bl.band()))
+            lr = plans[lead]["fit_region"]
+            for i in g:
+                p = plans[i]
+                if (fits[i][1] >= lo or p["bubble"] or p["angle"]
+                        or bl.is_emphasis(p["cap_h"], [plans[j]["cap_h"] for j in g if j != i])):
+                    continue
+                ox1, oy1, ox2, oy2 = [float(v) for v in p["obox"]]
+                cx, h = (ox1 + ox2) / 2, oy2 - oy1
+                half = min(cx - lr[0], lr[2] - cx)
+                if half <= (ox2 - ox1) / 2:
+                    continue
+                wide = (int(cx - half), int(max(0, oy1 - 0.3 * h)), int(cx + half), int(min(H, oy2 + 0.3 * h)))
+                cand = fit_once(p, wide, int(med))
+                probe = dict(p, inner=plans[lead]["inner"], inner_off=plans[lead]["inner_off"])
+                if cand[1] > fits[i][1] and lines_inside(probe, cand[0], cand[1], wide, line_spacing, 0.93):
+                    fits[i] = cand
+                    p["fit_region"], p["inner"], p["inner_off"] = wide, plans[lead]["inner"], plans[lead]["inner_off"]
+
+    balloon_raise()
+
     # last guard: never let a laid-out line cross the balloon / panel border (shrink until inside or at the floor)
-    for i, plan in enumerate(plans):
-        out, size = fits[i][0], fits[i][1]
-        guard = 0
-        while (plan["inner"] is not None and size > FLOOR_SIZE and guard < 14
-               and not lines_inside(plan, out, size, plan["fit_region"], line_spacing, 0.9)):
-            fits[i] = fit_once(plan, plan["fit_region"], size - 1)
+    def guard_fit():
+        for i, plan in enumerate(plans):
             out, size = fits[i][0], fits[i][1]
-            guard += 1
+            guard = 0
+            while (plan["inner"] is not None and size > FLOOR_SIZE and guard < 14
+                   and not lines_inside(plan, out, size, plan["fit_region"], line_spacing, 0.97 if plan.get("strict") else 0.9)):
+                fits[i] = fit_once(plan, plan["fit_region"], size - 1)
+                out, size = fits[i][0], fits[i][1]
+                guard += 1
+
+    before = [f[1] for f in fits]
+    guard_fit()
+    if any(f[1] < b for f, b in zip(fits, before)):
+        # a member had to shrink to stay inside the balloon: the whole balloon follows (balloon-wide size band)
+        balloon_cap(lambda sizes, caps: [int(math.ceil(min(sizes) * (1.0 + bl.band()))) if not bl.is_emphasis(
+            caps[k], [c for j, c in enumerate(caps) if j != k]) else None for k in range(len(sizes))])
+        guard_fit()
 
     items = []
     for plan, (out, size, dw, dh) in zip(plans, fits):
@@ -742,6 +955,9 @@ def build_items(blocks, image, cleaned, orig_boxes, render_settings, alignment, 
         if os.environ.get("RENDER_DEBUG"):
             print("[item]", {k: v for k, v in d["debug"].items() if k != "src"}, "text=", repr(out[:40]), flush=True)
         items.append(d)
+    resolve_item_overlaps(items, plans, W, H, render_settings.direction)
+    if bl.overlap_enabled():
+        items.sort(key=lambda d: d.get("glow_color") is None)  # soft halos go under every other block's lettering (stable)
     return items
 
 

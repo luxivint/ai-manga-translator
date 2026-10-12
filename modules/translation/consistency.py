@@ -120,6 +120,36 @@ def _swap_tokens(src: str) -> set[str]:
     return {_fold(w)[:5] for w in _WORD_RE.findall(src) if len(w) >= 5}
 
 
+_TERMINAL = ".!?…"
+
+
+def _words(text: str) -> list[str]:
+    return (text or "").split()
+
+
+def dedupe_boundary(prev: str, nxt: str, max_words: int = 3) -> str:
+    """`nxt` without a leading run of 1-3 words that repeat the end of `prev` (a sentence continued from block i into
+    block i+1 that the translator wrote out in both). Words that end a sentence in `prev` ('NO! NO!') are kept, and
+    nothing is dropped when it would leave `nxt` empty. Pure; returns `nxt` unchanged when there is no repeat."""
+    pw, nw = _words(prev), _words(nxt)
+    for n in range(min(max_words, len(pw), len(nw) - 1), 0, -1):
+        tail, head = pw[-n:], nw[:n]
+        if tail[-1][-1:] in _TERMINAL:
+            continue
+        if all(_norm(a) and _norm(a) == _norm(b) for a, b in zip(tail, head)):
+            return " ".join(nw[n:])
+    return nxt
+
+
+def dedupe_adjacent(texts: list[str], max_words: int = 3) -> list[str]:
+    """Apply dedupe_boundary to consecutive texts (reading order); the comparison uses the already cleaned previous."""
+    out = list(texts)
+    for i in range(1, len(out)):
+        if out[i - 1].strip() and out[i].strip():
+            out[i] = dedupe_boundary(out[i - 1], out[i], max_words)
+    return out
+
+
 def check_page(blocks, target_lang: str = "Turkish") -> list[str]:
     """Reasons a page's translations look suspicious (empty list = fine). Pure, no I/O."""
     reasons: list[str] = []
