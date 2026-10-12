@@ -67,3 +67,4 @@ FONT KLASÖR/
 output_smoke/
 output_chapter_in/
 output_chapter_test/
+tests/fixtures/ch29_blocks.json

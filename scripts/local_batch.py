@@ -1180,9 +1180,18 @@ def prune_ocr_blocks(blocks, image: np.ndarray | None = None):
             kept[replacement_index] = block
         dropped_duplicate += 1
 
-    if dropped_empty or dropped_duplicate:
+    dropped_contained = 0
+    if os.environ.get("BLOCK_CONTAINMENT_PRUNE", "true").lower() == "true":
+        # a block mostly inside another block whose words the other already has = the same text read twice at
+        # different scales; translating both prints the phrase twice (saves translation tokens too)
+        from modules.utils import block_cleanup
+        kept, dropped_info = block_cleanup.prune_contained_blocks(kept)
+        dropped_contained = len(dropped_info)
+
+    if dropped_empty or dropped_duplicate or dropped_contained:
+        extra = f", -{dropped_contained} contained" if dropped_contained else ""
         print(
-            f"  prune OCR blocks: -{dropped_empty} empty, -{dropped_duplicate} duplicate",
+            f"  prune OCR blocks: -{dropped_empty} empty, -{dropped_duplicate} duplicate{extra}",
             flush=True,
         )
     return kept
@@ -1260,17 +1269,40 @@ def strip_translation_garbage_letters(blocks) -> None:
             setattr(block, attr, cleaned)
 
 
-def debug_dump_blocks(stage: str, blocks) -> None:
+def debug_dump_blocks(stage: str, blocks, page: str | None = None) -> None:
+    """DEBUG_TRANSLATION_BLOCKS=true: one line per block. The first part of a line is the original format
+    (idx cls bubble box text trans); after ' | ' come replay fields (page, bubble_xyxy, style) so a threaded job's
+    interleaved dump can be replayed offline by scripts/replay_chapter.py without guessing."""
     if os.environ.get("DEBUG_TRANSLATION_BLOCKS", "false").lower() != "true":
         return
-    print(f"\n--- DEBUG BLOCKS {stage} ---", flush=True)
+    page = page or os.environ.get("TRANSLATION_SOURCE_FILE", "") or None
+    print("\n--- DEBUG BLOCKS " + stage + " ---", flush=True)
     for idx, block in enumerate(blocks):
         box = [int(v) for v in getattr(block, "xyxy", (0, 0, 0, 0))]
         cls = getattr(block, "text_class", "")
-        bubble = getattr(block, "bubble_xyxy", None) is not None
+        bubble_box = getattr(block, "bubble_xyxy", None)
         text = (getattr(block, "text", "") or "").replace("\n", "\\n")
         trans = (getattr(block, "translation", "") or "").replace("\n", "\\n")
-        print(f"{idx:02d} cls={cls} bubble={bubble} box={box} text={text!r} trans={trans!r}", flush=True)
+        extra = [f"page={page}"] if page else []
+        if bubble_box is not None:
+            extra.append(f"bubble_xyxy={[int(v) for v in bubble_box]}")
+        style = getattr(block, "style", "") or ""
+        if style:
+            extra.append(f"style={style}")
+        tail = (" | " + " ".join(extra)) if extra else ""
+        print(f"{idx:02d} cls={cls} bubble={bubble_box is not None} box={box} text={text!r} trans={trans!r}{tail}", flush=True)
+
+
+def debug_dump_items(page: str, items: list) -> None:
+    """DEBUG_TRANSLATION_BLOCKS=true: the laid-out text items of a page (final font size/position), one per line."""
+    if os.environ.get("DEBUG_TRANSLATION_BLOCKS", "false").lower() != "true":
+        return
+    print("\n--- DEBUG ITEMS render ---", flush=True)
+    for idx, d in enumerate(items):
+        dbg = d.get("debug") or {}
+        text = (d.get("text") or "").replace("\n", "\\n")
+        print(f"{idx:02d} size={d.get('font_size')} pos={list(d.get('position') or [])} wh=[{round(float(d.get('width', 0)))}, "
+              f"{round(float(d.get('height', 0)))}] style={dbg.get('style')} bub={dbg.get('bub')} text={text!r} | page={page}", flush=True)
 
 
 def bubble_outline_protection_mask(image: np.ndarray, blocks) -> np.ndarray:
@@ -2234,7 +2266,7 @@ def _stage_clean(task: tuple) -> tuple:
     # küme == render edilen küme (çevirisiz UI metni silinip boş kalmaz).
     suppress_noisy_ocr_blocks(blocks, args.source_lang)
     strip_translation_garbage_letters(blocks)
-    debug_dump_blocks("after-clean-translate", blocks)
+    debug_dump_blocks("after-clean-translate", blocks, page=Path(path).name)
     mask = build_segmenter_mask(image, blocks, require_translation=True)
     if mask.sum() == 0:
         cleaned = image.copy()
@@ -2275,6 +2307,7 @@ def _do_render_and_save(
         return out_path
 
     cleaned, text_items_state = build_text_items_state(blocks, image, cleaned, args, main)
+    debug_dump_items(path.name, text_items_state)
 
     renderer = ImageSaveRenderer(cleaned)
     renderer.add_state_to_image({"text_items_state": text_items_state})

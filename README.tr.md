@@ -363,6 +363,12 @@ Bu komut torch/torchvision'ın CUDA 13 sürümlerini ve `onnxruntime-gpu`'yu kur
 | `RENDER_V2`, `RENDER_STYLE_TAGS` | `true` | balon ve stile duyarlı dizgi |
 | `RENDER_BALLOON_UNIFY` | `true` | aynı balondaki bloklar tek font ve tek boyut bandı kullanır (`RENDER_BALLOON_BAND`, varsayılan `0.12`; kaynak harf yüksekliği `RENDER_EMPHASIS_RATIO` (1.4) oranından fazla farklıysa vurgu sayılır) ve her satır balon içinde kalır; `false` = eski blok bazlı boyut |
 | `RENDER_MERGE_BALLOON` | `true` | OCR'ın bir balonda birkaç bloğa böldüğü tek cümle tek paragraf olarak dizilir; blok sınırında tekrar eden kelimeler atılır |
+| `RENDER_DEDUPE_TRANSLATIONS` | `true` | aynı balonda / üst üste binen ve çevirisi daha uzun komşunun alt metni olan blok tekrar çizilmez; art arda tekrar eden ifadeler tek kopyaya iner |
+| `RENDER_GROUP_ROBUST` | `true` | toleranslı balon gruplama (farklı boyutlu balon kutuları, iç içe metin kutuları aynı balon sayılır) |
+| `RENDER_ABSORB_STRAYS` | `true` | balon içindeki küçük 1-2 kelimelik başıboş blok balonun ana metnine katılır |
+| `RENDER_MERGE_NARRATION` | `true` | üst üste dizili anlatım/altyazı satırları tek paragraf olur |
+| `RENDER_HARD_GUARD` | `true` | her balon bloğunun tüm satırları (+%2 boşluk) balon içinde kalır; gerekirse blok küçülür |
+| `BLOCK_CONTAINMENT_PRUNE`, `BLOCK_CONTAINMENT_RATIO`, `BLOCK_TEXT_COVER` | `true`, `0.6`, `0.8` | çeviriden önce: başka bir bloğun içinde (>= %60) duran ve kelimeleri (>= %80) o bloğta zaten bulunan blok atılır |
 | `RENDER_RESOLVE_OVERLAP` | `true` | üst üste binen yazı kutuları ayrılır / küçültülür |
 
 Herhangi birini değiştirmek için aynı adlı ortam değişkenini ayarlayın, örneğin `BATCH_PIPELINE=false`.

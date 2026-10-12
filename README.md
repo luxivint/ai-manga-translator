@@ -354,6 +354,12 @@ Out of the box `local_batch.py` and the worker use:
 | `RENDER_V2`, `RENDER_STYLE_TAGS` | `true` | balloon- and style-aware typesetting |
 | `RENDER_BALLOON_UNIFY` | `true` | blocks sharing one balloon use one font and one size band (`RENDER_BALLOON_BAND`, default `0.12` = +-12% of the balloon median; blocks whose source cap height differs by more than `RENDER_EMPHASIS_RATIO`, default `1.4`, keep their size) and every line must lie inside the balloon interior; `false` = old per-block sizing |
 | `RENDER_MERGE_BALLOON` | `true` | a sentence the OCR split over several blocks of one balloon is laid out as one centred paragraph (separate speech, shouts/SFX and emphasis stay separate); also drops words repeated across the block boundary |
+| `RENDER_DEDUPE_TRANSLATIONS` | `true` | a block in the same balloon / overlapping another block whose translation is a substring or near-duplicate of the longer neighbour is not drawn again; back-to-back repeated phrases are collapsed |
+| `RENDER_GROUP_ROBUST` | `true` | tolerant balloon grouping: balloon boxes of different size that hold each other's text, or text boxes lying inside each other, share one balloon |
+| `RENDER_ABSORB_STRAYS` | `true` | a tiny 1-2 word block (clearly smaller source lettering) inside a balloon joins the balloon's main text instead of being drawn tiny |
+| `RENDER_MERGE_NARRATION` | `true` | stacked narration/caption lines of one box become one paragraph |
+| `RENDER_HARD_GUARD` | `true` | every balloon block keeps all line boxes (+2% clearance) inside the interior mask, shrinking the block (and so the balloon band) if needed |
+| `BLOCK_CONTAINMENT_PRUNE`, `BLOCK_CONTAINMENT_RATIO`, `BLOCK_TEXT_COVER` | `true`, `0.6`, `0.8` | before translation: a block >= 60% inside another block whose OCR words (>= 80%) the other already contains is dropped (the same text read twice at another scale; saves translation tokens) |
 | `RENDER_RESOLVE_OVERLAP` | `true` | rendered text boxes that overlap are pushed apart / shrunk; halo-text is drawn under other blocks |
 
 Set the matching environment variable to override any of them, for example `BATCH_PIPELINE=false`.
