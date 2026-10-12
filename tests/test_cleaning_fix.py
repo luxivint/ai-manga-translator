@@ -25,6 +25,11 @@ def blk(xyxy, text="", translation="", is_ad=False):
 
 
 class WatermarkRuleTests(unittest.TestCase):
+    def setUp(self):  # these cover the 'keep' policy; the default is now 'clean' (see test_watermark_policy)
+        patcher = mock.patch.dict(os.environ, {"WATERMARK_POLICY": "keep"})
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
     def test_is_ad_block_is_kept(self):
         self.assertEqual(lb.watermark_rule(blk((0, 0, 10, 10), "x", is_ad=True), 800, 800), "is_ad")
 
@@ -112,7 +117,8 @@ class MaskGatingTests(unittest.TestCase):
     def test_watermark_block_never_masked(self):
         wm = blk((30, 200, 330, 270), "VORTEXSCANS.COM", "", is_ad=False)
         a = blk((30, 30, 330, 100), "HELLO", "MERHABA")
-        m = self._mask([a, wm], require_translation=True)
+        with mock.patch.dict(os.environ, {"WATERMARK_POLICY": "keep"}):
+            m = self._mask([a, wm], require_translation=True)
         self.assertEqual(int((m[190:280, 20:340] > 0).sum()), 0)
         self.assertGreater(int((m[30:100, 30:330] > 0).sum()), 0)
 
