@@ -354,7 +354,12 @@ Bu komut torch/torchvision'ın CUDA 13 sürümlerini ve `onnxruntime-gpu`'yu kur
 | `BATCH_PIPELINE` | `true` | 3 aşamalı toplu işlem |
 | `BATCH_WORKERS` | `3` | detect+OCR ve temizleme aşamaları için thread havuzu tabanı |
 | `BATCH_WORKERS_AUTO` / `BATCH_WORKERS_MAX` | `true` / `4` | auto açıkken CPU boşta (<%35) ise taban +1, meşgulse (>%80) -1 olur, `BATCH_WORKERS_MAX` değerini aşmaz; günlükte `[CPU n%] worker: 3 -> 4` görünür. Tam `BATCH_WORKERS` için `BATCH_WORKERS_AUTO=false` |
-| `BATCH_TRANSLATE_CONCURRENCY` | `4` | paralel GPT çeviri çağrısı (her çağrı 3 sayfa); `1` = sıralı |
+| `BATCH_TRANSLATE_CONCURRENCY` | `3` | paralel GPT çeviri çağrısı (her çağrı 3 sayfa); `1` = sıralı; gateway devre kesici açıkken 1'e düşer |
+| `OCR_CONCURRENCY` | `2` | aynı anda uçuşta olabilecek OCR isteği sayısı (`BATCH_WORKERS`'tan bağımsız) |
+| `GATEWAY_BACKOFFS` | `3,8,20` | OCR, çeviri ve vision çağrılarında 5xx/429/zaman aşımı için bekleme süreleri (sn, jitter'lı); art arda 3 hata 20 sn -> 60 sn ortak bekleme açar |
+| `OCR_MAX_FAIL_RATIO` | `0.0` | OCR/çeviri hatası verebilecek sayfa oranı; aşılırsa iş yayınlanmadan 3 koduyla düşer (`FAILED: OCR failed on N pages`), ham sayfalar silinmez, iş yeniden denenir |
+| `PASSTHROUGH_SUSPECT_RATIO` | `0.5` | metin balonu tespit edilen sayfaların bundan fazlası 0 bloklu (OCR boş) bitiyorsa iş hata verir |
+| `WATERMARK_POLICY` | `clean` | `clean` rakip watermark/banner'ları bütün olarak siler (kendi markamıza dokunmaz); `keep` dokunmaz |
 | `RENDER_V2`, `RENDER_STYLE_TAGS` | `true` | balon ve stile duyarlı dizgi |
 
 Herhangi birini değiştirmek için aynı adlı ortam değişkenini ayarlayın, örneğin `BATCH_PIPELINE=false`.

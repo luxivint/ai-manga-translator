@@ -345,7 +345,12 @@ Out of the box `local_batch.py` and the worker use:
 | `BATCH_PIPELINE` | `true` | 3-phase batch pipeline |
 | `BATCH_WORKERS` | `3` | thread-pool base for detect+OCR and clean phases |
 | `BATCH_WORKERS_AUTO` / `BATCH_WORKERS_MAX` | `true` / `4` | with auto on, the base goes +1 when the CPU is idle (<35%) and -1 when busy (>80%), never above `BATCH_WORKERS_MAX`; the log shows `[CPU n%] worker: 3 -> 4`. Set `BATCH_WORKERS_AUTO=false` for exactly `BATCH_WORKERS` |
-| `BATCH_TRANSLATE_CONCURRENCY` | `4` | parallel GPT translate calls (each call is 3 pages); `1` = sequential |
+| `BATCH_TRANSLATE_CONCURRENCY` | `3` | parallel GPT translate calls (each call is 3 pages); `1` = sequential; drops to 1 while the gateway breaker is open |
+| `OCR_CONCURRENCY` | `2` | process-wide cap of OCR requests in flight (independent of `BATCH_WORKERS`) |
+| `GATEWAY_BACKOFFS` | `3,8,20` | retry delays (s, with jitter) for 5xx/429/timeouts on OCR, translate and vision calls; 3 consecutive failures open a shared 20 s -> 60 s cool-down |
+| `OCR_MAX_FAIL_RATIO` | `0.0` | share of pages that may fail OCR/translation; above it the job exits 3 (`FAILED: OCR failed on N pages: [...]`) before publishing, raw pages kept, job retried. Raw is never deleted if any page failed |
+| `PASSTHROUGH_SUSPECT_RATIO` | `0.5` | fails the job when more than this share of pages with detected text bubbles ended with 0 blocks (OCR returned nothing) |
+| `WATERMARK_POLICY` | `clean` | `clean` erases competitor watermarks/banners whole (never the site's own brand); `keep` leaves them untouched |
 | `RENDER_V2`, `RENDER_STYLE_TAGS` | `true` | balloon- and style-aware typesetting |
 
 Set the matching environment variable to override any of them, for example `BATCH_PIPELINE=false`.
