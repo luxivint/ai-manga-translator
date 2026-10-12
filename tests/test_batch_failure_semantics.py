@@ -196,7 +196,7 @@ class MainPublishGateTests(unittest.TestCase):
         args = SimpleNamespace(
             env=".env", mask_refiner="fast", gpu=False, r2_input_prefix="raw/m/c", r2_output_prefix="translated/m/c",
             r2_workdir=tmp, r2_keep_workdir=False, r2_delete_input=True, input="input", output="output",
-            zip_output=False, source_lang="English", target_lang="Turkish")
+            zip_output=False, source_lang="English", target_lang="Turkish", safe_recut=False)
         fake_img = Path(tmp) / "x.jpg"
 
         def fake_batch(images, out_dir, a):

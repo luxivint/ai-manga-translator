@@ -373,6 +373,36 @@ Bu komut torch/torchvision'ın CUDA 13 sürümlerini ve `onnxruntime-gpu`'yu kur
 
 Herhangi birini değiştirmek için aynı adlı ortam değişkenini ayarlayın, örneğin `BATCH_PIPELINE=false`.
 
+## OCR öncesi güvenli bölüm kesimi
+
+`WEBTOON_SAFE_RECUT=true` varsayılan olarak açıktır. Worker, her yeni bölümün
+ham görsellerini sanal bir dikey şerit olarak okur; dev bir birleşik görüntüyü
+bellekte tutmaz. 1600 piksel yüksekliğinde, 600 piksel örtüşen pencerelerde
+metin ve balon kutuları bulunur. Kutuların çevresine 24 piksel pay eklenir;
+tam genişlikte en az 24 piksel yüksekliğindeki düz renkli boşluklardan kesilir.
+Boş bir balonun içinden kesmemek için metinsiz balon kutuları da korunur.
+
+Yeni, kayıpsız PNG parçaları OCR, çeviri, temizleme ve yazma aşamalarına gider.
+Yayımlanan sayfalar bu yeni kesimleri kullanır; mevcut reklam kırpma/çıkarma,
+damga ve SEO dosya adları aynı işlem akışında devam eder. Sayfa sayısı değişebilir.
+Önceki kesimlerin çeviri önbelleği yeniden kullanılmaz. Kaynak dosyalar değişmez.
+Kesilmiş parçaların piksel karması kaynak şeritle doğrulanır.
+
+`RECUT_TARGET_HEIGHT=2000` hedef parça yüksekliğidir. 3600 piksel yumuşak sınırdır;
+güvenli boşluk için biraz aşılabilir. `RECUT_MAX_HEIGHT=8000` sert sınırdır
+(en fazla 16000). Güvenli kesim bulunamazsa işlem hata verir; R2 yükleme ve ham
+görsellerin silinmesi yapılmaz. Algılayıcı tahminleri kusursuz değildir; özellikle
+alışılmadık bölüm düzenlerinde sonuçların kontrol edilmesi gerekir. Farklı
+genişlikteki kaynaklar otomatik olarak gerilmez; hata verir.
+
+Manuel eski akış için `--no-safe-recut` veya `WEBTOON_SAFE_RECUT=false` kullanılabilir.
+Özellik mevcut yayımlanmış bölümleri otomatik yeniden çevirmez; sonraki çeviri
+işlerinde çalışır. Yerel denemeler ve R2 worker işleri aynı ön işlemden geçer.
+
+```powershell
+& .venv/Scripts/python.exe -m unittest discover -s tests -p test_safe_recut.py
+```
+
 ## Lisans
 
 `LICENSE`'a bak.

@@ -10,6 +10,7 @@ import requests
 import shutil
 import sys
 import threading
+import tempfile
 import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
@@ -77,6 +78,7 @@ from modules.utils import watermark as watermark_lib
 from modules.utils.gateway import AdaptiveLimiter, GatewayError, OCRFailedError
 from modules.utils.openai_endpoint import get_openai_chat_completions_url, get_openai_model
 from scripts.storage import delete_prefix, download_prefix, normalize_key, upload_directory
+from scripts.safe_recut import prepare as prepare_safe_recut
 
 
 IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".webp", ".bmp"}
@@ -2822,6 +2824,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--r2-keep-workdir", action="store_true", default=os.environ.get("R2_KEEP_WORKDIR", "false").lower() == "true")
     parser.add_argument("--zip-output", action=argparse.BooleanOptionalAction, default=os.environ.get("ZIP_OUTPUT", "false").lower() == "true",
                          help="Zip the output folder into <output>.zip after a local (non-R2) run finishes")
+    parser.add_argument("--safe-recut", action=argparse.BooleanOptionalAction,
+                        default=os.environ.get("WEBTOON_SAFE_RECUT", "true").lower() == "true",
+                        help="Join chapter fragments virtually and recut away from detected text/bubbles before OCR")
+    parser.add_argument("--recut-target-height", type=int, default=int(os.environ.get("RECUT_TARGET_HEIGHT", "2000")))
+    parser.add_argument("--recut-max-height", type=int, default=int(os.environ.get("RECUT_MAX_HEIGHT", "8000")))
     return parser.parse_args()
 
 
@@ -2836,6 +2843,12 @@ def main() -> int:
     app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
     args.resolved_font = resolve_font(args)
 
+    # Fresh processing outputs prevent resume from using translations of old cuts.
+    with tempfile.TemporaryDirectory(prefix="manga-safe-recut-") as work:
+        return run_batch(args, app, Path(work))
+
+
+def run_batch(args, app, recut_work: Path) -> int:
     using_r2 = bool(args.r2_input_prefix)
     if using_r2:
         chapter_work = ROOT / args.r2_workdir / r2_work_name(args.r2_input_prefix)
@@ -2862,6 +2875,36 @@ def main() -> int:
     if not images:
         print(f"No images found in {input_dir}")
         return 0
+
+    final_output_dir = output_dir
+    recut_active = bool(args.safe_recut)
+    if recut_active:
+        if input_dir == final_output_dir:
+            app.quit()
+            print("FAILED: safe recut requires separate input and output folders; source images kept.", flush=True)
+            return EXIT_VALIDATION_FAILED
+        try:
+            from modules.detection.factory import DetectionEngineFactory
+            engine = DetectionEngineFactory.create_engine(LocalSettings(args), args.detector)
+            old_threshold = engine.confidence_threshold
+            try:
+                engine.confidence_threshold = min(old_threshold, 0.25)
+                def detect_protected(image):
+                    bubbles, texts = engine._detect_single_image(image)
+                    return list(bubbles) + list(texts)
+                plan = prepare_safe_recut(images, recut_work / "input", detect_protected,
+                    target=args.recut_target_height, minimum=min(800, args.recut_target_height // 2),
+                    soft_max=max(args.recut_target_height, min(3600, args.recut_max_height)),
+                    hard_max=args.recut_max_height)
+            finally:
+                engine.confidence_threshold = old_threshold
+            images = plan.images
+            output_dir = recut_work / "output"
+            output_dir.mkdir(parents=True, exist_ok=True)
+        except Exception as exc:
+            app.quit()
+            print(f"FAILED: safe recut failed; R2 upload/delete skipped, raw images kept: {exc}", flush=True)
+            return EXIT_VALIDATION_FAILED
 
     if os.environ.get("BATCH_PIPELINE", "true").lower() == "true":
         try:
@@ -2905,6 +2948,20 @@ def main() -> int:
             print(f"R2 upload/delete skipped: {exc}", flush=True)
             print(f"FAILED: {exc}", flush=True)
             return EXIT_VALIDATION_FAILED
+
+    if recut_active and failed == 0:
+        if not iter_images(output_dir):
+            app.quit()
+            print("FAILED: safe recut produced no translated outputs; R2 upload/delete skipped.", flush=True)
+            return EXIT_VALIDATION_FAILED
+        if not using_r2:
+            # Only replace final image files after the complete batch succeeded.
+            final_output_dir.mkdir(parents=True, exist_ok=True)
+            for old in iter_images(final_output_dir):
+                old.unlink()
+            for image in iter_images(output_dir):
+                shutil.copy2(image, final_output_dir / image.name)
+            output_dir = final_output_dir
 
     if using_r2 and failed == 0:
         out_prefix = args.r2_output_prefix or translated_prefix(args.r2_input_prefix)
