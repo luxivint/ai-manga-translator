@@ -221,7 +221,8 @@ class FontProfileTests(unittest.TestCase):
         heavy = {"stem": 0.20, "slant": 0.0, "wid": 0.6, "height": 40.0, "caps": True}
         light = {"stem": 0.07, "slant": 0.0, "wid": 0.6, "height": 40.0, "caps": True}
         a, b = fp.match_font("normal", heavy), fp.match_font("normal", light)
-        self.assertGreater(fp.traits_of(a)["stem"], fp.traits_of(b)["stem"])
+        self.assertGreaterEqual(fp.traits_of(a)["stem"], fp.traits_of(b)["stem"])
+        self.assertIn(b, fp.speech_pool())  # even a hairline source never gets a thin font for speech
         self.assertEqual(fp.match_font("normal", None), fp.ranked_candidates("normal")[0])
 
     def test_source_traits_measure_stem_and_slant(self):

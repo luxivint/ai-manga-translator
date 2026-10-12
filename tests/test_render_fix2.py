@@ -2,6 +2,7 @@
 merged-block groups, original-mask colour analysis, slanted-speech font choice."""
 import os
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -247,6 +248,78 @@ class SlantFontTests(unittest.TestCase):
     def test_slanted_shout_still_gets_slanted_font(self):
         sl = {"stem": 0.2, "slant": 0.25, "wid": 0.6, "height": 40.0, "caps": True}
         self.assertGreater(fp.traits_of(fp.match_font("shout", sl)).get("slant", 0), 0.1)
+
+
+class SpeechPoolTests(unittest.TestCase):
+    K = "FONT KLASÖR/"
+
+    def test_pool_is_konusma_folder_without_thin_fonts(self):
+        pool = fp.speech_pool()
+        if not (ROOT / "FONT KLASÖR" / "konuşma").is_dir():
+            self.skipTest("font folder not present (gitignored)")
+        self.assertTrue(pool)
+        self.assertTrue(all(r.startswith(fp.SPEECH_FOLDER) for r in pool))
+        self.assertIn(self.K + "konuşma/mercyorj.otf", pool)
+        self.assertEqual(fp.ranked_candidates("normal"), pool)
+        for r in pool:
+            self.assertGreaterEqual(fp.traits_of(r)["stem"], fp.SPEECH_MIN_STEM)
+        self.assertNotIn(self.K + "Kare/Chinacat.ttf", pool)
+
+    def test_thin_font_is_rejected_by_threshold(self):
+        if not (ROOT / "FONT KLASÖR" / "konuşma").is_dir():
+            self.skipTest("font folder not present (gitignored)")
+        os.environ["FONT_SPEECH_MIN_STEM"] = "0.12"
+        try:
+            pool = fp.speech_pool()
+        finally:
+            del os.environ["FONT_SPEECH_MIN_STEM"]
+        self.assertNotIn(self.K + "konuşma/CCVictorySpeech.otf", pool)  # stem 0.103
+        self.assertIn(self.K + "konuşma/mercyorj.otf", pool)
+
+    def test_neighbouring_bubbles_share_one_font(self):
+        if not fp.speech_pool():
+            self.skipTest("font folder not present (gitignored)")
+        picks = {fp.match_font("normal", {"stem": s, "slant": 0.0, "wid": w, "height": 40.0})
+                 for s in (0.06, 0.08, 0.11, 0.14, 0.18) for w in (0.55, 0.65, 0.7, 0.9)}
+        self.assertEqual(len(picks), 1)
+        self.assertEqual(picks.pop(), fp.speech_pool()[0])
+
+    def test_clearly_different_traits_may_switch_font(self):
+        pool = fp.speech_pool()
+        if len(pool) < 2:
+            self.skipTest("font folder not present (gitignored)")
+        wide = {"stem": 0.11, "slant": 0.0, "wid": 1.0, "height": 40.0}
+        self.assertIn(fp.match_font("normal", wide), pool)
+        self.assertNotEqual(fp.match_font("normal", wide), pool[0])
+
+    def test_fresh_clone_without_fonts_falls_back_without_crash(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            old_root = fp.ROOT
+            fp.ROOT = Path(tmp)
+            try:
+                self.assertEqual(fp.speech_pool(), [])
+                # old list (by committed traits) is used; the renderer then falls back to Comic Geek when a file
+                # is missing. Nothing may crash.
+                rel = fp.match_font("normal", {"stem": 0.1, "slant": 0, "wid": 0.7, "height": 40.0})
+                self.assertIsInstance(rel, str)
+            finally:
+                fp.ROOT = old_root
+
+    def test_env_font_map_file_overrides_normal(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            f = Path(tmp) / "map.json"
+            f.write_text('{"normal": ["FONT KLASÖR/Kare/CC_VictorySpeechLower.otf"]}', encoding="utf-8")
+            os.environ["FONT_MAP_FILE"] = str(f)
+            try:
+                self.assertEqual(fp.ranked_candidates("normal"), [self.K + "Kare/CC_VictorySpeechLower.otf"])
+                self.assertTrue(fp.ranked_candidates("whisper"))  # other styles untouched
+            finally:
+                del os.environ["FONT_MAP_FILE"]
+        os.environ["FONT_MAP_FILE"] = str(ROOT / "does_not_exist.json")
+        try:
+            self.assertEqual(fp.ranked_candidates("normal"), fp.speech_pool() or fp.ranked_candidates("normal"))
+        finally:
+            del os.environ["FONT_MAP_FILE"]
 
 
 if __name__ == "__main__":

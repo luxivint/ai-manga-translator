@@ -7,6 +7,7 @@ see render_test/render_fix/FONT_ANALYSIS.md).
 from __future__ import annotations
 
 import json
+import os
 from functools import lru_cache
 from pathlib import Path
 
@@ -33,8 +34,9 @@ BLOCKLIST = {
 
 # ranked candidates per style (first usable wins unless original-font matching reorders them)
 STYLE_RANKS: dict[str, list[str]] = {
-    "normal": [K + "konuşma/CCVictorySpeech.otf", K + "konuşma/mercyorj.otf",
-               K + "konuşma/CATBANG-ZOOM-REGULAR_1.OTF", K + "balon kenarı/DomBT-Regular.ttf",
+    # konuşma folder first (speech_pool(): anchor = first usable one), old list only as fallback
+    "normal": [K + "konuşma/mercyorj.otf", K + "konuşma/CATBANG-ZOOM-REGULAR_1.OTF",
+               K + "konuşma/CCVictorySpeech.otf", K + "balon kenarı/DomBT-Regular.ttf",
                K + "Kare/CC_VictorySpeechLower.otf"],
     "shout": [K + "bağırma/CCShoutOut_Regular.otf", K + "bağırma/Shout_Out_Bold.ttf",
               K + "acıma-üzülme-korkma/Knucklebones.ttf", K + "acıma-üzülme-korkma/BOCADILLO_REGULAR.OTF",
@@ -117,8 +119,75 @@ def sanitize_for_font(text: str, rel: str) -> str:
     return out
 
 
+# --- normal speech: heavy preference for the 'konuşma' (speech) font folder -----------------------------
+SPEECH_FOLDER = K + "konuşma/"
+# Measured stem/cap-height of the folder: CCVictorySpeech 0.103, CatBang 0.122, mercyorj 0.135 (all readable
+# in white balloons at small sizes); Chinacat 0.085 / hairline scripts are the "thin" look users complain about.
+# Anything below 0.10 is rejected from the speech pool. Override: env FONT_SPEECH_MIN_STEM.
+SPEECH_MIN_STEM = 0.10
+# Neighbouring bubbles must share one family: the anchor (first pool font) wins unless another pool font
+# is closer to the source lettering by more than this trait-distance margin (wide/condensed/very different weight).
+SPEECH_SWITCH_MARGIN = 0.30
+
+
+def _min_stem() -> float:
+    try:
+        return float(os.environ.get("FONT_SPEECH_MIN_STEM", SPEECH_MIN_STEM))
+    except ValueError:
+        return SPEECH_MIN_STEM
+
+
+def _file_exists(rel: str) -> bool:
+    return (ROOT / rel).is_file()
+
+
+def _user_style_map() -> dict[str, list[str]]:
+    """Optional JSON override (env FONT_MAP_FILE): {"normal": ["FONT KLASÖR/x/Font.otf" | "folder", ...]}.
+    An entry that is a folder name expands to its fonts; a user-supplied style replaces the built-in ranks
+    (and, for 'normal', disables the speech-pool preference)."""
+    path = os.environ.get("FONT_MAP_FILE", "").strip()
+    if not path or not Path(path).is_file():
+        return {}
+    try:
+        raw = json.loads(Path(path).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    out: dict[str, list[str]] = {}
+    for style, entries in (raw.items() if isinstance(raw, dict) else []):
+        entries = [entries] if isinstance(entries, str) else list(entries)
+        expanded: list[str] = []
+        for e in entries:
+            if isinstance(e, str) and "/" not in e and "\\" not in e:  # bare folder name
+                expanded += sorted(r for r in traits_table() if r.startswith(K + e.strip("/") + "/"))
+            elif isinstance(e, str):
+                expanded.append(e.replace("\\", "/"))
+        out[str(style).lower()] = expanded
+    return out
+
+
+def speech_pool() -> list[str]:
+    """Fonts of the konuşma folder that exist, cover Turkish and are not thin. Curated order first
+    (STYLE_RANKS['normal'] konuşma entries), then any other folder font heaviest-first."""
+    min_stem = _min_stem()
+    found = {r for r in traits_table() if r.startswith(SPEECH_FOLDER)}
+    d = ROOT / "FONT KLASÖR" / "konuşma"
+    if d.is_dir():
+        found |= {SPEECH_FOLDER + p.name for p in d.iterdir() if p.suffix.lower() in (".ttf", ".otf")}
+    ok = [r for r in found if _file_exists(r) and is_usable(r) and (traits_of(r) or {}).get("stem", 0.0) >= min_stem]
+    curated = [r for r in STYLE_RANKS["normal"] if r in ok]
+    rest = sorted((r for r in ok if r not in curated), key=lambda r: (-(traits_of(r) or {}).get("stem", 0.0), r))
+    return curated + rest
+
+
 def ranked_candidates(style: str) -> list[str]:
     style = (style or "normal").lower()
+    user = _user_style_map().get(style)
+    if user is not None:
+        return [rel for rel in user if is_usable(rel)]
+    if style == "normal":
+        pool = speech_pool()
+        if pool:
+            return pool
     ranks = STYLE_RANKS.get(style) or STYLE_RANKS["normal"]
     return [rel for rel in ranks if is_usable(rel)]
 
@@ -128,7 +197,9 @@ def match_font(style: str, src: dict | None, max_candidates: int = 4, rank_penal
 
     Heuristic: distance over stem weight (x4), slant (x3), character aspect (x1.2) plus a small
     penalty per rank so the curated order wins ties. Strongly italic sources (slant>0.18) also
-    consider the first slanted font from the shout/sfx lists. Returns a path relative to the repo root.
+    consider the first slanted font from the shout/sfx lists. 
+    Normal speech ranks only inside the speech pool and sticks to the anchor (first) font unless another
+    pool font is closer by SPEECH_SWITCH_MARGIN, so a page/series looks consistent.
     """
     cands = ranked_candidates(style)
     if not cands:
@@ -143,6 +214,12 @@ def match_font(style: str, src: dict | None, max_candidates: int = 4, rank_penal
             if rel not in pool and (traits_of(rel) or {}).get("slant", 0) > 0.15:
                 pool.append(rel)
                 break
+    in_speech_pool = (style or "normal").lower() == "normal" and cands[0].startswith(SPEECH_FOLDER)
+    if in_speech_pool:
+        # the pool is already curated for readability: pure trait distance, anchor wins unless clearly worse
+        dists = {rel: fm.trait_distance(src, traits_of(rel)) for rel in pool}
+        best = min(pool, key=lambda r: dists[r])
+        return best if dists[pool[0]] - dists[best] > SPEECH_SWITCH_MARGIN else pool[0]
     best, best_d = pool[0], 1e9
     for rank, rel in enumerate(pool):
         d = fm.trait_distance(src, traits_of(rel)) + rank_penalty * rank
