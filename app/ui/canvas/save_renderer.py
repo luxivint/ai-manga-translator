@@ -61,6 +61,8 @@ class ImageSaveRenderer:
             text_item.setScale(text_props.scale)
             text_item.set_vertical(bool(text_props.vertical))
             text_item.selection_outlines = text_props.selection_outlines
+            text_item.gradient = text_props.gradient
+            text_item.glow_color = text_props.glow_color
             text_item.update()
 
             self.scene.addItem(text_item)

@@ -94,6 +94,9 @@ class TextBlockItem(QGraphicsTextItem):
         self.old_state = None
 
         self.selection_outlines = []
+        # optional gradient fill ({"colors": [(r, g, b), ...], "vertical": bool}) and soft glow colour
+        self.gradient = None
+        self.glow_color = None
 
         self.setAcceptHoverEvents(True)
         self.setTextInteractionFlags(Qt.TextInteractionFlag.NoTextInteraction)
@@ -398,6 +401,9 @@ class TextBlockItem(QGraphicsTextItem):
         widget: QWidget = None
     ):
 
+        if self.glow_color is not None:
+            self._paint_glow(painter)
+
         # Then handle any selection outlines
         if self.selection_outlines:
             doc = self.document().clone()
@@ -444,7 +450,52 @@ class TextBlockItem(QGraphicsTextItem):
             painter.restore()
 
         # Draw the normal text on top
+        if self.gradient and len(self.gradient.get("colors", [])) >= 2:
+            self._paint_gradient(painter)
+            return
         super().paint(painter, option, widget)
+
+    def _paint_glow(self, painter: QPainter):
+        """Soft halo: the glyphs repeated at growing offsets with falling alpha."""
+        doc = self.document().clone()
+        cursor = QTextCursor(doc)
+        cursor.select(QTextCursor.SelectionType.Document)
+        base = max(1.0, float(self.outline_width or 1))
+        for k, alpha in ((3.0, 28), (2.0, 48), (1.0, 80)):
+            col = QColor(self.glow_color)
+            col.setAlpha(alpha)
+            fmt = cursor.charFormat()
+            fmt.setForeground(col)
+            cursor.mergeCharFormat(fmt)
+            r = base * k
+            for dx, dy in ((-r, 0), (r, 0), (0, -r), (0, r), (-r, -r), (r, -r), (-r, r), (r, r)):
+                painter.save()
+                painter.translate(dx, dy)
+                doc.drawContents(painter)
+                painter.restore()
+
+    def _paint_gradient(self, painter: QPainter):
+        from PySide6.QtGui import QBrush, QLinearGradient
+
+        doc = self.document().clone()
+        size = doc.size()
+        w, h = max(1.0, size.width()), max(1.0, size.height())
+        colors = self.gradient["colors"]
+        if self.gradient.get("vertical", True):
+            grad = QLinearGradient(0, 0, 0, h)
+        else:
+            grad = QLinearGradient(0, 0, w, 0)
+        n = len(colors)
+        for i, rgb in enumerate(colors):
+            grad.setColorAt(i / (n - 1), QColor(*rgb))
+        cursor = QTextCursor(doc)
+        cursor.select(QTextCursor.SelectionType.Document)
+        fmt = cursor.charFormat()
+        fmt.setForeground(QBrush(grad))
+        cursor.mergeCharFormat(fmt)
+        painter.save()
+        doc.drawContents(painter)
+        painter.restore()
 
     def set_bold(self, state):
         if not self.textCursor().hasSelection():

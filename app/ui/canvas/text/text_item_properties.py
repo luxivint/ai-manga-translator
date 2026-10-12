@@ -34,6 +34,10 @@ class TextItemProperties:
     
     # Advanced properties
     selection_outlines: list = field(default_factory=list)
+
+    # Optional rich fill: {"colors": [(r, g, b), ...], "vertical": bool}; glow_color: QColor/None
+    gradient: Optional[dict] = None
+    glow_color: Optional[QColor] = None
             
     @classmethod
     def from_dict(cls, data: dict) -> 'TextItemProperties':
@@ -100,7 +104,10 @@ class TextItemProperties:
         
         # Advanced
         props.selection_outlines = data.get('selection_outlines', [])
-        
+        props.gradient = data.get('gradient')
+        glow = data.get('glow_color')
+        props.glow_color = glow if isinstance(glow, QColor) or glow is None else QColor(glow)
+
         return props
     
     @classmethod
@@ -165,6 +172,8 @@ class TextItemProperties:
             'height': self.height,
             'vertical': self.vertical,
             'selection_outlines': self.selection_outlines,
+            'gradient': self.gradient,
+            'glow_color': self.glow_color,
         }
 
 
