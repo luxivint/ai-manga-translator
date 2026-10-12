@@ -326,6 +326,26 @@ Qt'nin gerçek bir sistem fontu fallback'i yok, yani `FONT_FILE`'ı kullanılır
 bir `FONT_FAMILY` kurulu olmadan boş bırakmak, ASCII olmayan metni eksik
 glif kutuları olarak render eder.
 
+
+#### Fontları yerleştirme
+
+Stile duyarlı renderer'ın kullandığı ek çizgi roman fontları, yeniden dağıtım lisansları bilinmediği için commit edilmez (`FONT KLASÖR/` git tarafından yok sayılır). Kendi `.ttf`/`.otf` dosyalarınızı proje kökündeki `FONT KLASÖR/` klasörüne koyun; yoksa renderer `assets/Comic Geek.ttf` dosyasına veya sistem fontuna düşer.
+
+## GPU
+
+Temizleme aşaması (YOLO metin segmenter + LaMa inpainting) NVIDIA GPU varsa onu kullanır, yoksa CPU'ya düşer. `requirements.txt` CPU tabanıdır. Bir venv'i GPU'ya geçirmek için:
+
+```
+pip uninstall -y onnxruntime torch torchvision
+pip install -r requirements-gpu.txt
+```
+
+Bu komut torch/torchvision'ın CUDA 13 sürümlerini ve `onnxruntime-gpu`'yu kurar (CUDA 13 destekli NVIDIA sürücüsü gerekir). `onnxruntime` ile `onnxruntime-gpu` aynı anda kurulu kalmamalı. GPU kullanıldığında günlükte `[clean] segmenter device: cuda` ve `[clean] LaMa device: cuda` satırları görünür. `SEG_DEVICE` ve `LAMA_DEVICE` (`auto|cuda|cpu`) seçimi değiştirir.
+
+## Varsayılanlar
+
+`local_batch.py` ve worker varsayılan olarak `RENDER_V2=true` (balon ve stile duyarlı dizgi), `RENDER_STYLE_TAGS=true` (çevirmen her satırın stilini etiketler), `BATCH_PIPELINE=true` (3 aşamalı toplu işlem) ve `BATCH_WORKERS=3` ile çalışır. Herhangi birini değiştirmek için aynı adlı ortam değişkenini ayarlayın, örneğin `BATCH_PIPELINE=false`.
+
 ## Lisans
 
 `LICENSE`'a bak.

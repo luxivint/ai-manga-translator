@@ -317,6 +317,26 @@ installed on the host/container. Offscreen Qt has no real system-font
 fallback, so leaving `FONT_FILE` empty without a usable `FONT_FAMILY`
 installed will render non-ASCII text as missing-glyph boxes.
 
+
+#### Placing fonts
+
+The extra comic fonts used by the style-aware renderer are not committed, because their redistribution licences are unknown (`FONT KLASÖR/` is git-ignored). Put your own `.ttf`/`.otf` files in a `FONT KLASÖR/` folder at the project root; without it the renderer falls back to `assets/Comic Geek.ttf` or the host font.
+
+## GPU
+
+The cleaning stage (YOLO text segmenter + LaMa inpainting) runs on an NVIDIA GPU when one is available and falls back to CPU otherwise. `requirements.txt` is the CPU baseline. To switch a venv to GPU:
+
+```
+pip uninstall -y onnxruntime torch torchvision
+pip install -r requirements-gpu.txt
+```
+
+This installs CUDA 13 builds of torch/torchvision and `onnxruntime-gpu` (needs an NVIDIA driver with CUDA 13 support). Never keep `onnxruntime` and `onnxruntime-gpu` installed together. At startup the log shows `[clean] segmenter device: cuda` and `[clean] LaMa device: cuda` when the GPU is used. `SEG_DEVICE` and `LAMA_DEVICE` (`auto|cuda|cpu`) override the choice.
+
+## Defaults
+
+Out of the box `local_batch.py` and the worker use `RENDER_V2=true` (balloon- and style-aware typesetting), `RENDER_STYLE_TAGS=true` (the translator tags each line's style), `BATCH_PIPELINE=true` (3-phase batch pipeline) and `BATCH_WORKERS=3`. Set the matching environment variable to override any of them, for example `BATCH_PIPELINE=false`.
+
 ## License
 
 See `LICENSE`.

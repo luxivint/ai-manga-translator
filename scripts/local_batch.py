@@ -52,7 +52,9 @@ from app.ui.canvas.text.text_item_properties import TextItemProperties
 from app.ui.canvas.text_item import OutlineInfo, OutlineType
 from modules.detection.processor import TextBlockDetector
 from modules.inpainting.schema import Config
+from modules.inpainting.mask import constrain_mask_to_allowed_regions
 from modules.inpainting.lama import LaMa
+from modules.utils import compute_device
 from modules.ocr.processor import OCRProcessor
 from modules.rendering.render import get_best_render_area, is_vertical_block, pyside_word_wrap
 from modules.translation.processor import Translator
@@ -60,6 +62,7 @@ from modules.utils.image_utils import generate_mask, get_smart_text_color
 from modules.utils.language_utils import get_language_code, get_layout_direction, is_no_space_lang
 from modules.utils.textblock import sort_blk_list
 from modules.utils.translator_utils import MODEL_MAP, format_translations
+from modules.utils.openai_endpoint import get_openai_chat_completions_url, get_openai_model
 from scripts.storage import delete_prefix, download_prefix, normalize_key, upload_directory
 
 
@@ -306,8 +309,13 @@ class LocalMain:
 # Temizleme reçetesi: YOLOv8 metin segmentasyonu + balon-içi Otsu + block-aware LaMa
 # ─────────────────────────────────────────────────────────────────────────────
 _SEGMENTER = None
+_SEGMENTER_CPU = None  # lazy CPU copy, only used after a CUDA OOM
+_SEG_DEVICE = "cpu"
+_SEG_HALF = False
 _LAMA = None
 _MODEL_LOCK = threading.Lock()
+# ultralytics predict() is NOT thread-safe on one model (concurrent calls corrupt masks) -> 1.
+_SEG_GPU_SEM = threading.Semaphore(max(1, int(os.environ.get("SEG_GPU_CONCURRENCY", "1"))))
 
 
 def _get_segmenter():
@@ -318,7 +326,7 @@ def _get_segmenter():
     çağırırsa fuse race oluşur ("'Conv' object has no attribute 'bn'"). Bunu
     önlemek için modeli lock İÇİNDE bir kez ısıtıp fuse'u tetikliyoruz ve
     _SEGMENTER'ı ancak ondan SONRA set ediyoruz."""
-    global _SEGMENTER
+    global _SEGMENTER, _SEG_DEVICE, _SEG_HALF
     if _SEGMENTER is None:
         with _MODEL_LOCK:
             if _SEGMENTER is None:
@@ -327,8 +335,13 @@ def _get_segmenter():
                 ModelDownloader.get(ModelID.COMIC_TEXT_SEGMENTER)
                 path = ModelDownloader.primary_path(ModelID.COMIC_TEXT_SEGMENTER)
                 model = YOLO(str(path))
+                # SEG_DEVICE=auto|cuda|cpu (auto = cuda varsa cuda). CPU davranışı eskisiyle aynı.
+                _SEG_DEVICE = compute_device.env_device("SEG_DEVICE", compute_device.torch_cuda_available())
+                _SEG_HALF = _SEG_DEVICE == "cuda" and os.environ.get("SEG_HALF", "false").lower() == "true"
+                print(f"[clean] segmenter device: {_SEG_DEVICE}" + (" (fp16)" if _SEG_HALF else ""), flush=True)
                 # Warm-up: fuse'u tek thread'de tetikle (paralel kullanım öncesi)
-                model.predict(np.zeros((640, 640, 3), np.uint8), verbose=False, imgsz=640)
+                model.predict(np.zeros((640, 640, 3), np.uint8), verbose=False, imgsz=640,
+                              device=_SEG_DEVICE, **({"half": True} if _SEG_HALF else {}))
                 _SEGMENTER = model
     return _SEGMENTER
 
@@ -338,69 +351,192 @@ def _get_lama():
     if _LAMA is None:
         with _MODEL_LOCK:
             if _LAMA is None:
-                _LAMA = LaMa(device="cpu", backend="onnx")
+                # LAMA_DEVICE=auto|cuda|cpu (auto = ORT CUDA provider varsa cuda)
+                dev = compute_device.env_device("LAMA_DEVICE", compute_device.ort_cuda_available())
+                _LAMA = LaMa(device=dev, backend="onnx")
+                print(f"[clean] LaMa device: {getattr(_LAMA, 'session_device', 'cpu')}", flush=True)
     return _LAMA
 
 
-def build_segmenter_mask(image: np.ndarray, blocks=None) -> np.ndarray:
-    """Pixel-perfect metin maskesi: YOLOv8 segmentasyonu + balon-içi Otsu (izole
-    işaretleri toplar, balon kenarına değmez) + closing/dilation.
+def _prewarm_cleaners() -> None:
+    """GPU only: building the LaMa ORT session takes ~20 s, so load YOLO + LaMa in a
+    background thread while detect/OCR/translate run (CLEAN_PREWARM=false disables).
+    CPU-only setups are left untouched."""
+    if os.environ.get("CLEAN_PREWARM", "true").lower() != "true":
+        return
+    if not (compute_device.env_device("SEG_DEVICE", compute_device.torch_cuda_available()) == "cuda"
+            or compute_device.env_device("LAMA_DEVICE", compute_device.ort_cuda_available()) == "cuda"):
+        return
 
-    blocks verilirse, maske SADECE OCR metni OKUNAN blokların bölgesine
-    sınırlanır. Böylece OCR'ın okuyamadığı SFX / ses efektleri / yalın
-    işaretler (!, ? gibi) temizlenmez, orijinal haliyle bırakılır."""
+    def _run():
+        try:
+            _get_segmenter()
+            _get_lama()
+        except Exception as exc:  # the real call will raise again with context
+            print(f"[clean] prewarm failed: {exc}", flush=True)
+
+    threading.Thread(target=_run, daemon=True, name="clean-prewarm").start()
+
+
+def _seg_predict(segmenter, crop, **kw):
+    """segmenter.predict on the configured device. GPU calls are serialised
+    (SEG_GPU_CONCURRENCY, default 1); a CUDA OOM retries that call on a CPU copy."""
+    if _SEG_DEVICE != "cuda":
+        return segmenter.predict(crop, device="cpu", **kw)
+    try:
+        with _SEG_GPU_SEM:
+            return segmenter.predict(crop, device="cuda", **({"half": True} if _SEG_HALF else {}), **kw)
+    except Exception as exc:
+        if not compute_device.is_oom_error(exc):
+            raise
+        print("[clean] segmenter CUDA OOM -> retrying this tile on CPU", flush=True)
+        global _SEGMENTER_CPU
+        with _MODEL_LOCK:
+            if _SEGMENTER_CPU is None:
+                from ultralytics import YOLO
+                from modules.utils.download import ModelDownloader, ModelID
+                _SEGMENTER_CPU = YOLO(str(ModelDownloader.primary_path(ModelID.COMIC_TEXT_SEGMENTER)))
+                _SEGMENTER_CPU.predict(np.zeros((640, 640, 3), np.uint8), verbose=False, imgsz=640, device="cpu")
+        try:
+            import torch
+            torch.cuda.empty_cache()
+        except Exception:
+            pass
+        return _SEGMENTER_CPU.predict(crop, device="cpu", **kw)
+
+
+def _tight_glyph_mask(image: np.ndarray, seg: np.ndarray, close_k: int, dilate_k: int, fine: np.ndarray | None = None, text_boxes: np.ndarray | None = None) -> np.ndarray:
+    """Glyph-hugging mask: inside each YOLO text component keep only pixels whose
+    Lab colour differs from the surrounding background (median of an outer ring),
+    so light-on-dark and dark-on-light both work; then small close + dilate."""
     h, w = image.shape[:2]
-    conf = float(os.environ.get("SEG_CONF", "0.25"))
-    close_k = int(os.environ.get("MASK_CLOSE", "13"))
-    dilate_k = int(os.environ.get("MASK_DILATE", "13"))
-
-    segmenter = _get_segmenter()
-    res = segmenter.predict(image[..., ::-1], conf=conf, verbose=False, imgsz=1024)
-    seg = np.zeros((h, w), np.uint8)
-    for r in res:
-        if r.masks is None:
+    ell = lambda k: cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k))
+    min_diff = float(os.environ.get("MASK_MIN_DIFF", "14"))
+    ring_out = int(os.environ.get("MASK_RING", "28"))
+    union_seg = os.environ.get("MASK_UNION_SEG", "true").lower() == "true"
+    near_k = int(os.environ.get("MASK_NEAR", "19"))
+    outer_min = int(os.environ.get("MASK_OUTER_MIN_AREA", "40"))
+    outer_max = int(os.environ.get("MASK_OUTER_MAX_AREA", "2500"))
+    outer_extent = int(os.environ.get("MASK_OUTER_MAX_EXTENT", "70"))
+    if fine is None:
+        fine = seg
+    lab = cv2.cvtColor(image, cv2.COLOR_RGB2LAB).astype(np.float32)
+    # Harf satırlarını tek bileşen yap (tek tek harf = kendi halkası bozulmasın)
+    reach = int(os.environ.get("MASK_REACH", "30"))
+    comp_src = cv2.dilate(seg, ell(2 * reach + 1))
+    n, labels = cv2.connectedComponents(comp_src)
+    glyphs = np.zeros((h, w), np.uint8)
+    for lbl in range(1, n):
+        comp = (labels == lbl)
+        ys, xs = np.where(comp)
+        pad = ring_out + 8
+        y1, y2 = max(0, ys.min() - pad), min(h, ys.max() + pad + 1)
+        x1, x2 = max(0, xs.min() - pad), min(w, xs.max() + pad + 1)
+        c = comp[y1:y2, x1:x2].astype(np.uint8)
+        s_roi = seg[y1:y2, x1:x2] > 0
+        f_roi = fine[y1:y2, x1:x2] > 0
+        # Native-scale segmenter bazen (renkli/gradyanlı yazıda) hiçbir şey
+        # bulamaz, yalnızca blob'lu coarse maske kalır. Bu bileşende 'fine'
+        # güvenilmez: yakınlık/union için coarse'u kullan, ama blob'u maskeye
+        # doğrudan ekleme (glyph'ler Lab farkından çıkar).
+        fine_missing = (f_roi & (c > 0)).sum() < float(os.environ.get("MASK_FINE_MIN_COV", "0.08")) * max(1, (s_roi & (c > 0)).sum())
+        fine_roi_u8 = (s_roi.astype(np.uint8) * 255) if fine_missing else fine[y1:y2, x1:x2]
+        ring =(cv2.dilate(c, ell(2 * ring_out + 1)) > 0) & (c == 0)
+        if ring.sum() < 50:
+            glyphs[y1:y2, x1:x2][s_roi] = 255
             continue
-        for s in r.masks.data:
-            sm = s.cpu().numpy().astype(np.uint8) * 255
-            if sm.shape[:2] != (h, w):
-                sm = cv2.resize(sm, (w, h), interpolation=cv2.INTER_NEAREST)
-            seg[sm > 127] = 255
-    if seg.sum() == 0:
-        return seg
+        l_roi = lab[y1:y2, x1:x2]
+        bg = np.median(l_roi[ring], axis=0)
+        diff = np.linalg.norm(l_roi - bg, axis=2)
+        region = c > 0
+        vals = diff[region]
+        if vals.size == 0:
+            continue
+        otsu_t, _ = cv2.threshold(np.clip(vals, 0, 255).astype(np.uint8).reshape(-1, 1), 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+        thr = max(min_diff, min(float(otsu_t), 40.0))
+        g = region & (diff > thr)
+        # Segmenter'ın kaçırdığı uç harfler için dış bantta SADECE küçük/orta
+        # bileşenleri kabul et (büyük = sanat: bulut, saç, çizgi).
+        near = cv2.dilate(fine_roi_u8, ell(near_k)) > 0
+        outer = (g & ~near).astype(np.uint8)
+        g = g & near
+        if outer.any():
+            no, lo, so, _ = cv2.connectedComponentsWithStats(outer, connectivity=8)
+            kept = np.zeros(outer.shape, np.uint8)
+            for i in range(1, no):
+                if (outer_min <= so[i, cv2.CC_STAT_AREA] <= outer_max
+                        and max(so[i, cv2.CC_STAT_WIDTH], so[i, cv2.CC_STAT_HEIGHT]) <= outer_extent):
+                    kept[lo == i] = 255
+            g |= kept > 0
+        # Büyük/birleşik (glow+sanat) bileşende harf kaçmasın: coarse segmenter
+        # bölgesinin İÇİNDE, yüksek kontrastlı pikselleri boyut süzgeci olmadan al.
+        strong = float(os.environ.get("MASK_OUTER_DIFF", "45"))
+        strong_reach = int(os.environ.get("MASK_OUTER_REACH", "70"))
+        close_to_fine = cv2.dilate(fine_roi_u8, ell(2 * strong_reach + 1)) > 0
+        g |= (s_roi & ~near & region & close_to_fine & (diff > strong))
+        # Konturlu/halolu harfin koyu çekirdeği zeminden farksız kalır -> küçük
+        # bileşenlerin iç boşluklarını doldur.
+        g8 = g.astype(np.uint8) * 255
+        cnts, _ = cv2.findContours(g8, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        for ct in cnts:
+            _, _, cw, ch = cv2.boundingRect(ct)
+            if max(cw, ch) <= outer_extent:
+                cv2.drawContours(g8, [ct], -1, 255, thickness=cv2.FILLED)
+        g = g8 > 0
+        def edge_glyphs(cand):
+            # Blob'lu coarse maskede Lab farkı sanatı da yakalar: sadece OCR kutusu
+            # içinde ve keskin kenar yoğunluğu olan (harf) pikselleri tut.
+            tb = text_boxes[y1:y2, x1:x2] > 0
+            gray = cv2.cvtColor(image[y1:y2, x1:x2], cv2.COLOR_RGB2GRAY)
+            edges = cv2.dilate(cv2.Canny(gray, 60, 150), ell(3))
+            edge_fill = cv2.morphologyEx(edges, cv2.MORPH_CLOSE, ell(15)) > 0
+            g8_ = cv2.morphologyEx((cand & edge_fill & tb).astype(np.uint8) * 255, cv2.MORPH_CLOSE, ell(15))
+            inv = cv2.bitwise_not(g8_)
+            nh, lh, sh, _ = cv2.connectedComponentsWithStats(inv, connectivity=4)
+            for i in range(1, nh):  # küçük iç boşlukları (harf içi) doldur
+                if sh[i, cv2.CC_STAT_AREA] <= 2500:
+                    g8_[lh == i] = 255
+            return (g8_ > 0) & tb
 
-    # Temizleme kriteri = render kriteri: SADECE yazısı basılacak (çevirisi olan)
-    # blokların bölgesini temizle. Çevirisi olmayan balon hiç dokunulmaz ->
-    # "temizlenmiş ama boş" balon oluşamaz. Okunamayan SFX / işaretler de
-    # (çevirileri olmadığı için) orijinal kalır.
-    if blocks is not None:
-        pad = int(os.environ.get("CLEAN_TEXT_PAD", "20"))
-        ad_min_ratio = float(os.environ.get("AD_MIN_AREA_RATIO", "0.015"))
-        page_area = h * w
-        keep = np.zeros((h, w), np.uint8)
-        has_target = False
-        for blk in blocks:
-            x1, y1, x2, y2 = [int(v) for v in getattr(blk, "xyxy", (0, 0, 0, 0))]
-            if getattr(blk, "is_ad", False):
-                # Reklam: SADECE yeterince büyükse temizle. Küçük köşe
-                # watermark'larına (alan eşiğinin altında) dokunma.
-                area = max(0, x2 - x1) * max(0, y2 - y1)
-                clean_it = area >= page_area * ad_min_ratio
-            else:
-                # Normal blok: render kriteriyle aynı (çeviri varsa len>1, yoksa
-                # OCR metnine düş).
-                tr = (getattr(blk, "translation", "") or "").strip()
-                txt = (getattr(blk, "text", "") or "").strip()
-                clean_it = (len(tr) > 1) if tr else bool(txt)
-            if not clean_it:
-                continue
-            has_target = True
-            keep[max(0, y1 - pad):min(h, y2 + pad), max(0, x1 - pad):min(w, x2 + pad)] = 255
-        if not has_target:
-            return np.zeros((h, w), np.uint8)
-        seg = cv2.bitwise_and(seg, keep)
-        if seg.sum() == 0:
-            return seg
+        if fine_missing and text_boxes is not None:
+            g = edge_glyphs(g)
+        elif text_boxes is not None:
+            # 'fine' satırın yalnızca bir kısmını bulduysa (ör. sondaki harfler
+            # fine'dan çok uzakta kalır) coarse'un fine'dan uzak kısmında aynı
+            # Lab+kenar yöntemiyle harfleri tamamla.
+            far_r = int(os.environ.get("MASK_FAR_REACH", "22"))
+            far = s_roi & (c > 0) & ~(cv2.dilate(fine_roi_u8, ell(2 * far_r + 1)) > 0)
+            if far.sum() >= int(os.environ.get("MASK_FAR_MIN_AREA", "400")):
+                cand = (region & (diff > thr)) & (cv2.dilate(far.astype(np.uint8), ell(7)) > 0)
+                g |= edge_glyphs(cand)
+        if union_seg and not fine_missing:
+            # Düşük kontrastlı (glow) yazıda segmenter'a güven; ama fine maske
+            # blob'luysa (Lab farkı zaten harfleri buluyorsa) blob'u ekleme ->
+            # "küçük gri kutu" artefaktı. Sadece g'nin zayıf kaldığı fine
+            # bileşenlerini birleştir.
+            comp_min = float(os.environ.get("MASK_UNION_COMP_MIN_COV", "0.10"))
+            halo_px = int(os.environ.get("MASK_UNION_HALO", "7"))
+            fcomp = (f_roi & (c > 0)).astype(np.uint8)
+            nf, lf = cv2.connectedComponents(fcomp)
+            for fi in range(1, nf):
+                fc = lf == fi
+                if (g & fc).sum() < comp_min * fc.sum():
+                    g |= fc
+                else:
+                    # g zaten harfleri buluyor: sadece harf çevresindeki halo/glow'u
+                    # (fine içinde, g'ye halo_px yakın) ekle; blob'un geri kalanını değil.
+                    g |= fc & (cv2.dilate(g.astype(np.uint8), ell(2 * halo_px + 1)) > 0)
+        if g.sum() < 0.02 * region.sum():
+            g = s_roi  # güvenilmez zemin -> segmenter maskesine düş
+        glyphs[y1:y2, x1:x2][g] = 255
+    mask = cv2.morphologyEx(glyphs, cv2.MORPH_CLOSE, ell(close_k))
+    mask = cv2.dilate(mask, ell(dilate_k))
+    # Dilation segmenter çevresinden fazla taşmasın (sanat/balon kenarı)
+    return cv2.bitwise_and(mask, comp_src)
 
+
+def _legacy_otsu_mask(image, seg, close_k, dilate_k):
+    h, w = image.shape[:2]
     # Her segmenter bileşeninin etrafında, balon kenarına değmeden Otsu ile
     # izole işaretleri (ünlem kuyruğu vb.) topla.
     otsu_full = np.zeros((h, w), np.uint8)
@@ -429,6 +565,200 @@ def build_segmenter_mask(image: np.ndarray, blocks=None) -> np.ndarray:
     return mask
 
 
+def _tiled_segment(segmenter, image: np.ndarray, conf: float) -> tuple[np.ndarray, np.ndarray]:
+    """Run the text segmenter on overlapping tiles at native resolution (a tall
+    800x5000 page downscaled to imgsz=1024 loses end letters) and union the masks.
+    Returns (coarse, fine) (h, w) uint8 masks: coarse = union of all scales (finds
+    every letter but is blobby), fine = native-scale only (hugs the text)."""
+    h, w = image.shape[:2]
+    tile = int(os.environ.get("SEG_TILE", "1024"))
+    overlap = float(os.environ.get("SEG_TILE_OVERLAP", "0.25"))
+    scales = [float(v) for v in os.environ.get("SEG_SCALES", "0.5,0.8,1.0").split(",") if v.strip()]
+    seg = np.zeros((h, w), np.uint8)
+    fine = np.zeros((h, w), np.uint8)
+    step = max(1, int(tile * (1 - overlap)))
+    ys = [0] if h <= tile else list(range(0, h - tile, step)) + [h - tile]
+    bgr = np.ascontiguousarray(image[..., ::-1])
+    for y0 in ys:
+        y1 = min(h, y0 + tile)
+        crop = bgr[y0:y1]
+        base = max(crop.shape[:2])
+        # Model is very scale sensitive (different imgsz finds different letters),
+        # so union a few scales per tile.
+        for sc in scales:
+            imgsz = max(320, int(round(base * sc / 32.0)) * 32)
+            res = _seg_predict(segmenter, crop, conf=conf, verbose=False, imgsz=imgsz, retina_masks=True)
+            for r in res:
+                if r.masks is None:
+                    continue
+                for sm in r.masks.data:
+                    m = sm.cpu().numpy().astype(np.uint8) * 255
+                    if m.shape[:2] != (y1 - y0, w):
+                        m = cv2.resize(m, (w, y1 - y0), interpolation=cv2.INTER_NEAREST)
+                    seg[y0:y1][m > 127] = 255
+                    if sc == scales[-1]:
+                        fine[y0:y1][m > 127] = 255
+    return seg, fine
+
+
+_WATERMARK_PATTERNS = (
+    r"vortex\s*scans",
+    r"[a-z0-9-]+\.(?:com|net|org|io|me|gg|xyz|co|to)\b",
+    r"read\s+(?:this\s+series\s+)?first\s+at",
+    r"discord\.gg|t\.me/|www\.|https?://",
+    r"\b(?:patreon|ko-?fi)\b",
+)
+
+
+def watermark_rule(blk, page_w: int, page_h: int) -> str | None:
+    """Scan-group watermark / banner / logo blokları TEMİZLENMEZ (yarım maskelenip
+    bozulmasın). Dönen değer = eşleşen kuralın adı, yoksa None.
+    WATERMARK_POLICY=keep (varsayılan) | clean ; WATERMARK_PATTERNS=ek|regex'ler."""
+    if os.environ.get("WATERMARK_POLICY", "keep").strip().lower() != "keep":
+        return None
+    if getattr(blk, "is_ad", False):
+        return "is_ad"
+    txt = (getattr(blk, "text", "") or "").strip().lower()
+    if not txt:
+        return None
+    extra = os.environ.get("WATERMARK_PATTERNS", "").strip()
+    pats = list(_WATERMARK_PATTERNS) + ([extra] if extra else [])
+    for pat in pats:
+        try:
+            if re.search(pat, txt, re.IGNORECASE):
+                return f"pattern:{pat[:28]}"
+        except re.error:
+            continue
+    return None
+
+
+def build_segmenter_mask(image: np.ndarray, blocks=None, require_translation: bool = False) -> np.ndarray:
+    """Pixel-perfect metin maskesi: YOLOv8 segmentasyonu + balon-içi Otsu (izole
+    işaretleri toplar, balon kenarına değmez) + closing/dilation.
+
+    blocks verilirse, maske SADECE OCR metni OKUNAN blokların bölgesine
+    sınırlanır. Böylece OCR'ın okuyamadığı SFX / ses efektleri / yalın
+    işaretler (!, ? gibi) temizlenmez, orijinal haliyle bırakılır."""
+    h, w = image.shape[:2]
+    conf = float(os.environ.get("SEG_CONF", "0.25"))
+    tight = os.environ.get("MASK_TIGHT", "true").lower() == "true"
+    close_k = int(os.environ.get("MASK_CLOSE", "7" if tight else "21"))
+    dilate_k = int(os.environ.get("MASK_DILATE", "9" if tight else "41"))
+    allowed_mask = None
+    text_boxes = None
+
+    segmenter = _get_segmenter()
+    seg, fine = _tiled_segment(segmenter, image, conf)
+    if seg.sum() == 0 and blocks is None:
+        return seg
+
+    # Temizleme kriteri = render kriteri: SADECE yazısı basılacak (çevirisi olan)
+    # blokların bölgesini temizle. Çevirisi olmayan balon hiç dokunulmaz ->
+    # "temizlenmiş ama boş" balon oluşamaz. Okunamayan SFX / işaretler de
+    # (çevirileri olmadığı için) orijinal kalır.
+    if blocks is not None:
+        pad = int(os.environ.get("CLEAN_TEXT_PAD", "50"))
+        ad_min_ratio = float(os.environ.get("AD_MIN_AREA_RATIO", "0.015"))
+        page_area = h * w
+        keep = np.zeros((h, w), np.uint8)
+        text_boxes = np.zeros((h, w), np.uint8)
+        target_boxes: list = []
+        tb_pad = int(os.environ.get("CLEAN_FINE_MISSING_PAD", "14"))
+        has_target = False
+        wm_exclude = np.zeros((h, w), np.uint8)
+        wm_pad = int(os.environ.get("WATERMARK_PAD", "12"))
+        for blk in blocks:
+            x1, y1, x2, y2 = [int(v) for v in getattr(blk, "xyxy", (0, 0, 0, 0))]
+            wm = watermark_rule(blk, w, h)
+            if wm:
+                # Watermark/banner: hiç dokunma (maskeye girmez, çevresi de korunur).
+                wm_exclude[max(0, y1 - wm_pad):min(h, y2 + wm_pad), max(0, x1 - wm_pad):min(w, x2 + wm_pad)] = 255
+                print(f"  [clean] watermark kept untouched rule={wm} box={x1},{y1},{x2},{y2}", flush=True)
+                continue
+            if getattr(blk, "is_ad", False):
+                # Reklam: SADECE yeterince büyükse temizle. Küçük köşe
+                # watermark'larına (alan eşiğinin altında) dokunma.
+                area = max(0, x2 - x1) * max(0, y2 - y1)
+                clean_it = area >= page_area * ad_min_ratio
+            else:
+                # Normal blok: render kriteriyle aynı (çeviri varsa len>1, yoksa
+                # OCR metnine düş).
+                tr = (getattr(blk, "translation", "") or "").strip()
+                txt = (getattr(blk, "text", "") or "").strip()
+                if require_translation:
+                    # Çeviri aşaması bitti: sadece render edilecek (len>1) bloklar.
+                    clean_it = len(tr) > 1
+                else:
+                    clean_it = (len(tr) > 1) if tr else bool(txt)
+            if not clean_it:
+                continue
+            has_target = True
+            keep[max(0, y1 - pad):min(h, y2 + pad), max(0, x1 - pad):min(w, x2 + pad)] = 255
+            text_boxes[max(0, y1 - tb_pad):min(h, y2 + tb_pad), max(0, x1 - tb_pad):min(w, x2 + tb_pad)] = 255
+            if not getattr(blk, "is_ad", False):
+                target_boxes.append((x1, y1, x2, y2))
+        if not has_target:
+            return np.zeros((h, w), np.uint8)
+        # Detector kutusu bir satırın yalnızca bir kısmını kapsıyorsa (ör. baştaki
+        # harfler kutu dışında kalır) satırı tamamla: kutuyla yeterince örtüşen
+        # segmenter bileşenini bütün olarak kabul et. Kutuyla ilgisiz metin
+        # (logo vb.) örtüşme eşiğini geçemez.
+        line_reach = int(os.environ.get("MASK_LINE_REACH", "14"))
+        min_inside = float(os.environ.get("MASK_LINE_MIN_INSIDE", "0.25"))
+        el = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * line_reach + 1, 2 * line_reach + 1))
+        n_l, lab_l = cv2.connectedComponents(cv2.dilate(fine, el))
+        for li in range(1, n_l):
+            comp_seg = (lab_l == li) & (fine > 0)
+            tot = int(comp_seg.sum())
+            if tot == 0:
+                continue
+            inside = int((comp_seg & (keep > 0)).sum())
+            if 0 < inside < tot and inside / tot >= min_inside:
+                keep[cv2.dilate(comp_seg.astype(np.uint8), el) > 0] = 255
+        allowed_mask = keep
+        # Segmenter bir OCR bloğunda HİÇ yazı bulamadıysa (ör. koyu zeminde kısa
+        # beyaz 'But...') bloğu sentetik coarse bileşen yap: glyph'ler yine
+        # Lab farkı + keskin kenar süzgecinden çıkar (_tight_glyph_mask,
+        # fine_missing yolu). Hem tight hem legacy yol için seg'e eklenir.
+        min_cov = float(os.environ.get("MASK_BLOCK_MIN_SEG_COV", "0.03"))
+        if min_cov > 0:
+            for bx1, by1, bx2, by2 in target_boxes:
+                bx1, by1, bx2, by2 = max(0, bx1), max(0, by1), min(w, bx2), min(h, by2)
+                if bx2 <= bx1 or by2 <= by1:
+                    continue
+                if (seg[by1:by2, bx1:bx2] > 0).mean() < min_cov:
+                    seg[by1:by2, bx1:bx2] = 255
+        seg = cv2.bitwise_and(seg, keep)
+        fine = cv2.bitwise_and(fine, keep)
+        if seg.sum() == 0:
+            return seg
+
+    if os.environ.get("MASK_TIGHT", "true").lower() == "true":
+        mask = _tight_glyph_mask(image, seg, close_k, dilate_k, fine, text_boxes)
+    else:
+        mask = _legacy_otsu_mask(image, seg, close_k, dilate_k)
+    if allowed_mask is not None:
+        protected = bubble_outline_protection_mask(image, blocks)
+        mask = constrain_mask_to_allowed_regions(mask, allowed_mask, protected)
+        if wm_exclude.any():
+            mask[wm_exclude > 0] = 0
+    return mask
+
+
+# The renderer measures the source lettering on this same original-page mask (colours, size, line groups).
+_build_segmenter_mask_impl = build_segmenter_mask
+
+
+def build_segmenter_mask(image: np.ndarray, blocks=None, require_translation: bool = False) -> np.ndarray:
+    mask = _build_segmenter_mask_impl(image, blocks, require_translation)
+    try:
+        from modules.rendering import orig_mask
+        orig_mask.remember(image, mask)
+    except Exception as exc:  # never let render bookkeeping break cleaning
+        print(f"  [orig_mask] not stored: {exc}", flush=True)
+    return mask
+
+
 def block_inpaint(image: np.ndarray, mask: np.ndarray, config) -> np.ndarray:
     """Block-aware full-res LaMa: her metin bölgesini 1.7x bağlamla kırpıp ayrı
     inpaint eder (tüm sayfayı küçültmeden → keskin sonuç)."""
@@ -451,7 +781,21 @@ def block_inpaint(image: np.ndarray, mask: np.ndarray, config) -> np.ndarray:
             continue
         out = imk.convert_scale_abs(lama(crop, cmask, config))
         cm = cmask > 0
-        result[cy1:cy2, cx1:cx2][cm] = out[cm]
+        if os.environ.get("CLEAN_LAMA_BLEND", "true").lower() == "true":
+            # LaMa dolgusu çoğu zaman zeminden hafif ton kayar (açık/koyu kutu
+            # artefaktı) ve maske kenarında sert dikdörtgen bırakır: maske
+            # çevresindeki halkadan ton farkını düzelt + kenarı yumuşat.
+            ring = (cv2.dilate(cm.astype(np.uint8), cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (15, 15))) > 0) & ~cm
+            band = cm & ~(cv2.erode(cm.astype(np.uint8), cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9, 9))) > 0)
+            if os.environ.get("CLEAN_LAMA_COLOR_MATCH", "false").lower() == "true" and ring.sum() >= 30 and band.sum() >= 30:
+                # Dolgunun kenar bandı ile dışındaki orijinal halka arasındaki ton farkı
+                off = np.median(crop[ring].astype(np.float32), axis=0) - np.median(out[band].astype(np.float32), axis=0)
+                out = np.clip(out.astype(np.float32) + np.clip(off, -40, 40), 0, 255).astype(np.uint8)
+            alpha = np.maximum(cm.astype(np.float32), cv2.GaussianBlur(cm.astype(np.float32), (0, 0), 1.5))
+            base = result[cy1:cy2, cx1:cx2].astype(np.float32)
+            result[cy1:cy2, cx1:cx2] = np.clip(base * (1 - alpha[..., None]) + out.astype(np.float32) * alpha[..., None], 0, 255).astype(np.uint8)
+        else:
+            result[cy1:cy2, cx1:cx2][cm] = out[cm]
     return result
 
 
@@ -602,10 +946,10 @@ def recover_empty_bubble_text_with_gpt(image: np.ndarray, blocks, args: argparse
         content.append({"type": "text", "text": f"crop_{index}"})
         content.append({"type": "image_url", "image_url": {"url": f"data:image/png;base64,{encoded}"}})
 
-    model = MODEL_MAP.get(args.translator, os.environ.get("OPENAI_MODEL", "gpt-5.4-mini"))
+    model = get_openai_model(MODEL_MAP.get(args.translator), "gpt-5.4-mini")
     try:
         response = requests.post(
-            "https://api.openai.com/v1/chat/completions",
+            get_openai_chat_completions_url(),
             headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
             data=json.dumps(
                 {
@@ -893,7 +1237,8 @@ def bubble_outline_protection_mask(image: np.ndarray, blocks) -> np.ndarray:
     max_chroma = int(os.environ.get("BUBBLE_OUTLINE_MAX_CHROMA", "120"))
     min_area = int(os.environ.get("BUBBLE_OUTLINE_MIN_AREA", "8"))
     text_guard = int(os.environ.get("BUBBLE_OUTLINE_TEXT_GUARD", "10"))
-    text_overlap_limit = float(os.environ.get("BUBBLE_OUTLINE_TEXT_OVERLAP_LIMIT", "0.35"))
+    text_overlap_limit = float(os.environ.get("BUBBLE_OUTLINE_TEXT_OVERLAP_LIMIT", "0.65"))
+    protect_dilate = max(1, int(os.environ.get("BUBBLE_OUTLINE_PROTECT_DILATE", "11")))
     protect_long_curves = os.environ.get("BUBBLE_OUTLINE_PROTECT_LONG_CURVES", "false").lower() == "true"
     edge_min_extent = int(os.environ.get("BUBBLE_OUTLINE_EDGE_MIN_EXTENT", "28"))
     edge_min_area = int(os.environ.get("BUBBLE_OUTLINE_EDGE_MIN_AREA", "22"))
@@ -954,7 +1299,7 @@ def bubble_outline_protection_mask(image: np.ndarray, blocks) -> np.ndarray:
 
         if component_mask.max() == 0:
             continue
-        kernel = np.ones((5, 5), np.uint8)
+        kernel = np.ones((protect_dilate, protect_dilate), np.uint8)
         component_mask = imk.dilate(component_mask, kernel, iterations=1)
         protect[by1:by2, bx1:bx2] = np.maximum(protect[by1:by2, bx1:bx2], component_mask)
 
@@ -1146,7 +1491,13 @@ def clear_light_free_text_render_regions(image: np.ndarray, blocks) -> np.ndarra
         fill = np.median(crop[light_pixels], axis=0).astype(np.uint8) if light_pixels.any() else np.array([255, 255, 255], dtype=np.uint8)
         if int(fill.mean()) < 210:
             fill = np.array([255, 255, 255], dtype=np.uint8)
-        result[y1:y2, x1:x2] = fill
+        # Edge-aware feathered fill: only the light pixels (closed over thin ghost strokes) are
+        # repainted, with a Gaussian-feathered alpha, so no hard rectangle shows on gradients/art.
+        near_light = cv2.morphologyEx(light_pixels.astype(np.uint8), cv2.MORPH_CLOSE, np.ones((9, 9), np.uint8))
+        near_light = cv2.erode(near_light, np.ones((3, 3), np.uint8))
+        alpha = cv2.GaussianBlur(near_light.astype(np.float32), (0, 0), 3.0)[..., None]
+        blended = crop.astype(np.float32) * (1.0 - alpha) + fill.astype(np.float32) * alpha
+        result[y1:y2, x1:x2] = np.clip(blended, 0, 255).astype(np.uint8)
 
     return result
 
@@ -1251,61 +1602,29 @@ def clear_light_bubble_text_render_regions(image: np.ndarray, blocks, original: 
     return restore_protected_pixels(source, result, outline_protect)
 
 
-def process_image(path: Path, output_dir: Path, args: argparse.Namespace) -> Path:
-    settings = LocalSettings(args)
-    main = LocalMain(settings, args.source_lang, args.target_lang)
-    device = "cuda" if args.gpu else "cpu"
+def build_text_items_state(blocks, image: np.ndarray, cleaned: np.ndarray, args: argparse.Namespace, main: LocalMain):
+    """Shared render stage: layout translated blocks. Returns (cleaned, text_items_state).
 
-    image = imk.read_image(str(path))
-    print(f"[1/6] detect: {path.name}", flush=True)
-    blocks = TextBlockDetector(settings).detect(image)
-    if not blocks:
-        output_dir.mkdir(parents=True, exist_ok=True)
-        output_ext = path.suffix if args.output_format == "source" else f".{args.output_format.lstrip('.')}"
-        out_path = output_dir / f"{path.stem}{args.suffix}{output_ext}"
-        print(f"[2/6] no text blocks, passthrough save: {out_path}", flush=True)
-        with Image.open(path) as source:
-            source = ImageOps.exif_transpose(source)
-            if output_ext.lower() in {".jpg", ".jpeg", ".webp"} and source.mode not in {"RGB", "RGBA"}:
-                source = source.convert("RGBA" if "A" in source.getbands() else "RGB")
-            source.save(out_path)
-        apply_page_stamp(out_path, path, args)
-        return out_path
+    Used by process_image, the batch path and scripts/render_experiment.py.
+    RENDER_V2=true switches to the balloon/style-aware layout in modules/rendering/render_v2.py;
+    default keeps the original behaviour.
+    """
+    from modules.rendering import render_v2
 
-    print(f"[2/6] ocr: {len(blocks)} blocks", flush=True)
-    ocr = OCRProcessor()
-    ocr.initialize(main, args.source_lang)
-    ocr.process(image, blocks)
-    recover_empty_bubble_text_with_gpt(image, blocks, args)
-    blocks = drop_non_english_ocr_blocks(blocks)
-    blocks = prune_ocr_blocks(blocks, image)
-    strip_translation_garbage_letters(blocks)
-    blocks = sort_blk_list(blocks, right_to_left=args.source_lang == "Japanese")
-
-    print("[3/6] clean: segmenter + block-aware LaMa", flush=True)
-    config = Config(hd_strategy="Resize", hd_strategy_resize_limit=2048)
-    mask = build_segmenter_mask(image, blocks)
-    if mask.sum() == 0:
-        cleaned = image.copy()
-    else:
-        cleaned = block_inpaint(image, mask, config)
-
-    print(f"[4/6] translate: {args.translator}", flush=True)
-    os.environ["TRANSLATION_SOURCE_FILE"] = path.name
-    translator = Translator(main, args.source_lang, args.target_lang)
-    translator.translate(blocks, image, args.extra_context)
-    suppress_noisy_ocr_blocks(blocks, args.source_lang)
-    strip_translation_garbage_letters(blocks)
-    debug_dump_blocks("after-translate", blocks)
-    cleaned = restore_untranslated_regions(image, cleaned, blocks)
-
-    print("[5/6] render", flush=True)
     target_code = get_language_code(args.target_lang)
     render_settings = main.render_settings()
-    format_translations(blocks, target_code, upper_case=render_settings.upper_case)
+    v2 = render_v2.render_v2_enabled() and not any(is_vertical_block(b, target_code) for b in blocks)
+    orig_boxes = [np.array(b.xyxy).copy() for b in blocks]
+    if v2:
+        pass  # casing is decided per block style in V2 (RENDER_CASING=upper|keep|auto, default auto)
+    else:
+        format_translations(blocks, target_code, upper_case=render_settings.upper_case)
     get_best_render_area(blocks, image, cleaned)
     cleaned = clear_light_free_text_render_regions(cleaned, blocks)
     cleaned = clear_light_bubble_text_render_regions(cleaned, blocks, image)
+    alignment = main.button_to_alignment[render_settings.alignment_id]
+    if v2:
+        return cleaned, render_v2.build_items(blocks, image, cleaned, orig_boxes, render_settings, alignment, target_code)
 
     text_items_state = []
     for block in blocks:
@@ -1315,7 +1634,6 @@ def process_image(path: Path, output_dir: Path, args: argparse.Namespace) -> Pat
 
         x1, y1, block_width, block_height = block.xywh
         vertical = is_vertical_block(block, target_code)
-        alignment = main.button_to_alignment[render_settings.alignment_id]
         outline_width = float(render_settings.outline_width)
 
         wrapped, font_size, rendered_width, rendered_height = pyside_word_wrap(
@@ -1367,6 +1685,70 @@ def process_image(path: Path, output_dir: Path, args: argparse.Namespace) -> Pat
             ] if render_settings.outline else [],
         )
         text_items_state.append(props.to_dict())
+    return cleaned, text_items_state
+
+
+def split_merged_blocks_ocr(image: np.ndarray, blocks, ocr):
+    """OCR blocks that merged several separate texts (board menu + titles + username) -> one block per text group."""
+    from modules.utils.merged_blocks import split_merged_ocr_blocks
+
+    h, w = image.shape[:2]
+    return split_merged_ocr_blocks(
+        blocks, image, ocr,
+        skip=lambda b: bool(watermark_rule(b, w, h)) or bool(_AD_URL_RE.search(getattr(b, "text", "") or "")))
+
+
+def process_image(path: Path, output_dir: Path, args: argparse.Namespace) -> Path:
+    settings = LocalSettings(args)
+    main = LocalMain(settings, args.source_lang, args.target_lang)
+    device = "cuda" if args.gpu else "cpu"
+
+    image = imk.read_image(str(path))
+    print(f"[1/6] detect: {path.name}", flush=True)
+    blocks = TextBlockDetector(settings).detect(image)
+    if not blocks:
+        output_dir.mkdir(parents=True, exist_ok=True)
+        output_ext = path.suffix if args.output_format == "source" else f".{args.output_format.lstrip('.')}"
+        out_path = output_dir / f"{path.stem}{args.suffix}{output_ext}"
+        print(f"[2/6] no text blocks, passthrough save: {out_path}", flush=True)
+        with Image.open(path) as source:
+            source = ImageOps.exif_transpose(source)
+            if output_ext.lower() in {".jpg", ".jpeg", ".webp"} and source.mode not in {"RGB", "RGBA"}:
+                source = source.convert("RGBA" if "A" in source.getbands() else "RGB")
+            source.save(out_path)
+        apply_page_stamp(out_path, path, args)
+        return out_path
+
+    print(f"[2/6] ocr: {len(blocks)} blocks", flush=True)
+    ocr = OCRProcessor()
+    ocr.initialize(main, args.source_lang)
+    ocr.process(image, blocks)
+    blocks = split_merged_blocks_ocr(image, blocks, ocr)
+    recover_empty_bubble_text_with_gpt(image, blocks, args)
+    blocks = drop_non_english_ocr_blocks(blocks)
+    blocks = prune_ocr_blocks(blocks, image)
+    strip_translation_garbage_letters(blocks)
+    blocks = sort_blk_list(blocks, right_to_left=args.source_lang == "Japanese")
+
+    print("[3/6] clean: segmenter + block-aware LaMa", flush=True)
+    config = Config(hd_strategy="Resize", hd_strategy_resize_limit=2048)
+    mask = build_segmenter_mask(image, blocks)
+    if mask.sum() == 0:
+        cleaned = image.copy()
+    else:
+        cleaned = block_inpaint(image, mask, config)
+
+    print(f"[4/6] translate: {args.translator}", flush=True)
+    os.environ["TRANSLATION_SOURCE_FILE"] = path.name
+    translator = Translator(main, args.source_lang, args.target_lang)
+    translator.translate(blocks, image, args.extra_context)
+    suppress_noisy_ocr_blocks(blocks, args.source_lang)
+    strip_translation_garbage_letters(blocks)
+    debug_dump_blocks("after-translate", blocks)
+    cleaned = restore_untranslated_regions(image, cleaned, blocks)
+
+    print("[5/6] render", flush=True)
+    cleaned, text_items_state = build_text_items_state(blocks, image, cleaned, args, main)
 
     renderer = ImageSaveRenderer(cleaned)
     renderer.add_state_to_image({"text_items_state": text_items_state})
@@ -1383,28 +1765,56 @@ def process_image(path: Path, output_dir: Path, args: argparse.Namespace) -> Pat
 # Batch pipeline  (BATCH_PIPELINE=true)
 # ─────────────────────────────────────────────────────────────────────────────
 
+def crop_has_ad_evidence(blocks, y1: int, y2: int, page_w: int, page_h: int) -> bool:
+    """Vision'ın kırpmak istediği [y1, y2) dışındaki şeritlerde (kırpılacak yerler)
+    OCR ile okunmuş reklam/watermark/URL metni var mı? AD_VISION_CROP_REQUIRE_TEXT=false
+    ile doğrulama kapatılır (eski davranış)."""
+    if os.environ.get("AD_VISION_CROP_REQUIRE_TEXT", "true").lower() != "true":
+        return True
+    for b in blocks:
+        bx1, by1, bx2, by2 = [int(v) for v in getattr(b, "xyxy", (0, 0, 0, 0))]
+        cy = (by1 + by2) / 2
+        if y1 <= cy < y2:
+            continue  # korunacak içerikteki blok
+        txt = (getattr(b, "text", "") or "")
+        if watermark_rule(b, page_w, page_h) or (txt and _AD_URL_RE.search(txt)):
+            return True
+    return False
+
+
 def _stage_detect_ocr(task: tuple) -> tuple:
     """Phase-1 worker: detect + OCR for one page (thread-safe, fresh instances per call)."""
     idx, path, args, crop = task
     settings = LocalSettings(args)
     main = LocalMain(settings, args.source_lang, args.target_lang)
     image = imk.read_image(str(path))
-    # GPT-Vision reklam bölgesi: görseli en başta kırp (üstten top%, alttan
-    # bottom%). Geri kalan tüm pipeline kırpılmış görselde tutarlı çalışır.
+    def _detect_ocr(img):
+        found = TextBlockDetector(settings).detect(img)
+        if found:
+            ocr = OCRProcessor()
+            ocr.initialize(main, args.source_lang)
+            ocr.process(img, found)
+            found = split_merged_blocks_ocr(img, found, ocr)
+        return found
+
+    blocks = _detect_ocr(image)
+    # GPT-Vision reklam bölgesi: görseli kırp (üstten top%, alttan bottom%).
+    # Vision tek başına güvenilmez (aynı sayfada %11 / %17 gibi değişken ve
+    # gerçek hikâye karesini kırpabiliyor) -> kırpma SADECE kırpılacak şeritte
+    # OCR ile doğrulanmış reklam/watermark metni varsa uygulanır.
     if crop:
         top, bottom = crop
         h = image.shape[0]
         y1 = int(h * top / 100)
         y2 = int(h * (100 - bottom) / 100)
-        if y2 - y1 >= h * 0.08:  # en az %8 gerçek içerik kalıyorsa kırp
+        if y2 - y1 >= h * 0.08 and crop_has_ad_evidence(blocks, y1, y2, image.shape[1], h):
             image = image[y1:y2].copy()
             print(f"  [vision-crop] [{idx+1}] {path.name}: üst%={top} alt%={bottom} kırpıldı", flush=True)
-    blocks = TextBlockDetector(settings).detect(image)
+            blocks = _detect_ocr(image)
+        else:
+            print(f"  [vision-crop] [{idx+1}] {path.name}: üst%={top} alt%={bottom} REDDEDİLDİ "
+                  f"(şeritte OCR reklam kanıtı yok; sayfa kırpılmadı)", flush=True)
     n_detected = len(blocks)
-    if blocks:
-        ocr = OCRProcessor()
-        ocr.initialize(main, args.source_lang)
-        ocr.process(image, blocks)
     n_empty_after_ocr = sum(1 for b in blocks if getattr(b, "text_class", None) == "text_bubble" and not (getattr(b, "text", "") or "").strip())
     recover_empty_bubble_text_with_gpt(image, blocks, args)
     n_before_filters = len(blocks)
@@ -1468,7 +1878,7 @@ def detect_ad_regions(pending: list, args: argparse.Namespace) -> dict:
     if n == 0 or edge <= 0:
         return {}
     idxs = sorted(set(range(min(edge, n))) | set(range(max(0, n - edge), n)))
-    model = os.environ.get("OPENAI_MODEL", "gpt-5.4-mini")
+    model = get_openai_model(None)
     from modules.translation.llm.gpt import _log_openai_usage
 
     regions: dict = {}
@@ -1483,7 +1893,7 @@ def detect_ad_regions(pending: list, args: argparse.Namespace) -> dict:
                 im.save(buf, format="JPEG", quality=80)
             b64 = base64.b64encode(buf.getvalue()).decode("ascii")
             resp = requests.post(
-                "https://api.openai.com/v1/chat/completions",
+                get_openai_chat_completions_url(),
                 headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
                 data=json.dumps({
                     "model": model,
@@ -1524,16 +1934,24 @@ def detect_ad_regions(pending: list, args: argparse.Namespace) -> dict:
                   f"(tok in/out {usage.get('prompt_tokens')}/{usage.get('completion_tokens')})", flush=True)
         except Exception as exc:
             print(f"  [vision] sayfa {i+1} hata: {exc}", flush=True)
-    in_price = float(os.environ.get("OPENAI_INPUT_PRICE_PER_1M", "0.75") or "0.75")
-    out_price = float(os.environ.get("OPENAI_OUTPUT_PRICE_PER_1M", "4.50") or "4.50")
-    cost = tot_in / 1e6 * in_price + tot_out / 1e6 * out_price
+    if os.environ.get("OPENAI_USAGE_BILLING_MODE", "api").strip().lower() == "subscription":
+        cost_summary = "ChatGPT/Codex plan kullanımı"
+    else:
+        in_price = float(os.environ.get("OPENAI_INPUT_PRICE_PER_1M", "0.75") or "0.75")
+        out_price = float(os.environ.get("OPENAI_OUTPUT_PRICE_PER_1M", "4.50") or "4.50")
+        cost = tot_in / 1e6 * in_price + tot_out / 1e6 * out_price
+        cost_summary = f"~${cost:.5f}"
     print(f"  [vision] {len(idxs)} sayfa tarandı, {len(regions)} reklam bölgesi; "
-          f"toplam tok {tot_in}+{tot_out}, ~${cost:.5f}", flush=True)
+          f"toplam tok {tot_in}+{tot_out}, {cost_summary}", flush=True)
     return regions
 
 
 def _batch_translate_all(page_results: list, args: argparse.Namespace) -> None:
-    """Phase-2: translate all pages together in as few GPT requests as possible."""
+    """Phase-2: translate all pages together in as few GPT requests as possible.
+
+    Uses the SAME engine as process_image (Translator -> GPTTranslation): identical system prompt (block rules,
+    style tags, Turkish rules), user prompt, temperature, page-image context and line-count enforcement. The only
+    additions are the [[AD]] rule and p{page}_b{block} keys."""
     combined: dict[str, str] = {}
     for pi, (_path, _img, blocks) in enumerate(page_results):
         for bi, blk in enumerate(blocks):
@@ -1541,73 +1959,53 @@ def _batch_translate_all(page_results: list, args: argparse.Namespace) -> None:
     if not combined:
         return
 
-    api_key = os.environ.get("OPENAI_API_KEY", "")
-    model = MODEL_MAP.get(args.translator, "gpt-5.4-mini")
+    from modules.translation.processor import Translator
+    from modules.utils.translator_utils import parse_translation_value
+
+    main = LocalMain(LocalSettings(args), args.source_lang, args.target_lang)
+    engine = Translator(main, args.source_lang, args.target_lang).engine
+    if not hasattr(engine, "translate_keyed"):
+        raise RuntimeError(f"batch translation needs an LLM engine, got {type(engine).__name__}")
     own_brand = os.environ.get("SEO_SITE_NAME", "TrendManga")
-    system_prompt = (
-        f"You are an expert translator who translates {args.source_lang} to {args.target_lang}. "
-        f"You pay attention to style, formality, idioms, slang etc and try to convey it in the way "
-        f"a {args.target_lang} speaker would understand.\n"
-        f"BE MORE NATURAL. NEVER USE 당신, 그녀, 그 or its Japanese equivalents.\n"
-        f"You will translate text OCR'd from a comic. The OCR is not always perfect.\n"
-        f"Return only the JSON with translated values. Do NOT translate the keys. "
-        f"If a block is already in {args.target_lang} or looks like gibberish, output it as-is.\n"
-        f"AD DETECTION: Mark scanlation/fansub promo blocks as ads — do NOT "
-        f"translate them; output exactly the string \"[[AD]]\" as that block's "
-        f"value. A block is an AD if it contains ANY of: a website/domain name "
-        f"(e.g. something.com / .net / .org / .gg), a URL or invite/link code "
-        f"(discord.gg/xxx, /AbCdEf123), a QR/scan instruction, or it pitches "
-        f"reading chapters elsewhere ('read/continue at...', 'premium/advance "
-        f"chapters', 'more at our site', 'join/support us'). THIS APPLIES EVEN IF "
-        f"the text is phrased like in-story dialogue — real comic dialogue NEVER "
-        f"contains real-world website domains or invite links. "
-        f"'{own_brand}' is our OWN brand; never mark our own brand as an ad."
-    )
+    use_images = os.environ.get("BATCH_TRANSLATE_IMAGES", "true").lower() == "true"
+    pages_per_call = max(1, int(os.environ.get("BATCH_TRANSLATE_PAGES", "3")))
 
     batch_size = int(os.environ.get("BATCH_TRANSLATE_SIZE", "400"))
-    keys = list(combined.keys())
-    batches = [keys[i : i + batch_size] for i in range(0, len(keys), batch_size)]
-    results: dict[str, str] = {}
+    batches: list[list[str]] = []
+    if use_images:
+        cur: list[str] = []
+        cur_pages: set[int] = set()
+        for key in combined:
+            pg = int(key[1:].split("_", 1)[0])
+            if cur and ((pg not in cur_pages and len(cur_pages) >= pages_per_call) or len(cur) >= batch_size):
+                batches.append(cur)
+                cur, cur_pages = [], set()
+            cur.append(key)
+            cur_pages.add(pg)
+        if cur:
+            batches.append(cur)
+    else:
+        keys = list(combined.keys())
+        batches = [keys[i : i + batch_size] for i in range(0, len(keys), batch_size)]
+    results: dict[str, tuple[str, str]] = {}
 
-    def _call_batch_translate(batch_dict: dict[str, str]) -> dict[str, str] | None:
-        """One GPT call for a batch. Returns the parsed {key: translation} dict,
-        or None if the call failed / the response had no parseable JSON."""
-        user_prompt = (
-            f"{args.extra_context}\n"
-            f"Make the translation sound as natural as possible.\n"
-            f"Translate this:\n"
-            f"{json.dumps(batch_dict, ensure_ascii=False, indent=2)}"
-        )
-        resp = requests.post(
-            "https://api.openai.com/v1/chat/completions",
-            headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
-            data=json.dumps({
-                "model": model,
-                "messages": [
-                    {"role": "system", "content": [{"type": "text", "text": system_prompt}]},
-                    {"role": "user", "content": [{"type": "text", "text": user_prompt}]},
-                ],
-                "temperature": 1.0,
-                "top_p": 0.95,
-                "max_completion_tokens": max(16000, len(batch_dict) * 300),
-            }),
-            timeout=180,
-        )
-        if not resp.ok:
-            raise RuntimeError(f"{resp.status_code} {resp.text}")
-        resp_data = resp.json()
-        from modules.translation.llm.gpt import _log_openai_usage
-        _log_openai_usage(model, resp_data.get("usage") or {})
-        usage_dbg_path = os.environ.get("BATCH_TRANSLATE_USAGE_PATH")
-        if usage_dbg_path:
-            with open(usage_dbg_path, "a", encoding="utf-8") as fh:
-                fh.write(json.dumps(resp_data.get("usage") or {}) + "\n")
-        content = resp_data["choices"][0]["message"]["content"] or ""
-        m = re.search(r"\{[\s\S]*\}", content)
-        if not m:
-            finish_reason = resp_data["choices"][0].get("finish_reason")
-            raise RuntimeError(f"yanıtta JSON bulunamadı (finish_reason={finish_reason}, content_len={len(content)})")
-        return json.loads(m.group(0))
+    def _call_batch_translate(batch_dict: dict[str, str]) -> dict[str, tuple[str, str]]:
+        """One GPT call for a batch -> {key: (text, style)}. Raises on API/JSON failure."""
+        images, hint = None, ""
+        if use_images:
+            page_ids = sorted({int(k[1:].split("_", 1)[0]) for k in batch_dict})
+            images = [page_results[pi][1] for pi in page_ids]
+            hint = (f"\nThe attached page images are, in order, pages {', '.join(f'p{pi}' for pi in page_ids)}. "
+                    f"A key 'pN_bM' is block M of page pN.")
+        crops: list = []
+        for pi in sorted({int(k[1:].split("_", 1)[0]) for k in batch_dict}):
+            page_keyed = {f"p{pi}_b{bi}": b for bi, b in enumerate(page_results[pi][2]) if f"p{pi}_b{bi}" in batch_dict}
+            hint += engine.row_hint_context(page_keyed, page_results[pi][1], crops)
+        if images is not None:
+            images = images + crops
+        raw = engine.translate_keyed(batch_dict, images=images, extra_context=f"{args.extra_context}{hint}",
+                                     ad_detection=True, own_brand=own_brand)
+        return {k: parse_translation_value(v) for k, v in raw.items() if k in batch_dict}
 
     max_attempts = int(os.environ.get("BATCH_TRANSLATE_RETRY_ATTEMPTS", "3"))
     retry_delay = float(os.environ.get("BATCH_TRANSLATE_RETRY_DELAY_SECONDS", "30"))
@@ -1640,13 +2038,14 @@ def _batch_translate_all(page_results: list, args: argparse.Namespace) -> None:
     # domain / URL / davet kodu varsa reklam say (kendi markamız hariç).
     # Gerçek çizgi roman diyaloğunda gerçek site adresleri geçmez.
     own_key = os.environ.get("SEO_IMAGE_BRAND", os.environ.get("SEO_SITE_NAME", "trendmanga")).lower()
-    for pi, (_path, _img, blocks) in enumerate(page_results):
+    for pi, (_path, img, blocks) in enumerate(page_results):
         for bi, blk in enumerate(blocks):
-            val = results.get(f"p{pi}_b{bi}")
-            if val is None:
+            got = results.get(f"p{pi}_b{bi}")
+            if got is None:
                 continue
+            val, style = got
             src_text = (getattr(blk, "text", "") or "")
-            looks_ad = isinstance(val, str) and "[[AD]]" in val.upper().replace(" ", "")
+            looks_ad = "[[AD]]" in val.upper().replace(" ", "")
             if not looks_ad and own_key not in src_text.lower() and _AD_URL_RE.search(src_text):
                 looks_ad = True
             if looks_ad:
@@ -1654,6 +2053,12 @@ def _batch_translate_all(page_results: list, args: argparse.Namespace) -> None:
                 blk.translation = ""  # reklam: çevirme/yazma
             else:
                 blk.translation = val
+                blk.style = style
+        # list-like UI blocks: N visual rows -> N lines (same post-check as process_image)
+        try:
+            engine.fix_line_counts([b for b in blocks if not getattr(b, "is_ad", False)], img, args.extra_context)
+        except Exception as exc:
+            print(f"  page {pi} line-count check skipped: {exc}", flush=True)
 
 
 def _stage_clean(task: tuple) -> tuple:
@@ -1661,15 +2066,17 @@ def _stage_clean(task: tuple) -> tuple:
     idx, path, image, blocks, args = task
     config = Config(hd_strategy="Resize", hd_strategy_resize_limit=2048)
 
-    mask = build_segmenter_mask(image, blocks)
+    # Gürültülü/boş çeviriler maskelemeden ÖNCE temizlensin; böylece temizlenen
+    # küme == render edilen küme (çevirisiz UI metni silinip boş kalmaz).
+    suppress_noisy_ocr_blocks(blocks, args.source_lang)
+    strip_translation_garbage_letters(blocks)
+    debug_dump_blocks("after-clean-translate", blocks)
+    mask = build_segmenter_mask(image, blocks, require_translation=True)
     if mask.sum() == 0:
         cleaned = image.copy()
     else:
         cleaned = block_inpaint(image, mask, config)
-
-    suppress_noisy_ocr_blocks(blocks, args.source_lang)
-    strip_translation_garbage_letters(blocks)
-    debug_dump_blocks("after-clean-translate", blocks)
+    assert cleaned.shape == image.shape, f"cleaned shape {cleaned.shape} != page {image.shape}"
     cleaned = restore_untranslated_regions(image, cleaned, blocks)
     print(f"  clean [{idx+1}] {path.name}: OK", flush=True)
     return idx, path, image, blocks, cleaned
@@ -1701,76 +2108,14 @@ def _do_render_and_save(
         print(f"  [{idx+1}/{n_total}] passthrough: {out_path.name}", flush=True)
         return out_path
 
-    target_code = get_language_code(args.target_lang)
-    render_settings = main.render_settings()
-    format_translations(blocks, target_code, upper_case=render_settings.upper_case)
-    get_best_render_area(blocks, image, cleaned)
-    cleaned = clear_light_free_text_render_regions(cleaned, blocks)
-    cleaned = clear_light_bubble_text_render_regions(cleaned, blocks, image)
-
-    text_items_state = []
-    for blk in blocks:
-        translation = blk.translation
-        if not translation or len(translation) == 1:
-            continue
-        x1, y1, block_width, block_height = blk.xywh
-        vertical = is_vertical_block(blk, target_code)
-        alignment = main.button_to_alignment[render_settings.alignment_id]
-        outline_width = float(render_settings.outline_width)
-        wrapped, font_size, rendered_width, rendered_height = pyside_word_wrap(
-            translation,
-            render_settings.font_family,
-            int(block_width),
-            int(block_height),
-            float(render_settings.line_spacing),
-            outline_width,
-            render_settings.bold,
-            render_settings.italic,
-            render_settings.underline,
-            alignment,
-            render_settings.direction,
-            render_settings.max_font_size,
-            render_settings.min_font_size,
-            vertical,
-            return_metrics=True,
-        )
-        if is_no_space_lang(target_code):
-            wrapped = wrapped.replace(" ", "")
-        font_color = get_smart_text_color(blk.font_color, QColor(render_settings.color))
-        outline_color = contrast_outline_color(font_color) if render_settings.outline else None
-        pos_x = int(x1 + max(0, (block_width - rendered_width) / 2))
-        pos_y = int(y1 + max(0, (block_height - rendered_height) / 2))
-        props = TextItemProperties(
-            text=wrapped,
-            font_family=render_settings.font_family,
-            font_size=font_size,
-            text_color=font_color,
-            alignment=alignment,
-            line_spacing=float(render_settings.line_spacing),
-            outline_color=outline_color,
-            outline_width=outline_width,
-            bold=render_settings.bold,
-            italic=render_settings.italic,
-            underline=render_settings.underline,
-            position=(pos_x, pos_y),
-            rotation=blk.angle,
-            scale=1.0,
-            transform_origin=blk.tr_origin_point,
-            width=rendered_width,
-            height=rendered_height,
-            direction=render_settings.direction,
-            vertical=vertical,
-            selection_outlines=[
-                OutlineInfo(0, len(wrapped), outline_color, outline_width, OutlineType.Full_Document)
-            ] if render_settings.outline else [],
-        )
-        text_items_state.append(props.to_dict())
+    cleaned, text_items_state = build_text_items_state(blocks, image, cleaned, args, main)
 
     renderer = ImageSaveRenderer(cleaned)
     renderer.add_state_to_image({"text_items_state": text_items_state})
     output_dir.mkdir(parents=True, exist_ok=True)
     print(f"  [{idx+1}/{n_total}] save: {out_path.name}", flush=True)
     saved_paths = save_rendered_output(renderer, out_path)
+    verify_output_dims(saved_paths, image)
     apply_page_stamp_to_outputs(saved_paths, path, args, idx + 1)
     return out_path
 
@@ -1835,7 +2180,7 @@ def _rate_translation_quality(page_results: list, args: argparse.Namespace) -> f
 
     sample = random.sample(pairs, min(int(os.environ.get("QUALITY_SCORE_SAMPLE", "20")), len(pairs)))
     sample_json = json.dumps([{"source": s, "translation": t} for s, t in sample], ensure_ascii=False)
-    model = MODEL_MAP.get(args.translator, "gpt-5.4-mini")
+    model = get_openai_model(MODEL_MAP.get(args.translator), "gpt-5.4-mini")
     prompt = (
         f"Rate the quality of each {args.source_lang}→{args.target_lang} translation on a scale "
         f"of 1 (bad) to 5 (perfect). Consider accuracy, naturalness, and style. "
@@ -1843,7 +2188,7 @@ def _rate_translation_quality(page_results: list, args: argparse.Namespace) -> f
     )
     try:
         resp = requests.post(
-            "https://api.openai.com/v1/chat/completions",
+            get_openai_chat_completions_url(),
             headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
             data=json.dumps({
                 "model": model,
@@ -1890,7 +2235,7 @@ def process_all_batched(images: list[Path], output_dir: Path, args: argparse.Nam
     Retry               : PAGE_MAX_RETRIES=N  (default 3)
     Resume              : zaten çevrilmiş sayfalar otomatik atlanır
     """
-    base_workers = int(os.environ.get("BATCH_WORKERS", "2"))
+    base_workers = int(os.environ.get("BATCH_WORKERS", "3"))
     max_retries = int(os.environ.get("PAGE_MAX_RETRIES", "3"))
     settings = LocalSettings(args)
     main = LocalMain(settings, args.source_lang, args.target_lang)
@@ -1905,6 +2250,8 @@ def process_all_batched(images: list[Path], output_dir: Path, args: argparse.Nam
     if not pending:
         print("[BATCH] Tüm sayfalar zaten çevrilmiş.", flush=True)
         return 0
+
+    _prewarm_cleaners()
 
     # ── Model warm-up: thread'ler başlamadan önce modeli main thread'de indir ──
     print("[BATCH] Model warm-up...", flush=True)
@@ -2005,6 +2352,20 @@ def process_all_batched(images: list[Path], output_dir: Path, args: argparse.Nam
     return failed
 
 
+def verify_output_dims(saved_paths: list, image: np.ndarray) -> None:
+    """Çıktı boyutu (parçalar toplamı) işlenen sayfa görseliyle birebir aynı olmalı;
+    sessiz kırpılma/kesilme (ör. alt kısmın kaybolması) hata olarak yakalanır."""
+    total_h = 0
+    width = None
+    for sp in saved_paths:
+        with Image.open(sp) as im:
+            width = im.size[0] if width is None else width
+            total_h += im.size[1]
+    exp_h, exp_w = image.shape[:2]
+    if (width, total_h) != (exp_w, exp_h):
+        raise ValueError(f"output size {width}x{total_h} != page size {exp_w}x{exp_h}")
+
+
 def save_rendered_output(renderer: ImageSaveRenderer, out_path: Path) -> list[Path]:
     final_rgb = renderer.render_to_image()
     max_dimension = int(os.environ.get("WEBP_MAX_DIMENSION", "16000"))
@@ -2101,7 +2462,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--target-lang", default=os.environ.get("TARGET_LANG", "Turkish"))
     parser.add_argument("--translator", default=os.environ.get("TRANSLATOR", "GPT-5.4-mini"))
     parser.add_argument("--detector", default=detector_default, choices=["RT-DETR-v2", "RT-DETR-v4-s-int8"])
-    parser.add_argument("--ocr", default=os.environ.get("OCR", os.environ.get("OCR_ENGINE", "Default")))
+    parser.add_argument(
+        "--ocr",
+        default=os.environ.get("OCR", os.environ.get("OCR_ENGINE", "9Router Vision Grid OCR")),
+    )
     parser.add_argument("--inpainter", default="SmartCV2", choices=["SmartCV2"])
     parser.add_argument("--mask-refiner", default="none", choices=["none"])
     parser.add_argument("--hd-strategy", default=os.environ.get("HD_STRATEGY", "Resize"), choices=["Resize", "Original", "Crop"])
@@ -2166,7 +2530,7 @@ def main() -> int:
         print(f"No images found in {input_dir}")
         return 0
 
-    if os.environ.get("BATCH_PIPELINE", "false").lower() == "true":
+    if os.environ.get("BATCH_PIPELINE", "true").lower() == "true":
         failed = process_all_batched(images, output_dir, args)
     else:
         max_retries = int(os.environ.get("PAGE_MAX_RETRIES", "3"))

@@ -32,3 +32,33 @@ models/
 # OS / editor noise
 .DS_Store
 Thumbs.db
+
+# More env variants (keep the template)
+.env.*
+!.env.example
+
+# Logs
+*.log
+logs/
+
+# Model weights and caches (ModelDownloader stores them in
+# %LOCALAPPDATA%/MangaTranslationWorker/models, outside the repo)
+*.gguf
+*.ckpt
+*.bin
+
+# Experiment / test output (harnesses in scripts/ write here)
+render_test/
+output_*/
+chapter_test/
+flux_experiment/
+cleaning_fix/
+
+# Third-party comic fonts in FONT KLASÖR/ have no licence files, so they are
+# not redistributed. Place your own fonts there locally (see README, "Placing fonts").
+FONT KLASÖR/
+
+# IDE
+.vscode/
+.idea/
+*.swp
