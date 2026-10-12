@@ -1,0 +1,13 @@
+# NVIDIA GPU variant of the cleaning stack (YOLO text segmenter + LaMa).
+# requirements.txt stays the CPU baseline. To switch an existing venv:
+#   pip install -r requirements.txt            (everything else)
+#   pip uninstall -y onnxruntime torch torchvision
+#   pip install -r requirements-gpu.txt
+# onnxruntime and onnxruntime-gpu must not be installed side by side.
+# torch must be imported before onnxruntime creates a CUDA session (it supplies the
+# CUDA/cuDNN DLLs); the code does that. Needs an NVIDIA driver with CUDA >= 13 for cu130.
+--extra-index-url https://download.pytorch.org/whl/cu130
+torch==2.14.1+cu130
+torchvision==0.29.1+cu130
+ultralytics>=8.3.0
+onnxruntime-gpu>=1.22.1
