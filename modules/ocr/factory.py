@@ -2,7 +2,7 @@ import json
 import hashlib
 
 from .base import OCREngine
-from .qwen_grid_ocr import QwenGridOCR
+from .qwen_grid_ocr import OpenAICompatibleGridOCR, QwenGridOCR
 
 
 class OCRFactory:
@@ -35,6 +35,11 @@ class OCRFactory:
             'Qwen3.6-Flash Grid OCR': 'qwen3.6-flash',
             'Qwen3.6-Plus Grid OCR': 'qwen3.6-plus',
         }
+        if ocr_model == "9Router Vision Grid OCR":
+            credentials = settings.get_credentials("Open AI GPT")
+            engine = OpenAICompatibleGridOCR()
+            engine.initialize(api_key=credentials.get("api_key", ""), model="")
+            return engine
         if ocr_model in qwen_models:
             credentials = settings.get_credentials("Qwen")
             engine = QwenGridOCR()

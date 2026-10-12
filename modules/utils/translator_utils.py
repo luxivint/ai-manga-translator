@@ -1,5 +1,6 @@
 import base64
 import json
+import os
 import re
 import jieba
 import janome.tokenizer
@@ -59,21 +60,69 @@ def get_raw_translation(blk_list: list[TextBlock]):
     
     return raw_translations_json
 
-def set_texts_from_json(blk_list: list[TextBlock], json_string: str):
-    match = re.search(r"\{[\s\S]*\}", json_string)
-    if match:
-        # Extract the JSON string from the matched regular expression
-        json_string = match.group(0)
-        translation_dict = json.loads(json_string)
-        
-        for idx, blk in enumerate(blk_list):
-            block_key = f"block_{idx}"
-            if block_key in translation_dict:
-                blk.translation = translation_dict[block_key]
-            else:
-                print(f"Warning: {block_key} not found in JSON string.")
-    else:
+def translation_temperature(default: float = 0.3) -> float:
+    """Sampling temperature shared by the single-page and the batch translation path."""
+    try:
+        return float(os.environ.get("TRANSLATION_TEMPERATURE", default))
+    except (TypeError, ValueError):
+        return default
+
+
+def parse_translation_value(value) -> tuple[str, str]:
+    """(text, style) from one JSON value: plain string or the style-tag object {"text", "style"}."""
+    style = ""
+    if isinstance(value, dict):
+        style = str(value.get("style") or "").strip().lower()
+        value = value.get("text", "")
+    if value is None:
+        value = ""
+    return str(value), style
+
+
+def apply_translation_json(keyed_blocks: dict, json_string: str) -> set[str]:
+    """Write the translations in `json_string` into {key: TextBlock}; returns the keys that were found.
+
+    Sets blk.translation (explicit \n line breaks preserved) and blk.style (style-tag schema)."""
+    match = re.search(r"\{[\s\S]*\}", json_string or "")
+    if not match:
         print("No JSON found in the input string.")
+        return set()
+    translation_dict = json.loads(match.group(0))
+    found = set()
+    for key, blk in keyed_blocks.items():
+        if key in translation_dict:
+            blk.translation, style = parse_translation_value(translation_dict[key])
+            if style or isinstance(translation_dict[key], dict):
+                blk.style = style
+            found.add(key)
+        else:
+            print(f"Warning: {key} not found in JSON string.")
+    return found
+
+
+def set_texts_from_json(blk_list: list[TextBlock], json_string: str):
+    apply_translation_json({f"block_{idx}": blk for idx, blk in enumerate(blk_list)}, json_string)
+
+
+def redistribute_lines(lines: list[str], n: int) -> list[str]:
+    """Force `lines` into exactly n lines: merge the shortest adjacent pair while there are too many,
+    split the longest multi-word line (balanced) while there are too few."""
+    lines = [ln.strip() for ln in lines if ln and ln.strip()]
+    if n <= 0 or not lines:
+        return lines
+    while len(lines) > n:
+        i = min(range(len(lines) - 1), key=lambda k: len(lines[k]) + len(lines[k + 1]))
+        lines[i:i + 2] = [lines[i] + " " + lines[i + 1]]
+    while len(lines) < n:
+        cand = [k for k, ln in enumerate(lines) if len(ln.split()) > 1]
+        if not cand:
+            break
+        i = max(cand, key=lambda k: len(lines[k]))
+        words = lines[i].split()
+        best = min(range(1, len(words)), key=lambda c: abs(len(" ".join(words[:c])) - len(" ".join(words[c:]))))
+        lines[i:i + 1] = [" ".join(words[:best]), " ".join(words[best:])]
+    return lines
+
 
 def set_upper_case(blk_list: list[TextBlock], upper_case: bool, lang_code: str = ""):
     for blk in blk_list:

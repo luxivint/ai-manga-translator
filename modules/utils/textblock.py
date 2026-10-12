@@ -58,6 +58,7 @@ class TextBlock(object):
         self.max_font_size = max_font_size
         self.font_color = font_color
         self.direction = direction
+        self.style = ""
 
     @property
     def xywh(self):

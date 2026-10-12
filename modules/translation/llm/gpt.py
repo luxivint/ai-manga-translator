@@ -7,6 +7,7 @@ import uuid
 
 from .base import BaseLLMTranslation
 from ...utils.translator_utils import MODEL_MAP
+from ...utils.openai_endpoint import get_openai_chat_completions_url, get_openai_model
 
 
 def _float_env(name: str, default: float) -> float:
@@ -44,13 +45,16 @@ def _estimate_cost_usd(model: str, usage: dict) -> tuple[int, int, int, int, flo
     total_tokens = _usage_int(usage, "total_tokens") or prompt_tokens + completion_tokens
     details = usage.get("prompt_tokens_details") or usage.get("input_tokens_details") or {}
     cached_tokens = _usage_int(details, "cached_tokens")
-    input_price, output_price, cached_price = _price_for_model(model)
-    billed_input_tokens = max(0, prompt_tokens - cached_tokens)
-    cost = (
-        billed_input_tokens * input_price
-        + cached_tokens * cached_price
-        + completion_tokens * output_price
-    ) / 1_000_000
+    if os.environ.get("OPENAI_USAGE_BILLING_MODE", "api").strip().lower() == "subscription":
+        cost = 0.0
+    else:
+        input_price, output_price, cached_price = _price_for_model(model)
+        billed_input_tokens = max(0, prompt_tokens - cached_tokens)
+        cost = (
+            billed_input_tokens * input_price
+            + cached_tokens * cached_price
+            + completion_tokens * output_price
+        ) / 1_000_000
     return prompt_tokens, completion_tokens, cached_tokens, total_tokens, cost
 
 
@@ -92,6 +96,7 @@ def _log_openai_usage(model: str, usage: dict) -> None:
         prompt, completion, cached, total, cost = _estimate_cost_usd(model, usage)
         metadata = {
             "source": os.environ.get("OPENAI_USAGE_SOURCE", "manga-translation-worker"),
+            "billing_mode": os.environ.get("OPENAI_USAGE_BILLING_MODE", "api"),
             "raw_prefix": os.environ.get("TRANSLATION_RAW_PREFIX", ""),
             "output_prefix": os.environ.get("TRANSLATION_OUTPUT_PREFIX", ""),
             "chapter_number": os.environ.get("TRANSLATION_CHAPTER_NUMBER", ""),
@@ -138,8 +143,9 @@ class GPTTranslation(BaseLLMTranslation):
         super().__init__()
         self.model_name = None
         self.api_key = None
-        self.api_base_url = "https://api.openai.com/v1"
+        self.api_base_url = None
         self.supports_images = True
+        self.supports_multi_image = True
     
     def initialize(self, settings: Any, source_lang: str, target_lang: str, model_name: str, **kwargs) -> None:
         """
@@ -156,7 +162,8 @@ class GPTTranslation(BaseLLMTranslation):
         self.model_name = model_name
         credentials = settings.get_credentials(settings.ui.tr('Open AI GPT'))
         self.api_key = credentials.get('api_key', '') or os.environ.get("OPENAI_API_KEY", "")
-        self.model = MODEL_MAP.get(self.model_name)
+        self.model = get_openai_model(MODEL_MAP.get(self.model_name))
+        self.api_base_url = get_openai_chat_completions_url()
 
         if not self.api_key:
             raise RuntimeError(
@@ -181,10 +188,14 @@ class GPTTranslation(BaseLLMTranslation):
             "Authorization": f"Bearer {self.api_key}"
         }
         
-        if self.supports_images and self.img_as_llm_input:
-            # Use the base class method to encode the image
-            encoded_image, mime_type = self.encode_image(image)
-            
+        images = [] if image is None else (list(image) if isinstance(image, (list, tuple)) else [image])
+        if self.supports_images and self.img_as_llm_input and images:
+            # Use the base class method to encode the image(s) (several pages in the batch path)
+            parts = [{"type": "text", "text": user_prompt}]
+            for page_image in images:
+                encoded_image, mime_type = self.encode_image(page_image)
+                parts.append({"type": "image_url", "image_url": {"url": f"data:{mime_type};base64,{encoded_image}"}})
+
             messages = [
                 {
                     "role": "system", 
@@ -192,10 +203,7 @@ class GPTTranslation(BaseLLMTranslation):
                 },
                 {
                     "role": "user", 
-                    "content": [
-                        {"type": "text", "text": user_prompt},
-                        {"type": "image_url", "image_url": {"url": f"data:{mime_type};base64,{encoded_image}"}}
-                    ]
+                    "content": parts
                 }
             ]
         else:
@@ -226,12 +234,17 @@ class GPTTranslation(BaseLLMTranslation):
         """
         try:
             response = requests.post(
-                f"{self.api_base_url}/chat/completions",
+                self.api_base_url,
                 headers=headers,
                 data=json.dumps(payload),
                 timeout=self.timeout
             )
-            
+            if response.status_code == 400 and "temperature" in response.text.lower():
+                # some models only accept the default sampling parameters: retry without them
+                payload = {k: v for k, v in payload.items() if k not in ("temperature", "top_p")}
+                response = requests.post(self.api_base_url, headers=headers,
+                                         data=json.dumps(payload), timeout=self.timeout)
+
             response.raise_for_status()
             response_data = response.json()
             _log_openai_usage(str(payload.get("model") or self.model or self.model_name or ""), response_data.get("usage") or {})

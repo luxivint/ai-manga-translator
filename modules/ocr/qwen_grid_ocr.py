@@ -11,6 +11,7 @@ import requests
 from PIL import Image, ImageDraw, ImageFont
 
 from modules.utils.textblock import TextBlock, adjust_text_line_coordinates
+from modules.utils.openai_endpoint import get_openai_chat_completions_url, get_openai_model
 
 from .base import OCREngine
 
@@ -25,6 +26,7 @@ class QwenGridOCR(OCREngine):
         self.model = "qwen3-vl-flash"
         self.api_base_url = "https://dashscope-intl.aliyuncs.com/compatible-mode/v1/chat/completions"
         self.max_tokens = 2500
+        self.max_tokens_parameter = "max_tokens"
         self.input_price_per_1m = 0.10
         self.output_price_per_1m = 0.40
 
@@ -72,7 +74,7 @@ class QwenGridOCR(OCREngine):
                     ],
                 }
             ],
-            "max_tokens": self.max_tokens,
+            self.max_tokens_parameter: self.max_tokens,
             "temperature": 0,
         }
 
@@ -261,3 +263,17 @@ class QwenGridOCR(OCREngine):
     @staticmethod
     def _normalize_text(text: str) -> str:
         return re.sub(r"\s+", " ", text).strip()
+
+
+class OpenAICompatibleGridOCR(QwenGridOCR):
+    """Grid OCR routed through the configured OpenAI-compatible endpoint."""
+
+    def initialize(self, api_key: str = "", model: str = "", **kwargs) -> None:
+        self.max_tokens_parameter = "max_completion_tokens"
+        self.api_key = api_key or os.environ.get("OPENAI_API_KEY", "")
+        self.model = get_openai_model(model)
+        self.api_base_url = get_openai_chat_completions_url()
+        self.max_tokens = int(kwargs.get("max_tokens", os.environ.get("QWEN_GRID_OCR_MAX_TOKENS", "2500")))
+        # Do not report an invented per-token cost for an arbitrary gateway model.
+        self.input_price_per_1m = float(os.environ.get("OPENAI_INPUT_PRICE_PER_1M", "0"))
+        self.output_price_per_1m = float(os.environ.get("OPENAI_OUTPUT_PRICE_PER_1M", "0"))

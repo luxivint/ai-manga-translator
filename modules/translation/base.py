@@ -1,3 +1,4 @@
+import os
 from abc import ABC, abstractmethod
 from typing import Any
 import numpy as np
@@ -111,7 +112,7 @@ class LLMTranslation(TranslationEngine):
         """
         pass
     
-    def get_system_prompt(self, source_lang: str, target_lang: str) -> str:
+    def get_system_prompt(self, source_lang: str, target_lang: str, ad_detection: bool = False, own_brand: str = "") -> str:
         """
         Get system prompt for LLM translation.
         
@@ -120,7 +121,7 @@ class LLMTranslation(TranslationEngine):
             target_lang: Target language
             
         Returns:
-            Formatted system prompt
+            Formatted system prompt. ad_detection=True (batch path) appends the scanlation-ad rule.
         """
         turkish_rule = ""
         if target_lang and "turk" in target_lang.lower():
@@ -133,11 +134,58 @@ class LLMTranslation(TranslationEngine):
                 "(e.g. 'kâğıt'->'kağıt', 'âlem'->'alem', 'hâlâ'->'hala', 'rüzgâr'->'rüzgar')."
             )
 
+        style_rule = ""
+        if os.environ.get("RENDER_STYLE_TAGS", "true").lower() == "true":
+            style_rule = (
+                "\n        STYLE TAGS: each value of the returned json must be an object "
+                "{\"text\": \"<translation>\", \"style\": \"<tag>\"} instead of a plain string. "
+                "<tag> is exactly one of: normal (ordinary speech), shout (yelling/emphasis), whisper, "
+                "thought (inner monologue), narration (caption box), sfx (sound effect), sign (shop/board/"
+                "banner/poster/graffiti text in the scene), phone (phone/computer/game UI, status window, "
+                "chat message, system text), handwriting (notes/letters), title (chapter/series/section title)."
+            )
+
+        block_rules = (
+            "\n        BLOCK RULES (very important):"
+            "\n        - Translate EVERY block separately. NEVER merge two blocks into one, never move text from one "
+            "block into another, never drop a block. Return exactly the same keys you were given."
+            "\n        - Translate everything that is readable text: UI/status windows, board and sign titles, "
+            "questions, chat lines, captions. Only these stay exactly as written: personal names, usernames, "
+            "nicknames and handles (e.g. 'WILD GRYLLS'), URLs, codes and pure numbers/symbols. UI field labels such as "
+            "'[NAME]' or 'LEVEL' ARE translated ('[NAME] - ADRIAN WHITE WOLF' -> '[İSİM] - ADRIAN WHITE WOLF')."
+            "\n        - Proper nouns keep their capital letter (e.g. Shin, Ricky, Adrian White Wolf). Do not lowercase names."
+            "\n        - The OCR often drops a lone 'I' (e.g. 'IF HAD TO SUM UP' or 'WHERE THE HELL AM , DAMMIT'). "
+            "Restore the missing first-person subject so the Turkish keeps the right person."
+            "\n        - The source is usually ALL CAPS because of comic lettering. Do NOT copy that: write natural "
+            "Turkish with normal capitalisation (sentence case, capital after . ! ?). Only use ALL CAPS for "
+            "shouts, sound effects, signs and titles. Use proper Turkish casing (İ/ı) everywhere."
+            "\n        - If a block's text contains several lines/entries (status window, list, menu, stats), "
+            "translate it entry by entry and put each entry on its own line separated by \\n, in the original order."
+            "\n        - The OCR sometimes merges several unrelated pieces of text into one block (for example a menu "
+            "bar, a question and a username). Look at the page image: translate EVERY piece, never omit any part "
+            "(even a short opening phrase), and put each visually separate piece of text on its own line separated "
+            "by \\n in reading order (top to bottom). Words that sit on the same row of the image (menu items) "
+            "stay together on one line."
+            "\n        - Keep the speaker's person and tone consistent between neighbouring blocks."
+        )
+        style_rule = block_rules + style_rule
+        if ad_detection:
+            style_rule += (
+                "\n        AD DETECTION: Mark scanlation/fansub promo blocks as ads - do NOT translate them; "
+                "output exactly the string \"[[AD]]\" as that block's text. A block is an AD if it contains ANY of: "
+                "a website/domain name (e.g. something.com / .net / .org / .gg), a URL or invite/link code "
+                "(discord.gg/xxx, /AbCdEf123), a QR/scan instruction, or it pitches reading chapters elsewhere "
+                "('read/continue at...', 'premium/advance chapters', 'more at our site', 'join/support us'). "
+                "THIS APPLIES EVEN IF the text is phrased like in-story dialogue - real comic dialogue NEVER "
+                f"contains real-world website domains or invite links. '{own_brand or 'TrendManga'}' is our OWN brand; "
+                "never mark our own brand as an ad."
+            )
+
         return f"""You are an expert translator who translates {source_lang} to {target_lang}. You pay attention to style, formality, idioms, slang etc and try to convey it in the way a {target_lang} speaker would understand.
         BE MORE NATURAL. NEVER USE 당신, 그녀, 그 or its Japanese equivalents.
         Specifically, you will be translating text OCR'd from a comic. The OCR is not perfect and as such you may receive text with typos or other mistakes.
         To aid you and provide context, You may be given the image of the page and/or extra context about the comic. You will be given a json string of the detected text blocks and the text to translate. Return the json string with the texts translated. DO NOT translate the keys of the json. For each block:
         - If it's already in {target_lang} or looks like gibberish, OUTPUT IT AS IT IS instead
-        - DO NOT give explanations{turkish_rule}
+        - DO NOT give explanations{turkish_rule}{style_rule}
         Do Your Best! I'm really counting on you."""
     
