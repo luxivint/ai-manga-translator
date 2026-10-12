@@ -64,6 +64,8 @@ from modules.inpainting.lama import LaMa
 from modules.utils import compute_device
 from modules.ocr.processor import OCRProcessor
 from modules.rendering.render import get_best_render_area, is_vertical_block, pyside_word_wrap
+from modules.translation import consistency
+from modules.translation.consistency import ORDER_HINT
 from modules.translation.processor import Translator
 from modules.utils.image_utils import generate_mask, get_smart_text_color
 from modules.utils.language_utils import get_language_code, get_layout_direction, is_no_space_lang
@@ -1757,6 +1759,10 @@ def process_image(path: Path, output_dir: Path, args: argparse.Namespace) -> Pat
     os.environ["TRANSLATION_SOURCE_FILE"] = path.name
     translator = Translator(main, args.source_lang, args.target_lang)
     translator.translate(blocks, image, args.extra_context)
+    if consistency.enabled():
+        consistency.guard_page(path.name, blocks,
+                               lambda: translator.translate(blocks, image, f"{args.extra_context}{ORDER_HINT}"),
+                               args.target_lang)
     suppress_noisy_ocr_blocks(blocks, args.source_lang)
     strip_translation_garbage_letters(blocks)
     debug_dump_blocks("after-translate", blocks)
@@ -2004,9 +2010,9 @@ def _batch_translate_all(page_results: list, args: argparse.Namespace) -> None:
         batches = [keys[i : i + batch_size] for i in range(0, len(keys), batch_size)]
     results: dict[str, tuple[str, str]] = {}
 
-    def _call_batch_translate(batch_dict: dict[str, str]) -> dict[str, tuple[str, str]]:
+    def _call_batch_translate(batch_dict: dict[str, str], extra: str = "") -> dict[str, tuple[str, str]]:
         """One GPT call for a batch -> {key: (text, style)}. Raises on API/JSON failure."""
-        images, hint = None, ""
+        images, hint = None, extra
         if use_images:
             page_ids = sorted({int(k[1:].split("_", 1)[0]) for k in batch_dict})
             images = [page_results[pi][1] for pi in page_ids]
@@ -2030,25 +2036,29 @@ def _batch_translate_all(page_results: list, args: argparse.Namespace) -> None:
         pending = {k: combined[k] for k in batch_keys}
         print(f"  GPT call [{bi+1}/{len(batches)}]: {len(batch_keys)} blok", flush=True)
 
+        best: dict[str, tuple[str, str]] = {}
         for attempt in range(1, max_attempts + 1):
             try:
-                batch_result = _call_batch_translate(pending) or {}
+                batch_result = _call_batch_translate(pending, extra=ORDER_HINT if attempt > 1 else "") or {}
             except Exception as exc:
                 print(f"  batch {bi+1} translate FAILED (attempt {attempt}/{max_attempts}): {exc}", flush=True)
                 batch_result = {}
 
-            got.update(batch_result)
-            # Only stop once every key we asked for came back; a partial JSON
-            # (GPT silently dropping some keys) retries too, asking only for
-            # what's still missing so later attempts do less redundant work.
-            pending = {k: v for k, v in pending.items() if k not in batch_result}
-            if not pending:
-                break
-            if len(batch_result) > 0:
-                print(f"  batch {bi+1} (attempt {attempt}/{max_attempts}): {len(pending)} blok yanıtta eksik", flush=True)
+            missing = [k for k in batch_keys if k not in batch_result]
+            if not missing:
+                return batch_result
+            # A key missing from the answer means the model lost track of the blocks (merged two, shifted the
+            # rest up by one): the keys that DID come back are not trustworthy either. Keep only the fullest
+            # partial answer as a last resort and re-ask for the WHOLE batch with an explicit order rule.
+            if len(batch_result) > len(best):
+                best = batch_result
+            if batch_result:
+                print(f"  batch {bi+1} (attempt {attempt}/{max_attempts}): {len(missing)} blok yanıtta eksik, "
+                      f"tüm batch tekrar istenecek", flush=True)
             if attempt < max_attempts:
                 print(f"  batch {bi+1}: {retry_delay:.0f}sn sonra tekrar denenecek", flush=True)
                 time.sleep(retry_delay)
+        got.update(best)
         return got
 
     # BATCH_TRANSLATE_CONCURRENCY GPT calls in flight at once (default 4; 1 = sequential). Each batch owns
@@ -2070,9 +2080,10 @@ def _batch_translate_all(page_results: list, args: argparse.Namespace) -> None:
     # domain / URL / davet kodu varsa reklam say (kendi markamız hariç).
     # Gerçek çizgi roman diyaloğunda gerçek site adresleri geçmez.
     own_key = os.environ.get("SEO_IMAGE_BRAND", os.environ.get("SEO_SITE_NAME", "trendmanga")).lower()
-    for pi, (_path, img, blocks) in enumerate(page_results):
+
+    def _apply_results(pi: int, blocks: list, page_results_for_page: dict) -> None:
         for bi, blk in enumerate(blocks):
-            got = results.get(f"p{pi}_b{bi}")
+            got = page_results_for_page.get(f"p{pi}_b{bi}")
             if got is None:
                 continue
             val, style = got
@@ -2086,11 +2097,31 @@ def _batch_translate_all(page_results: list, args: argparse.Namespace) -> None:
             else:
                 blk.translation = val
                 blk.style = style
+
+    def _retry_page(pi: int, blocks: list) -> None:
+        """Re-translate ONE page alone (all its blocks) with an explicit order rule; rewrites the blocks."""
+        keys = {f"p{pi}_b{bi}": (b.text or "") for bi, b in enumerate(blocks)}
+        for b in blocks:
+            b.is_ad = False
+        _apply_results(pi, blocks, _call_batch_translate(keys, extra=ORDER_HINT))
+
+    check = consistency.enabled()
+    flagged: dict[int, list[str]] = {}
+    for pi, (_path, img, blocks) in enumerate(page_results):
+        _apply_results(pi, blocks, results)
+        if check and blocks:
+            # shifted / merged answers keep every key, so only the content can give them away
+            left = consistency.guard_page(pi + 1, blocks, lambda pi=pi, blocks=blocks: _retry_page(pi, blocks),
+                                          args.target_lang)
+            if left:
+                flagged[pi + 1] = left
         # list-like UI blocks: N visual rows -> N lines (same post-check as process_image)
         try:
             engine.fix_line_counts([b for b in blocks if not getattr(b, "is_ad", False)], img, args.extra_context)
         except Exception as exc:
             print(f"  page {pi} line-count check skipped: {exc}", flush=True)
+    if flagged:
+        print(f"[translate-check] still suspicious after retry: {sorted(flagged)}", flush=True)
 
 
 def _stage_clean(task: tuple) -> tuple:
