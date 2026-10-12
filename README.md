@@ -352,6 +352,9 @@ Out of the box `local_batch.py` and the worker use:
 | `PASSTHROUGH_SUSPECT_RATIO` | `0.5` | fails the job when more than this share of pages with detected text bubbles ended with 0 blocks (OCR returned nothing) |
 | `WATERMARK_POLICY` | `clean` | `clean` erases competitor watermarks/banners whole (never the site's own brand); `keep` leaves them untouched |
 | `RENDER_V2`, `RENDER_STYLE_TAGS` | `true` | balloon- and style-aware typesetting |
+| `RENDER_BALLOON_UNIFY` | `true` | blocks sharing one balloon use one font and one size band (`RENDER_BALLOON_BAND`, default `0.12` = +-12% of the balloon median; blocks whose source cap height differs by more than `RENDER_EMPHASIS_RATIO`, default `1.4`, keep their size) and every line must lie inside the balloon interior; `false` = old per-block sizing |
+| `RENDER_MERGE_BALLOON` | `true` | a sentence the OCR split over several blocks of one balloon is laid out as one centred paragraph (separate speech, shouts/SFX and emphasis stay separate); also drops words repeated across the block boundary |
+| `RENDER_RESOLVE_OVERLAP` | `true` | rendered text boxes that overlap are pushed apart / shrunk; halo-text is drawn under other blocks |
 
 Set the matching environment variable to override any of them, for example `BATCH_PIPELINE=false`.
 

@@ -59,6 +59,7 @@ from app.ui.canvas.text.text_item_properties import TextItemProperties
 from app.ui.canvas.text_item import OutlineInfo, OutlineType
 from modules.detection.processor import TextBlockDetector
 from modules.inpainting.schema import Config
+from modules.inpainting import patch_match
 from modules.inpainting.mask import constrain_mask_to_allowed_regions
 from modules.inpainting.lama import LaMa
 from modules.utils import compute_device
@@ -832,7 +833,10 @@ def block_inpaint(image: np.ndarray, mask: np.ndarray, config) -> np.ndarray:
                 # Dolgunun kenar bandı ile dışındaki orijinal halka arasındaki ton farkı
                 off = np.median(crop[ring].astype(np.float32), axis=0) - np.median(out[band].astype(np.float32), axis=0)
                 out = np.clip(out.astype(np.float32) + np.clip(off, -40, 40), 0, 255).astype(np.uint8)
-            alpha = np.maximum(cm.astype(np.float32), cv2.GaussianBlur(cm.astype(np.float32), (0, 0), 1.5))
+            # Düz parlak iç yüzeylerde (balon/kutu/gökyüzü) ton + doku eşleme: LaMa'nın pürüzsüz/ton kaymış
+            # dolgusu kâğıt greniyle uyuşmayan gri dikdörtgen bırakır (CLEAN_PATCH_MATCH=false ile kapanır).
+            out = patch_match.refine_fill(crop, out, cm)
+            alpha = np.maximum(cm.astype(np.float32), cv2.GaussianBlur(cm.astype(np.float32), (0, 0), float(os.environ.get("CLEAN_LAMA_FEATHER", "2.5"))))
             base = result[cy1:cy2, cx1:cx2].astype(np.float32)
             result[cy1:cy2, cx1:cx2] = np.clip(base * (1 - alpha[..., None]) + out.astype(np.float32) * alpha[..., None], 0, 255).astype(np.uint8)
         else:
@@ -1851,17 +1855,27 @@ def _stage_detect_ocr(task: tuple) -> tuple:
         # gerçek hikâye karesini kırpabiliyor) -> kırpma SADECE kırpılacak şeritte
         # OCR ile doğrulanmış reklam/watermark metni varsa uygulanır.
         if crop:
-            top, bottom = crop
+            top, bottom = crop[0], crop[1]
             h = image.shape[0]
-            y1 = int(h * top / 100)
-            y2 = int(h * (100 - bottom) / 100)
-            if y2 - y1 >= h * 0.08 and crop_has_ad_evidence(blocks, y1, y2, image.shape[1], h):
+            y1, y2 = 0, h
+            if top or bottom:
+                vy1 = int(h * top / 100)
+                vy2 = int(h * (100 - bottom) / 100)
+                if vy2 - vy1 >= h * 0.08 and crop_has_ad_evidence(blocks, vy1, vy2, image.shape[1], h):
+                    y1, y2 = vy1, vy2
+                    print(f"  [vision-crop] [{idx+1}] {path.name}: üst%={top} alt%={bottom} kırpıldı", flush=True)
+                else:
+                    print(f"  [vision-crop] [{idx+1}] {path.name}: üst%={top} alt%={bottom} REDDEDİLDİ "
+                          f"(şeritte OCR reklam kanıtı yok; sayfa kırpılmadı)", flush=True)
+            # OCR-free banner strip (measured edge, needs no OCR evidence): the vision percentage is only a rough
+            # guess and can stop short of the banner's real edge, so this tightens the cut to the measured edge.
+            btop, bbottom = (crop[2], crop[3]) if len(crop) >= 4 else (0, 0)
+            if btop or bbottom:
+                y1, y2 = max(y1, int(btop)), min(y2, h - int(bbottom))
+                print(f"  [banner-crop] [{idx+1}] {path.name}: üst={btop}px alt={bbottom}px", flush=True)
+            if (y1, y2) != (0, h) and y2 - y1 >= h * 0.08:
                 image = image[y1:y2].copy()
-                print(f"  [vision-crop] [{idx+1}] {path.name}: üst%={top} alt%={bottom} kırpıldı", flush=True)
                 blocks = _detect_ocr(image)
-            else:
-                print(f"  [vision-crop] [{idx+1}] {path.name}: üst%={top} alt%={bottom} REDDEDİLDİ "
-                      f"(şeritte OCR reklam kanıtı yok; sayfa kırpılmadı)", flush=True)
     except OCRFailedError as exc:
         # OCR could not be read (503 / timeout / broken stream after all retries): NOT the same as a page without
         # text. Flag it; the caller re-runs it later and fails the job if it stays unreadable.
@@ -1915,6 +1929,41 @@ _AD_VISION_PROMPT = (
 )
 
 
+def edge_page_indices(n: int) -> list[int]:
+    """Pages that may carry a promo: first AD_VISION_EDGE_PAGES (3) and last AD_VISION_TAIL_PAGES (5; a banner
+    sliced across the chapter end is often a few pages before the very last one)."""
+    head = int(os.environ.get("AD_VISION_EDGE_PAGES", "3"))
+    tail = int(os.environ.get("AD_VISION_TAIL_PAGES", str(max(head, 5)))) if head > 0 else 0
+    if n <= 0 or head <= 0:
+        return []
+    return sorted(set(range(min(head, n))) | set(range(max(0, n - tail), n)))
+
+
+def detect_banner_strips(pending: list, vision_ad_pages: set) -> dict:
+    """OCR-free promo banner strips on the edge pages -> {page index: (rows from top, rows from bottom)}.
+    A page right before/after a fully-ad page also gets the thin (non-strict) strip that ad page leaves behind."""
+    from modules.utils.ad_banner import detect_edge_banner
+    found: dict = {}
+    for i in edge_page_indices(len(pending)):
+        if i in vision_ad_pages:
+            continue
+        try:
+            with Image.open(pending[i]) as im:
+                arr = np.asarray(ImageOps.exif_transpose(im).convert("RGB"))
+            top, bottom = detect_edge_banner(arr, strict=True)
+            if (i + 1) in vision_ad_pages and not bottom:
+                bottom = detect_edge_banner(arr, strict=False)[1]
+            if (i - 1) in vision_ad_pages and not top:
+                top = detect_edge_banner(arr, strict=False)[0]
+        except Exception as exc:
+            print(f"  [banner] sayfa {i+1} hata: {exc}", flush=True)
+            continue
+        if top or bottom:
+            found[i] = (int(top), int(bottom))
+            print(f"  [banner] sayfa {i+1}: üst={top}px alt={bottom}px (OCR'sız şerit tespiti)", flush=True)
+    return found
+
+
 def detect_ad_regions(pending: list, args: argparse.Namespace) -> dict:
     """İlk N + son N sayfayı GPT-Vision'a sorarak reklam BÖLGELERİNİ bul.
     Detection/OCR'dan bağımsız (görsel reklamları da yakalar). Her sayfa için
@@ -1926,11 +1975,10 @@ def detect_ad_regions(pending: list, args: argparse.Namespace) -> dict:
     api_key = os.environ.get("OPENAI_API_KEY", "")
     if not api_key:
         return {}
-    edge = int(os.environ.get("AD_VISION_EDGE_PAGES", "3"))
     n = len(pending)
-    if n == 0 or edge <= 0:
+    idxs = edge_page_indices(n)
+    if n == 0 or not idxs:
         return {}
-    idxs = sorted(set(range(min(edge, n))) | set(range(max(0, n - edge), n)))
     model = get_openai_model(None)
     from modules.translation.llm.gpt import _log_openai_usage
 
@@ -2165,6 +2213,18 @@ def _batch_translate_all(page_results: list, args: argparse.Namespace) -> None:
         print(f"[translate-check] still suspicious after retry: {sorted(flagged)}", flush=True)
 
 
+def _dump_clean_debug(path: Path, image: np.ndarray, mask: np.ndarray) -> None:
+    """CLEAN_DUMP_DIR=<dir>: save the source page + cleaning mask (scripts/patch_metrics.py replays them)."""
+    dump = os.environ.get("CLEAN_DUMP_DIR", "").strip()
+    if not dump:
+        return
+    try:
+        Path(dump).mkdir(parents=True, exist_ok=True)
+        np.savez_compressed(Path(dump) / f"{Path(path).stem}.npz", image=image, mask=mask)
+    except Exception as exc:  # debugging aid only
+        print(f"  [clean-dump] failed: {exc}", flush=True)
+
+
 def _stage_clean(task: tuple) -> tuple:
     """Phase-3a worker: YOLOv8 segmentasyon maskesi + block-aware LaMa ile temizlik."""
     idx, path, image, blocks, args = task
@@ -2181,6 +2241,7 @@ def _stage_clean(task: tuple) -> tuple:
     else:
         cleaned = block_inpaint(image, mask, config)
         cleaned = watermark_lib.flat_fill(image, cleaned, watermark_clear_mask(image, blocks))
+        _dump_clean_debug(path, image, mask)
     assert cleaned.shape == image.shape, f"cleaned shape {cleaned.shape} != page {image.shape}"
     cleaned = restore_untranslated_regions(image, cleaned, blocks)
     print(f"  clean [{idx+1}] {path.name}: OK", flush=True)
@@ -2472,12 +2533,15 @@ def process_all_batched(images: list[Path], output_dir: Path, args: argparse.Nam
     ad_regions = detect_ad_regions(pending, args)
     # Kırpınca %8'den az içerik kalan sayfalar tam reklam -> tamamen atla.
     vision_ad_pages = {i for i, (t, b) in ad_regions.items() if (100 - t - b) < 8}
+    # OCR'sız şerit dedektörü: Vision yüzdesi banner'ın gerçek kenarını kaçırınca (örn. %46 yerine %54) kalan şeridi keser.
+    banner_strips = detect_banner_strips(pending, vision_ad_pages)
 
     # ── Faz 1: Parallel detect + OCR (reklam bölgesi kırpılmış görselde) ─────
     w1 = _dynamic_workers(base_workers)
     print(f"\n[BATCH] Faz 1/3  detect+ocr  {len(pending)} sayfa  {w1} worker", flush=True)
     t1 = time.perf_counter()
-    phase1_tasks = [(i, p, args, None if i in vision_ad_pages else ad_regions.get(i))
+    phase1_tasks = [(i, p, args, None if i in vision_ad_pages else
+                     (*ad_regions.get(i, (0, 0)), *banner_strips[i]) if i in banner_strips else ad_regions.get(i))
                     for i, p in enumerate(pending)]
     with ThreadPoolExecutor(max_workers=w1) as pool:
         phase1 = list(pool.map(_stage_detect_ocr, phase1_tasks))

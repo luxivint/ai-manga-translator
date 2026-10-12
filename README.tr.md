@@ -361,6 +361,9 @@ Bu komut torch/torchvision'ın CUDA 13 sürümlerini ve `onnxruntime-gpu`'yu kur
 | `PASSTHROUGH_SUSPECT_RATIO` | `0.5` | metin balonu tespit edilen sayfaların bundan fazlası 0 bloklu (OCR boş) bitiyorsa iş hata verir |
 | `WATERMARK_POLICY` | `clean` | `clean` rakip watermark/banner'ları bütün olarak siler (kendi markamıza dokunmaz); `keep` dokunmaz |
 | `RENDER_V2`, `RENDER_STYLE_TAGS` | `true` | balon ve stile duyarlı dizgi |
+| `RENDER_BALLOON_UNIFY` | `true` | aynı balondaki bloklar tek font ve tek boyut bandı kullanır (`RENDER_BALLOON_BAND`, varsayılan `0.12`; kaynak harf yüksekliği `RENDER_EMPHASIS_RATIO` (1.4) oranından fazla farklıysa vurgu sayılır) ve her satır balon içinde kalır; `false` = eski blok bazlı boyut |
+| `RENDER_MERGE_BALLOON` | `true` | OCR'ın bir balonda birkaç bloğa böldüğü tek cümle tek paragraf olarak dizilir; blok sınırında tekrar eden kelimeler atılır |
+| `RENDER_RESOLVE_OVERLAP` | `true` | üst üste binen yazı kutuları ayrılır / küçültülür |
 
 Herhangi birini değiştirmek için aynı adlı ortam değişkenini ayarlayın, örneğin `BATCH_PIPELINE=false`.
 
