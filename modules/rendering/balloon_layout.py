@@ -7,6 +7,11 @@ Env knobs (all read at call time):
   RENDER_BALLOON_BAND  (0.12)  allowed size spread around the balloon median (+-12 percent)
   RENDER_EMPHASIS_RATIO (1.4)  source cap-height ratio above which a block is deliberate emphasis and left alone
   RENDER_RESOLVE_OVERLAP (true) separate rendered text boxes that overlap
+  RENDER_MERGE_NARRATION (true) stacked narration/caption blocks of one box are laid out as ONE paragraph
+  RENDER_GROUP_ROBUST    (true) tolerant balloon grouping (mutual centre containment, contained text boxes)
+  RENDER_HARD_GUARD      (true) every balloon block keeps all line boxes (+2% clearance) inside the interior mask
+  RENDER_ABSORB_STRAYS   (true) a tiny 1-2 word block inside a balloon joins the balloon's main text
+  RENDER_DEDUPE_TRANSLATIONS (true) see modules/utils/block_cleanup.py
 """
 from __future__ import annotations
 
@@ -38,6 +43,18 @@ def band() -> float:
     return float(os.environ.get("RENDER_BALLOON_BAND", "0.12"))
 
 
+def narration_merge_enabled() -> bool:
+    return _flag("RENDER_MERGE_NARRATION")
+
+
+def hard_guard_enabled() -> bool:
+    return _flag("RENDER_HARD_GUARD")
+
+
+def absorb_enabled() -> bool:
+    return _flag("RENDER_ABSORB_STRAYS")
+
+
 def emphasis_ratio() -> float:
     return float(os.environ.get("RENDER_EMPHASIS_RATIO", "1.4"))
 
@@ -53,6 +70,14 @@ def _iou(a, b) -> float:
     inter = ix * iy
     union = (a[2] - a[0]) * (a[3] - a[1]) + (b[2] - b[0]) * (b[3] - b[1]) - inter
     return inter / union if union > 0 else 0.0
+
+
+def _contained_frac(a, b) -> float:
+    """Share of box a's area that lies inside box b."""
+    ix = max(0.0, min(a[2], b[2]) - max(a[0], b[0]))
+    iy = max(0.0, min(a[3], b[3]) - max(a[1], b[1]))
+    area = (a[2] - a[0]) * (a[3] - a[1])
+    return (ix * iy) / area if area > 0 else 0.0
 
 
 def group_by_balloon(bubbles: list, boxes: list) -> list[list[int]]:
@@ -73,10 +98,24 @@ def group_by_balloon(bubbles: list, boxes: list) -> list[list[int]]:
     def union(i, j):
         owner[find(i)] = find(j)
 
+    robust = _flag("RENDER_GROUP_ROBUST")
+
+    def centre(k):
+        return ((boxes[k][0] + boxes[k][2]) / 2, (boxes[k][1] + boxes[k][3]) / 2)
+
     for i in range(n):
         for j in range(i + 1, n):
-            if bubbles[i] is not None and bubbles[j] is not None and _iou(bubbles[i], bubbles[j]) >= 0.8:
-                union(i, j)
+            bi, bj = bubbles[i], bubbles[j]
+            if bi is not None and bj is not None:
+                v = _iou(bi, bj)
+                if v >= 0.8:
+                    union(i, j)
+                elif robust and v >= 0.3 and _inside(bi, centre(j)) and _inside(bj, centre(i)):
+                    # the detector sized one balloon differently for two of its lettering blocks: each balloon box
+                    # holds the other block's text, so it is the same balloon
+                    union(i, j)
+            if robust and (_contained_frac(boxes[i], boxes[j]) >= 0.6 or _contained_frac(boxes[j], boxes[i]) >= 0.6):
+                union(i, j)  # one lettering box lying inside another: the same text region (echo / piece of it)
     for i in range(n):
         if bubbles[i] is not None:
             continue
@@ -154,9 +193,14 @@ def mergeable(texts: list[str], styles: list[str], gaps: list[float], row_height
     and no hard break: a block of 3+ words that ends with . ! ? ... followed by a vertical source gap larger than 1.6 text
     rows is separate speech (second sentence after a pause / another speaker); a short fragment ('KARDEŞİM.') is a
     vocative / interjection and stays with the rest of the speech."""
-    if len(texts) < 2 or len(texts) > 4:
+    if len(texts) < 2 or len(texts) > (6 if styles and all(x == 'narration' for x in styles) else 4):
         return False
-    if any(s not in SPEECH_STYLES for s in styles) or any(not (t or "").strip() for t in texts):
+    narration = bool(styles) and all(s == "narration" for s in styles)
+    if narration and not narration_merge_enabled():
+        return False
+    if not narration and any(s not in SPEECH_STYLES for s in styles):
+        return False
+    if any(not (t or "").strip() for t in texts):
         return False
     hs = [h for h in row_heights if h and h > 0]
     if len(hs) >= 2 and max(hs) > emphasis_ratio() * min(hs):
@@ -166,6 +210,63 @@ def mergeable(texts: list[str], styles: list[str], gaps: list[float], row_height
         if ends_sentence(texts[i]) and len(texts[i].split()) >= 3 and row > 0 and gaps[i] > 1.6 * row:
             return False
     return True
+
+
+def narration_groups(boxes: list, styles: list[str], rows: list[float] | None = None) -> list[list[int]]:
+    """Groups (>= 2, reading order) of narration blocks that are lines of ONE caption box: vertically stacked, the
+    horizontal extents overlap by >= 50 percent of the narrower block and the gap between them is at most 1.5 text
+    rows (source row height, else the block height). Narration has no tails/speakers, so stacked lines are one text."""
+    idx = [i for i, st in enumerate(styles) if st == "narration"]
+    idx.sort(key=lambda k: ((boxes[k][1] + boxes[k][3]) / 2, boxes[k][0]))
+    owner = {i: i for i in idx}
+
+    def find(i):
+        while owner[i] != i:
+            owner[i] = owner[owner[i]]
+            i = owner[i]
+        return i
+
+    for a_pos, a in enumerate(idx):
+        for b in idx[a_pos + 1:]:
+            ax1, ay1, ax2, ay2 = boxes[a]
+            bx1, by1, bx2, by2 = boxes[b]
+            ov = min(ax2, bx2) - max(ax1, bx1)
+            if ov < 0.5 * min(ax2 - ax1, bx2 - bx1):
+                continue
+            row = max([(rows[k] if rows and rows[k] else 0.0) for k in (a, b)] + [0.0]) or min(ay2 - ay1, by2 - by1)
+            gap = by1 - ay2
+            if gap <= 1.5 * row and by1 >= ay1:
+                owner[find(a)] = find(b)
+    groups: dict[int, list[int]] = {}
+    for i in idx:
+        groups.setdefault(find(i), []).append(i)
+    return [g for g in groups.values() if len(g) >= 2]
+
+
+def _word_count(text: str) -> int:
+    return len([w for w in (text or "").split() if any(c.isalnum() for c in w)])
+
+
+def stray_fragments(translations: list[str], sources: list[str], caps: list[float], inside: list[bool]) -> list[int]:
+    """Positions of tiny stray blocks of one balloon that belong to the main text: a 1-2 word translation of a 1-2
+    word source whose centre lies inside the balloon, in a balloon whose main (longest) block has >= 3 words and
+    whose source letters are clearly smaller (< 0.8 x) than the main block's (an OCR/detector split, not a separate
+    speaker: a different speaker has its own balloon)."""
+    if len(translations) < 2:
+        return []
+    main = max(range(len(translations)), key=lambda k: _word_count(translations[k]))
+    if _word_count(translations[main]) < 3:
+        return []
+    out = []
+    for k, t in enumerate(translations):
+        if k == main or not (t or "").strip() or not inside[k]:
+            continue
+        if _word_count(t) > 2 or _word_count(sources[k]) > 2:
+            continue
+        if caps[k] and caps[main] and caps[k] >= 0.8 * caps[main]:
+            continue
+        out.append(k)
+    return out
 
 
 # ------------------------------------------------------------------ overlap

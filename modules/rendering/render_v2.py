@@ -449,10 +449,40 @@ def _source_cap(image: np.ndarray, obox) -> float:
         return 0.0
 
 
+def dedupe_duplicate_blocks(blocks, orig_boxes):
+    """Safety net after translation: blocks that sit in one balloon or overlap on the page and whose translation is a
+    substring / near-duplicate of a longer neighbour are dropped (that text is already drawn by the neighbour); a
+    phrase repeated back to back inside one translation is collapsed. RENDER_DEDUPE_TRANSLATIONS=false disables."""
+    import copy
+
+    from modules.utils import block_cleanup as bcl
+
+    if not bcl.dedupe_enabled() or len(blocks) < 2:
+        return blocks, orig_boxes
+    boxes = [[float(v) for v in o] for o in orig_boxes]
+    bubbles = [None if getattr(b, "bubble_xyxy", None) is None else tuple(float(v) for v in b.bubble_xyxy) for b in blocks]
+    groups = bl.group_by_balloon(bubbles, boxes) + bcl.overlap_groups(boxes)
+    if not groups:
+        return blocks, orig_boxes
+    drop, rewrite = bcl.drop_duplicate_translations(blocks, boxes, groups)
+    if not drop and not rewrite:
+        return blocks, orig_boxes
+    blocks, orig_boxes = list(blocks), list(orig_boxes)
+    for i, t in rewrite.items():
+        blocks[i] = copy.copy(blocks[i])
+        blocks[i].translation = t
+    if os.environ.get("RENDER_DEBUG"):
+        print(f"[dedupe] dropped duplicate translations of blocks {drop}, collapsed repeats in {sorted(rewrite)}", flush=True)
+    dropped = set(drop)
+    keep = [i for i in range(len(blocks)) if i not in dropped]
+    return [blocks[i] for i in keep], [orig_boxes[i] for i in keep]
+
+
 def prepare_balloon_blocks(blocks, orig_boxes, image):
     """Blocks that share a balloon: drop words one block repeats from the previous one (a sentence continued across
-    blocks that the translator wrote out twice) and, when RENDER_MERGE_BALLOON is on and the blocks read as one
-    continued speech, lay them out as ONE paragraph block (one font, one size, balanced wrapping)."""
+    blocks that the translator wrote out twice); absorb tiny stray 1-2 word blocks into the balloon's main text; and,
+    when RENDER_MERGE_BALLOON is on and the blocks read as one continued speech (or stacked lines of one narration
+    box), lay them out as ONE paragraph block (one font, one size, balanced wrapping)."""
     import copy
 
     from modules.translation import consistency
@@ -464,8 +494,28 @@ def prepare_balloon_blocks(blocks, orig_boxes, image):
     boxes = [[float(v) for v in o] for o in orig_boxes]
     blocks, orig_boxes = list(blocks), list(orig_boxes)
     drop: set[int] = set()
+
+    def style_of(i):
+        st = (getattr(blocks[i], "style", "") or "normal").lower()
+        return st if st in VALID_STYLES else "normal"
+
+    def merge(idx, base):
+        """Lay blocks idx (reading order) out as ONE block built on `base`; the others are dropped."""
+        merged = copy.copy(blocks[base])
+        merged.translation = " ".join(blocks[i].translation.strip() for i in idx)
+        merged.text = " ".join((getattr(blocks[i], "text", "") or "").strip() for i in idx).strip()
+        box = np.array([min(boxes[i][0] for i in idx), min(boxes[i][1] for i in idx),
+                        max(boxes[i][2] for i in idx), max(boxes[i][3] for i in idx)])
+        merged.xyxy = box.copy()
+        first = idx[0]
+        base_bubble = bubbles[base]
+        blocks[first], orig_boxes[first], boxes[first] = merged, box, [float(v) for v in box]
+        bubbles[first] = base_bubble
+        drop.update(idx[1:])
+        return merged
+
     for g in bl.group_by_balloon(bubbles, boxes):
-        g = [i for i in g if (blocks[i].translation or "").strip() and not getattr(blocks[i], "is_ad", False)]
+        g = [i for i in g if (blocks[i].translation or "").strip() and not getattr(blocks[i], "is_ad", False) and i not in drop]
         if len(g) < 2:
             continue
         texts = consistency.dedupe_adjacent([blocks[i].translation.strip() for i in g])
@@ -473,10 +523,26 @@ def prepare_balloon_blocks(blocks, orig_boxes, image):
             if t != blocks[i].translation.strip():
                 blocks[i] = copy.copy(blocks[i])
                 blocks[i].translation = t
+        if bl.absorb_enabled():
+            owners = [bubbles[i] for i in g if bubbles[i] is not None]
+            inside = []
+            for i in g:
+                cx, cy = (boxes[i][0] + boxes[i][2]) / 2, (boxes[i][1] + boxes[i][3]) / 2
+                inside.append(any(b[0] <= cx <= b[2] and b[1] <= cy <= b[3] for b in owners))
+            strays = bl.stray_fragments([blocks[i].translation for i in g], [getattr(blocks[i], "text", "") for i in g],
+                                        [_source_cap(image, orig_boxes[i]) for i in g], inside)
+            if strays:
+                main = max(range(len(g)), key=lambda k: len((blocks[g[k]].translation or "").split()))
+                idx = sorted([g[main]] + [g[k] for k in strays], key=lambda i: ((boxes[i][1] + boxes[i][3]) / 2, boxes[i][0]))
+                merge(idx, g[main])
+                if os.environ.get("RENDER_DEBUG"):
+                    print(f"[absorb-stray] {len(strays)} tiny block(s) joined the balloon text: {blocks[idx[0]].translation[:70]!r}", flush=True)
+                g = [i for i in g if i not in drop]
+                if len(g) < 2:
+                    continue
         if not bl.merge_enabled():
             continue
-        styles = [((getattr(blocks[i], "style", "") or "normal").lower()) for i in g]
-        styles = [st if st in VALID_STYLES else "normal" for st in styles]
+        styles = [style_of(i) for i in g]
         rows = [_source_cap(image, orig_boxes[i]) for i in g]
         gaps = [float(orig_boxes[g[k + 1]][1]) - float(orig_boxes[g[k]][3]) for k in range(len(g) - 1)]
         texts = [blocks[i].translation for i in g]
@@ -486,16 +552,27 @@ def prepare_balloon_blocks(blocks, orig_boxes, image):
         if not bases or not bl.mergeable(texts, styles, gaps, rows):
             continue
         base = max(bases, key=lambda i: (boxes[i][2] - boxes[i][0]) * (boxes[i][3] - boxes[i][1]))
-        merged = copy.copy(blocks[base])
-        merged.translation = " ".join(t.strip() for t in texts)
-        merged.text = " ".join((getattr(blocks[i], "text", "") or "").strip() for i in g).strip()
-        box = np.array([min(boxes[i][0] for i in g), min(boxes[i][1] for i in g),
-                        max(boxes[i][2] for i in g), max(boxes[i][3] for i in g)])
-        merged.xyxy = box.copy()
-        blocks[g[0]], orig_boxes[g[0]] = merged, box
-        drop.update(g[1:])
+        merged = merge(g, base)
         if os.environ.get("RENDER_DEBUG"):
             print(f"[merge-balloon] {len(g)} blocks -> one paragraph: {merged.translation[:70]!r}", flush=True)
+
+    # stacked lines of one narration / caption box (no balloon boxes to group by): one paragraph
+    if bl.narration_merge_enabled() and bl.merge_enabled():
+        live = [i for i in range(n) if i not in drop and (blocks[i].translation or "").strip() and not getattr(blocks[i], "is_ad", False)]
+        sub_styles = [style_of(i) for i in live]
+        sub_boxes = [boxes[i] for i in live]
+        sub_rows = [_source_cap(image, orig_boxes[i]) if sub_styles[k] == "narration" else 0.0 for k, i in enumerate(live)]
+        for g in bl.narration_groups(sub_boxes, sub_styles, sub_rows):
+            g = [live[k] for k in g]
+            rows = [_source_cap(image, orig_boxes[i]) for i in g]
+            gaps = [float(boxes[g[k + 1]][1]) - float(boxes[g[k]][3]) for k in range(len(g) - 1)]
+            texts = [blocks[i].translation for i in g]
+            if not bl.mergeable(texts, ["narration"] * len(g), gaps, rows):
+                continue
+            base = max(g, key=lambda i: (boxes[i][2] - boxes[i][0]) * (boxes[i][3] - boxes[i][1]))
+            merged = merge(g, base)
+            if os.environ.get("RENDER_DEBUG"):
+                print(f"[merge-narration] {len(g)} blocks -> one paragraph: {merged.translation[:70]!r}", flush=True)
     if drop:
         keep = [i for i in range(n) if i not in drop]
         blocks, orig_boxes = [blocks[i] for i in keep], [orig_boxes[i] for i in keep]
@@ -552,6 +629,7 @@ def build_items(blocks, image, cleaned, orig_boxes, render_settings, alignment, 
     policy = casing_policy(render_settings.upper_case)
     plans = []
     blocks, orig_boxes = split_merged_blocks(blocks, orig_boxes, image, cleaned)
+    blocks, orig_boxes = dedupe_duplicate_blocks(blocks, orig_boxes)
     blocks, orig_boxes = prepare_balloon_blocks(blocks, orig_boxes, image)
     for blk, obox in zip(blocks, orig_boxes):
         raw = (blk.translation or "")
@@ -839,18 +917,26 @@ def build_items(blocks, image, cleaned, orig_boxes, render_settings, alignment, 
     balloon_raise()
 
     # last guard: never let a laid-out line cross the balloon / panel border (shrink until inside or at the floor)
-    def guard_fit():
+    def guard_fit(hard: bool = False):
+        """hard=True (RENDER_HARD_GUARD): every balloon block, not only members of a multi-block balloon, must keep every
+        line box (plus 2 percent clearance, all four corners) inside the interior mask."""
         for i, plan in enumerate(plans):
             out, size = fits[i][0], fits[i][1]
             guard = 0
-            while (plan["inner"] is not None and size > FLOOR_SIZE and guard < 14
+            was = plan.get("strict")
+            if hard and plan["inner"] is not None and plan["bubble"] and not plan["angle"]:
+                plan["strict"] = True
+            while (plan["inner"] is not None and size > FLOOR_SIZE and guard < (30 if hard else 14)
                    and not lines_inside(plan, out, size, plan["fit_region"], line_spacing, 0.97 if plan.get("strict") else 0.9)):
                 fits[i] = fit_once(plan, plan["fit_region"], size - 1)
                 out, size = fits[i][0], fits[i][1]
                 guard += 1
+            plan["strict"] = was
 
     before = [f[1] for f in fits]
     guard_fit()
+    if bl.hard_guard_enabled():
+        guard_fit(hard=True)
     if any(f[1] < b for f, b in zip(fits, before)):
         # a member had to shrink to stay inside the balloon: the whole balloon follows (balloon-wide size band)
         balloon_cap(lambda sizes, caps: [int(math.ceil(min(sizes) * (1.0 + bl.band()))) if not bl.is_emphasis(
