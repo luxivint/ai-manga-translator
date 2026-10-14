@@ -367,3 +367,17 @@ Set the matching environment variable to override any of them, for example `BATC
 ## License
 
 See `LICENSE`.
+
+
+### Worker recovery and chapter boundaries
+
+R2 folder operations require a trailing slash: chapter 2 never reads/deletes chapters 20–29.
+Safe recutting prefers blank gutters; oversized illustration spans can use rows outside all
+padded detected text and balloon regions. Pixels are verified before OCR; protected spans
+that still exceed the hard limit fail without uploading or deleting source images.
+
+Each batch writes `work/job-logs/<job-id>.log`. The worker updates its heartbeat and stage
+progress every five seconds and stops the process tree after 600 seconds without new output
+(configurable with `TRANSLATION_STALL_SECONDS`). Cancellation also stops the batch tree.
+Account usage-limit errors persist their reset deadline in `work/gateway-quota.json`, pause
+job claiming and requeue the current job without consuming a retry. Jobs resume after reset.

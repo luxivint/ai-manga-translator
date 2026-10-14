@@ -132,6 +132,25 @@ def prepare(paths, workspace, detect, *, target=2000, minimum=800, soft_max=3600
                 print(f'[RECUT] protect {index + 1}/{len(starts)} windows ({time.monotonic() - started:.1f}s)', flush=True)
         bands = safe_bands(uniform & ~protected)
         cuts = choose_cuts(strip.height, bands, target, minimum, soft_max)
+        # Prefer gutters, but an uninterrupted illustration need not be blank.
+        # Only supplement oversized spans with rows outside every detected balloon/text.
+        fallback_bands = safe_bands(~protected)
+        expanded = [cuts[0]]
+        fallback_cuts = []
+        for end in cuts[1:]:
+            while end - expanded[-1] > hard_max:
+                start = expanded[-1]
+                candidates = []
+                for a, b in fallback_bands:
+                    lo, hi = max(a, start + minimum), min(b - 1, start + soft_max, end - minimum)
+                    if lo <= hi:
+                        candidates.append(min(max(start + target, lo), hi))
+                if not candidates:
+                    break
+                y = min(candidates, key=lambda y: abs(y - start - target))
+                expanded.append(y); fallback_cuts.append(y)
+            expanded.append(end)
+        cuts = expanded
         if any(b - a > hard_max for a, b in zip(cuts, cuts[1:])):
             raise RecutError(f'No safe cut within {hard_max}px. Raw images kept; inspect this chapter or disable safe recut explicitly.')
         if any(protected[y] for y in cuts[1:-1]):
@@ -151,6 +170,7 @@ def prepare(paths, workspace, detect, *, target=2000, minimum=800, soft_max=3600
             raise RecutError('Recut images did not preserve source pixels')
         manifest = dict(width=strip.width, height=strip.height, source_files=[p.name for p in paths],
                         source_ends=strip.ends, cuts=cuts, protected_regions=regions, safe_bands=bands,
+                        fallback_cuts=fallback_cuts,
                         source_sha256=digest.hexdigest(), pixel_exact=True,
                         oversized_heights=[b - a for a, b in zip(cuts, cuts[1:]) if b - a > soft_max])
         (workspace / 'recut-manifest.json').write_text(json.dumps(manifest, indent=2), encoding='utf-8')

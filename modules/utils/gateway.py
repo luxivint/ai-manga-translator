@@ -14,6 +14,9 @@ HTTP 4xx (except 429) is not transient: the response is returned for the caller 
 """
 from __future__ import annotations
 
+import json
+import re
+from pathlib import Path
 import contextlib
 import os
 import random
@@ -26,6 +29,40 @@ import requests
 
 class GatewayError(RuntimeError):
     """The gateway call failed after all retries (as opposed to answering with nothing)."""
+
+
+class GatewayQuotaError(GatewayError):
+    """Account usage quota is exhausted; repeated page calls cannot recover it."""
+
+
+def quota_path():
+    return Path(os.environ.get("GATEWAY_QUOTA_FILE", str(Path(__file__).resolve().parents[2] / "work/gateway-quota.json")))
+
+
+def quota_remaining():
+    try:
+        return max(0, json.loads(quota_path().read_text())["until"] - time.time())
+    except (OSError, ValueError, KeyError):
+        return 0
+
+
+def raise_if_quota():
+    remaining = quota_remaining()
+    if remaining:
+        raise GatewayQuotaError(f"Model usage limit reached; retry after {remaining:.0f} seconds")
+
+
+def remember_quota(text):
+    if not any(x in text.lower() for x in ("usage limit has been reached", "quota exceeded")):
+        return False
+    reset = text.lower().split("reset after", 1)
+    seconds = sum(int(n) * {"h":3600,"m":60,"s":1}[u] for n,u in re.findall(r"(\d+)\s*([hms])", reset[-1])) if len(reset)>1 else 1800
+    seconds = max(60, min(seconds + 30, 86400))
+    path = quota_path(); path.parent.mkdir(parents=True, exist_ok=True)
+    temp = path.with_suffix(f".{os.getpid()}.{threading.get_ident()}.tmp")
+    temp.write_text(json.dumps({"until": time.time()+max(seconds, quota_remaining()), "reason":"Model usage limit reached"}))
+    os.replace(temp, path)
+    return True
 
 
 class OCRFailedError(GatewayError):
@@ -190,6 +227,7 @@ def resilient_post(url: str, *, headers: dict, data, timeout: float, kind: str =
     attempts = len(delays) + 1
     last = "no attempt made"
     for attempt in range(1, attempts + 1):
+        raise_if_quota()
         breaker.wait_if_open()
         problem = None
         resp = None
@@ -200,6 +238,8 @@ def resilient_post(url: str, *, headers: dict, data, timeout: float, kind: str =
             problem = f"{type(exc).__name__}: {_short(str(exc), 400)}"
         else:
             status = resp.status_code
+            if status >= 400 and remember_quota(getattr(resp, "text", "")):
+                raise_if_quota()
             if status >= 500 or status == 429:
                 problem = f"HTTP {status} {_short(getattr(resp, 'text', ''))}"
             elif status == 200:

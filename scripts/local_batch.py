@@ -1868,6 +1868,7 @@ def crop_has_ad_evidence(blocks, y1: int, y2: int, page_w: int, page_h: int) -> 
 
 
 def _stage_detect_ocr(task: tuple) -> tuple:
+    gateway.raise_if_quota()
     """Phase-1 worker: detect + OCR for one page (thread-safe, fresh instances per call)."""
     idx, path, args, crop = task
     settings = LocalSettings(args)
@@ -2155,6 +2156,8 @@ def _batch_translate_all(page_results: list, args: argparse.Namespace) -> None:
         for attempt in range(1, max_attempts + 1):
             try:
                 batch_result = _call_batch_translate(pending, extra=ORDER_HINT if attempt > 1 else "") or {}
+            except gateway.GatewayQuotaError:
+                raise
             except Exception as exc:
                 print(f"  batch {bi+1} translate FAILED (attempt {attempt}/{max_attempts}): {exc}", flush=True)
                 batch_result = {}
@@ -2565,7 +2568,9 @@ def process_all_batched(images: list[Path], output_dir: Path, args: argparse.Nam
         print(f"[BATCH] Warm-up uyarı: {_warmup_exc}", flush=True)
 
     # ── GPT-Vision: ilk/son N sayfada reklam bölgelerini bul (üst%/alt%) ─────
+    gateway.raise_if_quota()
     ad_regions = detect_ad_regions(pending, args)
+    gateway.raise_if_quota()
     # Kırpınca %8'den az içerik kalan sayfalar tam reklam -> tamamen atla.
     vision_ad_pages = {i for i, (t, b) in ad_regions.items() if (100 - t - b) < 8}
     # OCR'sız şerit dedektörü: Vision yüzdesi banner'ın gerçek kenarını kaçırınca (örn. %46 yerine %54) kalan şeridi keser.
@@ -2580,6 +2585,7 @@ def process_all_batched(images: list[Path], output_dir: Path, args: argparse.Nam
                     for i, p in enumerate(pending)]
     with ThreadPoolExecutor(max_workers=w1) as pool:
         phase1 = list(pool.map(_stage_detect_ocr, phase1_tasks))
+    gateway.raise_if_quota()
     phase1, ocr_failed_pages = rerun_failed_ocr(phase1, phase1_tasks)
     # Fail BEFORE spending translate/clean time on a result that must not be published.
     enforce_page_failures("OCR failed", ocr_failed_pages, len(pending))
@@ -2849,6 +2855,9 @@ def main() -> int:
 
 
 def run_batch(args, app, recut_work: Path) -> int:
+    if gateway.quota_remaining():
+        print("WAIT: model usage limit reached; raw images kept", flush=True)
+        return 4
     using_r2 = bool(args.r2_input_prefix)
     if using_r2:
         chapter_work = ROOT / args.r2_workdir / r2_work_name(args.r2_input_prefix)
@@ -2909,6 +2918,10 @@ def run_batch(args, app, recut_work: Path) -> int:
     if os.environ.get("BATCH_PIPELINE", "true").lower() == "true":
         try:
             failed = process_all_batched(images, output_dir, args)
+        except gateway.GatewayQuotaError as exc:
+            app.quit()
+            print(f"WAIT: {exc}; raw images kept", flush=True)
+            return 4
         except BatchValidationError as exc:
             # Nothing is uploaded, no raw page is deleted (R2 or local workdir), exit != 0 so the worker retries.
             app.quit()
@@ -2943,6 +2956,10 @@ def run_batch(args, app, recut_work: Path) -> int:
         args.degraded_pages = list(page_failed)
         try:
             enforce_page_failures("page processing failed (untranslated fallback)", page_failed, len(pending))
+        except gateway.GatewayQuotaError as exc:
+            app.quit()
+            print(f"WAIT: {exc}; raw images kept", flush=True)
+            return 4
         except BatchValidationError as exc:
             app.quit()
             print(f"R2 upload/delete skipped: {exc}", flush=True)

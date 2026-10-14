@@ -14,6 +14,8 @@ import urllib.request
 import urllib.error
 import json
 
+from batch_process import run_batch_process, batch_progress
+
 from r2_storage import R2Config, client, delete_prefix, load_env, normalize_key, public_url
 
 
@@ -47,7 +49,21 @@ def execute(conn, sql: str, params: tuple | list = ()):
         return cur
 
 
+def quota_remaining():
+    path = Path(os.environ.get("GATEWAY_QUOTA_FILE", str(ROOT / "work/gateway-quota.json")))
+    try:
+        return max(0, json.loads(path.read_text())["until"] - time.time())
+    except (OSError, ValueError, KeyError):
+        return 0
+
+
+class QuotaWaitError(RuntimeError):
+    pass
+
+
 def claim_job(conn):
+    if quota_remaining():
+        return None
     with conn:
         with conn.cursor() as cur:
             cur.execute(
@@ -76,10 +92,10 @@ JOB_RETRY_DELAY_MINUTES = 30
 
 
 def mark_failed_or_retry(conn, job_id: str, error: str):
-    """FAILED yerine, deneme hakkı varsa job'u belirli bir süre sonra tekrar
-    denenmek üzere QUEUED'a döndürür. Sunucu/PC yarıda kesilse, GPT API anlık
+    """FAILED yerine, deneme hakkÄ± varsa job'u belirli bir sÃ¼re sonra tekrar
+    denenmek Ã¼zere QUEUED'a dÃ¶ndÃ¼rÃ¼r. Sunucu/PC yarÄ±da kesilse, GPT API anlÄ±k
     hata verse bile elle 'Yeniden Dene' basmaya gerek kalmadan otomatik
-    kurtarma sağlar. MAX_JOB_RETRIES denemesi tükenince kalıcı FAILED olur."""
+    kurtarma saÄŸlar. MAX_JOB_RETRIES denemesi tÃ¼kenince kalÄ±cÄ± FAILED olur."""
     with conn:
         with conn.cursor() as cur:
             cur.execute("SELECT retry_count FROM pipeline_jobs WHERE id = %s", [job_id])
@@ -109,7 +125,7 @@ def mark_failed_or_retry(conn, job_id: str, error: str):
                         finished_at = now(), updated_at = now()
                     WHERE id = %s
                     """,
-                    [f"({MAX_JOB_RETRIES} deneme tükendi) {error[:1900]}", job_id],
+                    [f"({MAX_JOB_RETRIES} deneme tÃ¼kendi) {error[:1900]}", job_id],
                 )
 
 
@@ -150,32 +166,32 @@ def heartbeat(conn, job_id: str):
 
 
 def startup_cleanup(conn):
-    """Worker başlarken kendi job türlerindeki zombi RUNNING jobları, deneme
-    hakkı varsa tekrar kuyruğa alır (PC/worker yarıda kapandıysa böyle
-    kurtarılır), yoksa FAILED yapar."""
+    """Worker baÅŸlarken kendi job tÃ¼rlerindeki zombi RUNNING joblarÄ±, deneme
+    hakkÄ± varsa tekrar kuyruÄŸa alÄ±r (PC/worker yarÄ±da kapandÄ±ysa bÃ¶yle
+    kurtarÄ±lÄ±r), yoksa FAILED yapar."""
     with conn.cursor() as cur:
         cur.execute("SELECT id FROM pipeline_jobs WHERE status = 'RUNNING' AND job_type = ANY(%s)", [list(JOB_TYPES)])
         orphan_ids = [row["id"] for row in cur.fetchall()]
     for job_id in orphan_ids:
-        mark_failed_or_retry(conn, job_id, "Translator worker yeniden başlatıldı, iş yarıda kesildi.")
+        mark_failed_or_retry(conn, job_id, "Translator worker yeniden baÅŸlatÄ±ldÄ±, iÅŸ yarÄ±da kesildi.")
     if orphan_ids:
-        print(f"startup_cleanup: {len(orphan_ids)} orphan RUNNING job işlendi (retry/FAILED)", flush=True)
+        print(f"startup_cleanup: {len(orphan_ids)} orphan RUNNING job iÅŸlendi (retry/FAILED)", flush=True)
     with conn:
         cur = execute(conn, """
             UPDATE pipeline_jobs
             SET status = 'CANCELLED',
-                error_message = 'Translator worker yeniden başlatıldı, kuyruktan kaldırıldı.',
+                error_message = 'Translator worker yeniden baÅŸlatÄ±ldÄ±, kuyruktan kaldÄ±rÄ±ldÄ±.',
                 finished_at = now(), updated_at = now()
             WHERE status = 'CANCEL_REQUESTED'
               AND job_type = ANY(%s)
         """, [list(JOB_TYPES)])
         if cur.rowcount:
-            print(f"startup_cleanup: {cur.rowcount} CANCEL_REQUESTED → CANCELLED", flush=True)
+            print(f"startup_cleanup: {cur.rowcount} CANCEL_REQUESTED â†’ CANCELLED", flush=True)
 
 
 def reap_dead_jobs(conn):
-    """20 dakika güncellenmeyen çeviri joblarını, deneme hakkı varsa tekrar
-    kuyruğa alır (bkz. mark_failed_or_retry), yoksa FAILED yapar."""
+    """20 dakika gÃ¼ncellenmeyen Ã§eviri joblarÄ±nÄ±, deneme hakkÄ± varsa tekrar
+    kuyruÄŸa alÄ±r (bkz. mark_failed_or_retry), yoksa FAILED yapar."""
     with conn.cursor() as cur:
         cur.execute("""
             SELECT id FROM pipeline_jobs
@@ -183,12 +199,12 @@ def reap_dead_jobs(conn):
         """, [list(JOB_TYPES)])
         stale_ids = [row["id"] for row in cur.fetchall()]
     for job_id in stale_ids:
-        mark_failed_or_retry(conn, job_id, "Translator worker 20 dakika yanıt vermedi, otomatik iptal.")
+        mark_failed_or_retry(conn, job_id, "Translator worker 20 dakika yanÄ±t vermedi, otomatik iptal.")
     with conn:
         execute(conn, """
             UPDATE pipeline_jobs
             SET status = 'CANCELLED',
-                error_message = 'Durdurma talebi zaman aşımına uğradı, otomatik iptal.',
+                error_message = 'Durdurma talebi zaman aÅŸÄ±mÄ±na uÄŸradÄ±, otomatik iptal.',
                 finished_at = now(), updated_at = now()
             WHERE status = 'CANCEL_REQUESTED'
               AND job_type = ANY(%s)
@@ -197,7 +213,7 @@ def reap_dead_jobs(conn):
 
 
 def cleanup_old_jobs(conn):
-    """Eski terminal jobları sil."""
+    """Eski terminal joblarÄ± sil."""
     with conn:
         execute(conn, """
             DELETE FROM pipeline_jobs
@@ -335,10 +351,10 @@ def cleanup_raw(conn, chapter_id: str):
 
 SEO_TITLE_TEMPLATE = os.environ.get(
     "SEO_TITLE_TEMPLATE",
-    "{site_name} {language_phrase} {slug} bölüm {number} sayfa {page}",
+    "{site_name} {language_phrase} {slug} bÃ¶lÃ¼m {number} sayfa {page}",
 )
 SEO_SITE_NAME = os.environ.get("SEO_SITE_NAME", "TrendManga")
-SEO_LANGUAGE_PHRASE = os.environ.get("SEO_LANGUAGE_PHRASE", "Türkçe manga oku")
+SEO_LANGUAGE_PHRASE = os.environ.get("SEO_LANGUAGE_PHRASE", "TÃ¼rkÃ§e manga oku")
 
 
 def seo_alt(manga_slug: str, number, page_index: int) -> str:
@@ -457,7 +473,7 @@ def invalidate_web_cache(manga_slug: str):
 LOCAL_BATCH_VALIDATION_EXIT = 3  # keep in sync with local_batch.EXIT_VALIDATION_FAILED
 
 
-def translate_chapter(chapter: dict, delete_raw: bool, job_id: str):
+def translate_chapter(chapter: dict, delete_raw: bool, job_id: str, tick=None):
     raw_prefix = prefix_from_key(chapter["raw_key"])
     output_prefix = translated_prefix(raw_prefix)
     env = os.environ.copy()
@@ -489,19 +505,24 @@ def translate_chapter(chapter: dict, delete_raw: bool, job_id: str):
         command.append("--no-r2-delete-input")
     print("running:", " ".join(command), flush=True)
     try:
-        subprocess.run(command, cwd=ROOT, check=True, env=env)
+        run_batch_process(command, ROOT, env, ROOT / "work/job-logs" / f"{job_id}.log", tick,
+                          stall_seconds=int(os.environ.get("TRANSLATION_STALL_SECONDS", "600")))
     except subprocess.CalledProcessError as exc:
+        if exc.returncode == 4:
+            raise QuotaWaitError("Model usage limit reached; waiting for reset") from exc
         # local_batch exits != 0 BEFORE uploading or deleting anything when OCR/translation failed (code 3 =
         # "FAILED: OCR failed on N pages ..."). Raising here means: no record_translated_assets, no DB raw delete,
         # not marked translated; run_once() turns it into QUEUED+retry via mark_failed_or_retry.
         reason = ("Preprocessing/OCR/translation validation failed (see translation.log 'FAILED:' line); raw pages kept"
                   if exc.returncode == LOCAL_BATCH_VALIDATION_EXIT else f"local_batch crashed (exit {exc.returncode})")
-        raise RuntimeError(f"{reason}; exit code {exc.returncode}") from exc
+        failures = [line for line in str(exc.output or "").splitlines() if "FAILED:" in line]
+        detail = failures[-1][-500:] if failures else reason
+        raise RuntimeError(f"{detail}; exit code {exc.returncode}") from exc
     return raw_prefix, output_prefix
 
 
 def enqueue_chapter_jobs(conn, chapters: list, priority: int, payload: dict) -> int:
-    """Her chapter için ayrı TRANSLATE_CHAPTER job'u oluştur, zaten kuyrukta olanları atla."""
+    """Her chapter iÃ§in ayrÄ± TRANSLATE_CHAPTER job'u oluÅŸtur, zaten kuyrukta olanlarÄ± atla."""
     created = 0
     for chapter in chapters:
         with conn.cursor() as cur:
@@ -534,7 +555,7 @@ def enqueue_chapter_jobs(conn, chapters: list, priority: int, payload: dict) -> 
 
 
 def process_translate_job(conn, job):
-    # TRANSLATE_PROJECT → chapter'ları ayrı job'lara böl, worker'lar paralel alsın
+    # TRANSLATE_PROJECT â†’ chapter'larÄ± ayrÄ± job'lara bÃ¶l, worker'lar paralel alsÄ±n
     if job["job_type"] == "TRANSLATE_PROJECT":
         chapters = project_chapters(conn, job["manga_id"])
         if not chapters:
@@ -543,10 +564,10 @@ def process_translate_job(conn, job):
         priority = int(job.get("priority") or 100)
         payload = dict(job.get("payload") or {})
         created = enqueue_chapter_jobs(conn, chapters, priority, payload)
-        print(f"TRANSLATE_PROJECT → {created} TRANSLATE_CHAPTER jobs enqueued", flush=True)
+        print(f"TRANSLATE_PROJECT â†’ {created} TRANSLATE_CHAPTER jobs enqueued", flush=True)
         return 0
 
-    # TRANSLATE_CHAPTER / RETRANSLATE_CHAPTER → tek chapter işle
+    # TRANSLATE_CHAPTER / RETRANSLATE_CHAPTER â†’ tek chapter iÅŸle
     if job["job_type"] in {"RETRANSLATE_CHAPTER", "TRANSLATE_CHAPTER"}:
         if not job.get("chapter_id"):
             raise RuntimeError(f"{job['job_type']} requires chapter_id")
@@ -563,7 +584,14 @@ def process_translate_job(conn, job):
         stop_if_cancelled(conn, job["id"])
         heartbeat(conn, job["id"])
         delete_raw = bool(chapter.get("auto_delete_raw_after_translate", True))
-        raw_prefix, output_prefix = translate_chapter(chapter, delete_raw, job["id"])
+        progress = 0
+        def tick():
+            nonlocal progress
+            stop_if_cancelled(conn, job["id"])
+            progress = max(progress, batch_progress(ROOT / "work/job-logs" / f"{job['id']}.log"))
+            set_job(conn, job["id"], progress=progress)
+            update_worker_heartbeat(conn)
+        raw_prefix, output_prefix = translate_chapter(chapter, delete_raw, job["id"], tick=tick)
         record_translated_assets(conn, chapter, output_prefix, raw_prefix, delete_raw)
         heartbeat(conn, job["id"])
         set_job(conn, job["id"], progress=int(index / total * 95))
@@ -586,6 +614,11 @@ def run_once(conn) -> bool:
             deleted = cleanup_raw(conn, job["chapter_id"])
             print(f"CLEANUP_RAW_CHAPTER deleted={deleted}", flush=True)
         set_job(conn, job["id"], status="DONE", progress=100)
+    except QuotaWaitError as exc:
+        with conn:
+            execute(conn, """UPDATE pipeline_jobs SET status='QUEUED', started_at=NULL,
+                next_retry_at=now()+(%s * interval '1 second'), error_message=%s, updated_at=now()
+                WHERE id=%s""", [max(60, quota_remaining()), str(exc), job['id']])
     except CancelledJob as exc:
         print(f"job cancelled {job['id']}: {exc}", flush=True)
         set_job(conn, job["id"], status="CANCELLED", error=str(exc))

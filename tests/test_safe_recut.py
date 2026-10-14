@@ -58,11 +58,11 @@ class RecutTests(unittest.TestCase):
             im = Image.new('RGB', (80, 2000), 'white')
             ImageDraw.Draw(im).line((40, 0, 40, 1999), fill='black'); im.save(p)
             before = p.read_bytes()
-            with self.assertRaisesRegex(RecutError, 'No safe cut'):
-                prepare([p], Path(work) / 'recut', lambda a: [],
-                        target=500, minimum=200, soft_max=800, hard_max=1000)
+            plan = prepare([p], Path(work) / 'recut', lambda a: [],
+                           target=500, minimum=200, soft_max=800, hard_max=1000)
+            self.assertLessEqual(max(b-a for a,b in zip(plan.cuts,plan.cuts[1:])),1000)
             self.assertEqual(p.read_bytes(), before)
-            self.assertFalse(list((Path(work) / 'recut').glob('*.png')))
+            self.assertTrue(list((Path(work) / 'recut').glob('*.png')))
 
     def test_thin_edges_and_empty_balloons_block_gaps(self):
         with tempfile.TemporaryDirectory() as work:

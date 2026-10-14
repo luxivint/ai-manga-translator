@@ -258,7 +258,7 @@ class WorkerFailurePathTests(unittest.TestCase):
 
     def test_nonzero_exit_raises_and_nothing_is_recorded(self):
         err = subprocess.CalledProcessError(worker.LOCAL_BATCH_VALIDATION_EXIT, ["x"])
-        with mock.patch.object(worker.subprocess, "run", side_effect=err), \
+        with mock.patch.object(worker, "run_batch_process", side_effect=err), \
                 mock.patch.object(worker, "single_chapter", return_value=self.chapter), \
                 mock.patch.object(worker, "stop_if_cancelled"), mock.patch.object(worker, "heartbeat"), \
                 mock.patch.object(worker, "record_translated_assets") as record, \
@@ -289,7 +289,7 @@ class WorkerFailurePathTests(unittest.TestCase):
 
     def test_crash_exit_code_is_reported_as_crash(self):
         err = subprocess.CalledProcessError(1, ["x"])
-        with mock.patch.object(worker.subprocess, "run", side_effect=err), captured():
+        with mock.patch.object(worker, "run_batch_process", side_effect=err), captured():
             with self.assertRaises(RuntimeError) as ctx:
                 worker.translate_chapter(self.chapter, True, "j1")
         self.assertIn("crashed", str(ctx.exception))
