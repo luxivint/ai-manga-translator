@@ -150,6 +150,9 @@ def download_prefix(prefix: str, local_dir: Path, config: R2Config | None = None
     config = config or R2Config.from_env()
     s3 = client(config)
     prefix = normalize_key(prefix)
+    if not prefix:
+        raise ValueError("R2 folder prefix must not be empty")
+    prefix += "/"  # Chapter 2 must never include chapters 20-29.
     local_dir.mkdir(parents=True, exist_ok=True)
     downloaded = []
 
@@ -178,6 +181,9 @@ def delete_prefix(prefix: str, config: R2Config | None = None) -> int:
     config = config or R2Config.from_env()
     s3 = client(config)
     prefix = normalize_key(prefix)
+    if not prefix:
+        raise ValueError("R2 folder prefix must not be empty")
+    prefix += "/"  # Chapter 2 must never include chapters 20-29.
     deleted = 0
     paginator = s3.get_paginator("list_objects_v2")
     batch = []

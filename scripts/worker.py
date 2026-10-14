@@ -245,6 +245,9 @@ def list_images(prefix: str) -> list[dict]:
     config = R2Config.from_env()
     s3 = client(config)
     prefix = normalize_key(prefix)
+    if not prefix:
+        raise ValueError("R2 folder prefix must not be empty")
+    prefix += "/"  # Chapter 2 must never include chapters 20-29.
     items: list[dict] = []
     paginator = s3.get_paginator("list_objects_v2")
     for page in paginator.paginate(Bucket=config.bucket, Prefix=prefix):
@@ -491,7 +494,7 @@ def translate_chapter(chapter: dict, delete_raw: bool, job_id: str):
         # local_batch exits != 0 BEFORE uploading or deleting anything when OCR/translation failed (code 3 =
         # "FAILED: OCR failed on N pages ..."). Raising here means: no record_translated_assets, no DB raw delete,
         # not marked translated; run_once() turns it into QUEUED+retry via mark_failed_or_retry.
-        reason = ("OCR/translation validation failed (see translation.log 'FAILED:' line); raw pages kept"
+        reason = ("Preprocessing/OCR/translation validation failed (see translation.log 'FAILED:' line); raw pages kept"
                   if exc.returncode == LOCAL_BATCH_VALIDATION_EXIT else f"local_batch crashed (exit {exc.returncode})")
         raise RuntimeError(f"{reason}; exit code {exc.returncode}") from exc
     return raw_prefix, output_prefix

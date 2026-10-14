@@ -2873,8 +2873,8 @@ def run_batch(args, app, recut_work: Path) -> int:
 
     images = iter_images(input_dir)
     if not images:
-        print(f"No images found in {input_dir}")
-        return 0
+        print(f"FAILED: No input images found in {input_dir}; R2 upload/delete skipped", flush=True)
+        return EXIT_VALIDATION_FAILED
 
     final_output_dir = output_dir
     recut_active = bool(args.safe_recut)
