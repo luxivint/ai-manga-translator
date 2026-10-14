@@ -31,9 +31,41 @@ class QuotaTests(unittest.TestCase):
 class WorkerQuotaTests(unittest.TestCase):
     def test_waiting_for_quota_does_not_claim_or_consume_retry(self):
         import worker
-        with patch.object(worker,'quota_remaining',return_value=100):
+        with patch.object(worker,'quota_remaining',return_value=100), patch.object(worker,'quota_path') as path:
+            path.return_value.exists.return_value=False
             conn=Mock()
             self.assertIsNone(worker.claim_job(conn));conn.cursor.assert_not_called()
+
+    def test_successful_probe_releases_deferred_jobs_before_old_reset_time(self):
+        import worker,json,time
+        from unittest.mock import MagicMock
+        with tempfile.TemporaryDirectory() as tmp, patch.dict(os.environ,{'GATEWAY_QUOTA_FILE':tmp+'/quota.json'}):
+            path=Path(tmp)/'quota.json';path.write_text(json.dumps({'until':time.time()+1800}))
+            conn=MagicMock();conn.cursor.return_value.__enter__.return_value.fetchone.return_value={'owned':True}
+            response=Mock(status_code=200);response.json.return_value={'choices':[{'message':{'content':'OK'}}]}
+            with patch('requests.post',return_value=response) as post:
+                worker.probe_quota(conn)
+            self.assertFalse(path.exists());self.assertEqual(post.call_count,1)
+            sql=' '.join(str(c) for c in conn.cursor.return_value.__enter__.return_value.execute.call_args_list)
+            self.assertIn('next_retry_at=NULL',sql)
+
+    def test_probe_failure_waits_and_does_not_repeat_for_every_worker(self):
+        import worker,json,time
+        from unittest.mock import MagicMock
+        with tempfile.TemporaryDirectory() as tmp, patch.dict(os.environ,{'GATEWAY_QUOTA_FILE':tmp+'/quota.json'}):
+            path=Path(tmp)/'quota.json';path.write_text(json.dumps({'until':time.time()-1}))
+            conn=MagicMock();conn.cursor.return_value.__enter__.return_value.fetchone.return_value={'owned':True}
+            with patch('requests.post',return_value=Mock(status_code=429)) as post:
+                worker.probe_quota(conn);worker.probe_quota(conn)
+            self.assertEqual(post.call_count,1);self.assertGreater(worker.quota_remaining(),50)
+
+    def test_other_worker_owns_job_so_cleanup_cannot_requeue_it(self):
+        import worker
+        from unittest.mock import MagicMock
+        conn=MagicMock();conn.cursor.return_value.__enter__.return_value.fetchone.return_value={'owned':False}
+        with patch.object(worker,'mark_failed_or_retry') as fail:
+            self.assertFalse(worker.recover_unowned_job(conn,'test-owner','restart'))
+            fail.assert_not_called()
 
 class SupervisionTests(unittest.TestCase):
     def test_progress_follows_batch_stages(self):

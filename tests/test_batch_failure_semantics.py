@@ -281,7 +281,7 @@ class WorkerFailurePathTests(unittest.TestCase):
                 mock.patch.object(worker, "mark_failed_or_retry") as retry, \
                 mock.patch.object(worker, "set_job") as set_job, \
                 contextlib.redirect_stdout(out):
-            self.assertTrue(worker.run_once(object()))
+            self.assertTrue(worker.run_once(mock.MagicMock()))
         retry.assert_called_once()
         self.assertEqual(retry.call_args.args[1], "j1")
         set_job.assert_not_called()

@@ -6,6 +6,7 @@ import shlex
 import subprocess
 import sys
 import time
+import threading
 from pathlib import Path
 
 import psycopg2
@@ -21,6 +22,9 @@ from r2_storage import R2Config, client, delete_prefix, load_env, normalize_key,
 
 ROOT = Path(__file__).resolve().parents[1]
 IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".webp", ".bmp", ".tif", ".tiff"}
+WORKER_ID = os.environ.get("WORKER_INSTANCE_ID", "translator")
+DRAIN_FILE = os.environ.get("WORKER_DRAIN_FILE", "")
+
 JOB_TYPES = ("TRANSLATE_PROJECT", "RETRANSLATE_CHAPTER", "TRANSLATE_CHAPTER", "CLEANUP_RAW_CHAPTER")
 
 
@@ -49,12 +53,59 @@ def execute(conn, sql: str, params: tuple | list = ()):
         return cur
 
 
+def quota_path():
+    return Path(os.environ.get("GATEWAY_QUOTA_FILE", str(ROOT / "work/gateway-quota.json")))
+
+
 def quota_remaining():
-    path = Path(os.environ.get("GATEWAY_QUOTA_FILE", str(ROOT / "work/gateway-quota.json")))
     try:
-        return max(0, json.loads(path.read_text())["until"] - time.time())
+        return max(0, json.loads(quota_path().read_text())["until"] - time.time())
     except (OSError, ValueError, KeyError):
         return 0
+
+
+def probe_quota(conn):
+    """One shared lightweight probe per minute detects an early account reset."""
+    path=quota_path()
+    if not path.exists(): return
+    with conn.cursor() as cur:
+        cur.execute("SELECT pg_try_advisory_lock(hashtextextended('translation-quota-probe',0)) AS owned")
+        if not cur.fetchone()['owned']: return
+    try:
+        try: state=json.loads(path.read_text())
+        except (OSError,ValueError): return
+        if state.get('next_probe',0)>time.time(): return
+        state['next_probe']=time.time()+60
+        state['until']=max(time.time()+60,state.get('until',0))
+        def save():
+            temp=path.with_suffix(f'.{os.getpid()}.tmp')
+            temp.write_text(json.dumps(state));os.replace(temp,path)
+        save()
+        import requests
+        sys.path.insert(0,str(ROOT)) if str(ROOT) not in sys.path else None
+        from modules.utils.openai_endpoint import get_openai_chat_completions_url, get_openai_model
+        response=requests.post(get_openai_chat_completions_url(),
+            headers={'Authorization':'Bearer '+os.environ.get('OPENAI_API_KEY','')},
+            json={'model':get_openai_model(None),'messages':[{'role':'user','content':'Reply OK.'}],
+                  'max_completion_tokens':8},timeout=20)
+        if response.status_code==200:
+            body=response.json()
+            if not body.get('choices'): return
+            state['until']=0;state['reason']='Model available';save()
+            with conn:
+                execute(conn,"""UPDATE pipeline_jobs SET next_retry_at=NULL,error_message=NULL,updated_at=now()
+                    WHERE status='QUEUED' AND job_type=ANY(%s)
+                    AND error_message LIKE 'Model usage limit reached%%'""",[list(JOB_TYPES)])
+            path.unlink(missing_ok=True)
+            print('Model quota probe succeeded; queued translations resumed',flush=True)
+        else:
+            # A missing reset time must not invent a fresh 30 minute pause repeatedly.
+            state['until']=max(time.time()+60,state.get('until',0));save()
+    except Exception as exc:
+        print(f'Quota probe deferred: {type(exc).__name__}',flush=True)
+    finally:
+        execute(conn,"SELECT pg_advisory_unlock(hashtextextended('translation-quota-probe',0))")
+        conn.commit()
 
 
 class QuotaWaitError(RuntimeError):
@@ -62,6 +113,8 @@ class QuotaWaitError(RuntimeError):
 
 
 def claim_job(conn):
+    if quota_path().exists():
+        probe_quota(conn)
     if quota_remaining():
         return None
     with conn:
@@ -69,7 +122,8 @@ def claim_job(conn):
             cur.execute(
                 """
                 UPDATE pipeline_jobs
-                SET status = 'RUNNING', started_at = now(), updated_at = now(), error_message = NULL
+                SET status = 'RUNNING', started_at = now(), updated_at = now(), error_message = NULL,
+                    payload = COALESCE(payload, '{}'::jsonb) || jsonb_build_object('worker_id', %s)
                 WHERE id = (
                   SELECT id
                   FROM pipeline_jobs
@@ -82,9 +136,15 @@ def claim_job(conn):
                 )
                 RETURNING *
                 """,
-                (list(JOB_TYPES),),
+                (WORKER_ID, list(JOB_TYPES)),
             )
-            return cur.fetchone()
+            job = cur.fetchone()
+            if job:
+                cur.execute("SELECT pg_try_advisory_lock(hashtextextended(%s,0)) AS owned", [job["id"]])
+                if not cur.fetchone()["owned"]:
+                    conn.rollback()
+                    return None
+            return job
 
 
 MAX_JOB_RETRIES = 5
@@ -160,6 +220,27 @@ def stop_if_cancelled(conn, job_id: str):
         raise CancelledJob("Job cancelled by admin")
 
 
+def recover_unowned_job(conn, job_id, reason):
+    with conn.cursor() as cur:
+        cur.execute("SELECT pg_try_advisory_lock(hashtextextended(%s,0)) AS owned", [job_id])
+        if not cur.fetchone()['owned']:
+            return False
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT status FROM pipeline_jobs WHERE id=%s", [job_id])
+            row=cur.fetchone()
+        if row and row['status']=='CANCEL_REQUESTED':
+            set_job(conn,job_id,status='CANCELLED',error=reason)
+            return True
+        if row and row['status']=='RUNNING':
+            mark_failed_or_retry(conn,job_id,reason)
+            return True
+        return False
+    finally:
+        execute(conn,"SELECT pg_advisory_unlock(hashtextextended(%s,0))",[job_id])
+        conn.commit()
+
+
 def heartbeat(conn, job_id: str):
     with conn:
         execute(conn, "UPDATE pipeline_jobs SET updated_at = now() WHERE id = %s", [job_id])
@@ -173,20 +254,15 @@ def startup_cleanup(conn):
         cur.execute("SELECT id FROM pipeline_jobs WHERE status = 'RUNNING' AND job_type = ANY(%s)", [list(JOB_TYPES)])
         orphan_ids = [row["id"] for row in cur.fetchall()]
     for job_id in orphan_ids:
-        mark_failed_or_retry(conn, job_id, "Translator worker yeniden baÅŸlatÄ±ldÄ±, iÅŸ yarÄ±da kesildi.")
+        recover_unowned_job(conn, job_id, "Translator worker yeniden baÅŸlatÄ±ldÄ±, iÅŸ yarÄ±da kesildi.")
     if orphan_ids:
         print(f"startup_cleanup: {len(orphan_ids)} orphan RUNNING job iÅŸlendi (retry/FAILED)", flush=True)
-    with conn:
-        cur = execute(conn, """
-            UPDATE pipeline_jobs
-            SET status = 'CANCELLED',
-                error_message = 'Translator worker yeniden baÅŸlatÄ±ldÄ±, kuyruktan kaldÄ±rÄ±ldÄ±.',
-                finished_at = now(), updated_at = now()
-            WHERE status = 'CANCEL_REQUESTED'
-              AND job_type = ANY(%s)
-        """, [list(JOB_TYPES)])
-        if cur.rowcount:
-            print(f"startup_cleanup: {cur.rowcount} CANCEL_REQUESTED â†’ CANCELLED", flush=True)
+    with conn.cursor() as cur:
+        cur.execute("SELECT id FROM pipeline_jobs WHERE status='CANCEL_REQUESTED' AND job_type=ANY(%s)", [list(JOB_TYPES)])
+        cancelled_ids=[row['id'] for row in cur.fetchall()]
+    for job_id in cancelled_ids:
+        recover_unowned_job(conn,job_id,"Worker stopped; cancellation completed")
+
 
 
 def reap_dead_jobs(conn):
@@ -199,17 +275,13 @@ def reap_dead_jobs(conn):
         """, [list(JOB_TYPES)])
         stale_ids = [row["id"] for row in cur.fetchall()]
     for job_id in stale_ids:
-        mark_failed_or_retry(conn, job_id, "Translator worker 20 dakika yanÄ±t vermedi, otomatik iptal.")
-    with conn:
-        execute(conn, """
-            UPDATE pipeline_jobs
-            SET status = 'CANCELLED',
-                error_message = 'Durdurma talebi zaman aÅŸÄ±mÄ±na uÄŸradÄ±, otomatik iptal.',
-                finished_at = now(), updated_at = now()
-            WHERE status = 'CANCEL_REQUESTED'
-              AND job_type = ANY(%s)
-              AND updated_at < now() - interval '2 minutes'
-        """, [list(JOB_TYPES)])
+        recover_unowned_job(conn, job_id, "Translator worker 20 dakika yanÄ±t vermedi, otomatik iptal.")
+    with conn.cursor() as cur:
+        cur.execute("SELECT id FROM pipeline_jobs WHERE status='CANCEL_REQUESTED' AND job_type=ANY(%s) AND updated_at < now()-interval '2 minutes'", [list(JOB_TYPES)])
+        cancelled_ids=[row['id'] for row in cur.fetchall()]
+    for job_id in cancelled_ids:
+        recover_unowned_job(conn,job_id,"Worker stopped; cancellation completed")
+
 
 
 def cleanup_old_jobs(conn):
@@ -234,11 +306,11 @@ def update_worker_heartbeat(conn, jobs_done: int = 0):
     with conn:
         execute(conn, """
             INSERT INTO worker_heartbeats (worker_id, last_seen_at, jobs_processed)
-            VALUES ('translator', now(), %s)
+            VALUES (%s, now(), %s)
             ON CONFLICT (worker_id) DO UPDATE
               SET last_seen_at = now(),
                   jobs_processed = worker_heartbeats.jobs_processed + EXCLUDED.jobs_processed
-        """, [jobs_done])
+        """, [WORKER_ID, jobs_done])
 
 
 def prefix_from_key(key: str) -> str:
@@ -625,7 +697,26 @@ def run_once(conn) -> bool:
     except Exception as exc:
         print(f"job failed {job['id']}: {exc}", flush=True)
         mark_failed_or_retry(conn, job["id"], str(exc))
+    finally:
+        if not conn.closed:
+            with conn:
+                execute(conn, "SELECT pg_advisory_unlock(hashtextextended(%s,0))", [job["id"]])
     return True
+
+
+def keep_worker_online():
+    """Use a separate connection so a long chapter cannot hide a live worker."""
+    conn = None
+    while True:
+        try:
+            if conn is None or conn.closed:
+                conn = connect()
+            update_worker_heartbeat(conn)
+        except psycopg2.Error:
+            if conn is not None:
+                conn.close()
+            conn = None
+        time.sleep(20)
 
 
 def main() -> int:
@@ -639,9 +730,14 @@ def main() -> int:
     conn = connect()
     print("Translation worker connected to pipeline_jobs.", flush=True)
     startup_cleanup(conn)
+    threading.Thread(target=keep_worker_online,daemon=True).start()
     update_worker_heartbeat(conn)
     cleanup_tick = 0
     while True:
+        if DRAIN_FILE and Path(DRAIN_FILE).exists():
+            conn.close()
+            print("Worker drained; current chapter completed", flush=True)
+            return 0
         try:
             reap_dead_jobs(conn)
             had_job = run_once(conn)
