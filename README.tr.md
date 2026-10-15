@@ -406,3 +406,8 @@ işlerinde çalışır. Yerel denemeler ve R2 worker işleri aynı ön işlemden
 ## Lisans
 
 `LICENSE`'a bak.
+
+
+## GPU olmayan sunucu / Docker
+
+CPU sunucu kurulumu, örnek environment ve çalıştırma komutları: [DEPLOY.cpu.md](DEPLOY.cpu.md).

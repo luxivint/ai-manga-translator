@@ -13,3 +13,16 @@ models
 Dockerfile
 .dockerignore
 .git
+
+.env.*
+venv
+env
+output_*
+render_test
+chapter_test
+benchmark
+experiments
+logs
+*.log
+*.zip
+FONT KLASÖR

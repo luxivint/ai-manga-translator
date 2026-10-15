@@ -1,0 +1,48 @@
+# Run from this repository: docker compose --env-file .env.server -f compose.cpu.yml up -d --build
+services:
+  translation-worker:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: trendmanga-translation:cpu
+    env_file:
+      - .env.server
+    environment:
+      USE_GPU: "false"
+      SEG_DEVICE: cpu
+      LAMA_DEVICE: cpu
+      USE_TENSORRT: "false"
+      BATCH_WORKERS: "1"
+      BATCH_WORKERS_AUTO: "false"
+      BATCH_WORKERS_MAX: "1"
+      OMP_NUM_THREADS: "2"
+      OPENBLAS_NUM_THREADS: "2"
+      MKL_NUM_THREADS: "2"
+      NUMEXPR_NUM_THREADS: "2"
+    # Hard limits, including when ordinary Docker Compose runs outside Swarm.
+    cpus: "${TRANSLATION_CPUS:-2.0}"
+    mem_limit: "${TRANSLATION_MEMORY:-8g}"
+    pids_limit: 512
+    restart: unless-stopped
+    init: true
+    # SIGTERM drains the current job; Docker forces a stop after this deadline.
+    stop_grace_period: 30m
+    volumes:
+      - translation-work:/app/work
+    networks:
+      - worker-network
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+volumes:
+  translation-work:
+
+networks:
+  worker-network:
+    external: true
+    name: "${WORKER_DOCKER_NETWORK:-trendmanga}"
