@@ -60,7 +60,7 @@ from app.ui.canvas.text.text_item_properties import TextItemProperties
 from app.ui.canvas.text_item import OutlineInfo, OutlineType
 from modules.detection.processor import TextBlockDetector
 from modules.inpainting.schema import Config
-from modules.inpainting import patch_match
+from modules.inpainting import fill_qa, patch_match
 from modules.inpainting.mask import constrain_mask_to_allowed_regions
 from modules.inpainting.lama import LaMa
 from modules.utils import compute_device
@@ -1569,18 +1569,62 @@ def clear_light_free_text_render_regions(image: np.ndarray, blocks) -> np.ndarra
         if float(light_pixels.mean()) < white_ratio_min:
             continue
 
+        local_bg = os.environ.get("LIGHT_RENDER_CLEAR_LOCAL_BG", "true").lower() == "true"
+        if local_bg and float(gray[light_pixels].std()) > float(os.environ.get("LIGHT_RENDER_CLEAR_MAX_STD", "22")):
+            continue  # light pixels spread over art / UI: nothing "plain" to wipe
         fill = np.median(crop[light_pixels], axis=0).astype(np.uint8) if light_pixels.any() else np.array([255, 255, 255], dtype=np.uint8)
-        if int(fill.mean()) < 210:
+        if int(fill.mean()) < 210 and not local_bg:
             fill = np.array([255, 255, 255], dtype=np.uint8)
+        painted_mask = light_pixels
+        if local_bg:
+            painted_mask = light_pixels & ~_wipe_structure_mask(light_pixels)
         # Edge-aware feathered fill: only the light pixels (closed over thin ghost strokes) are
         # repainted, with a Gaussian-feathered alpha, so no hard rectangle shows on gradients/art.
-        near_light = cv2.morphologyEx(light_pixels.astype(np.uint8), cv2.MORPH_CLOSE, np.ones((9, 9), np.uint8))
+        near_light = cv2.morphologyEx(painted_mask.astype(np.uint8), cv2.MORPH_CLOSE, np.ones((9, 9), np.uint8))
         near_light = cv2.erode(near_light, np.ones((3, 3), np.uint8))
+        if local_bg:
+            near_light = near_light & ~_wipe_structure_mask(light_pixels)
         alpha = cv2.GaussianBlur(near_light.astype(np.float32), (0, 0), 3.0)[..., None]
-        blended = crop.astype(np.float32) * (1.0 - alpha) + fill.astype(np.float32) * alpha
+        target = _local_light_background(crop, light_pixels, fill) if local_bg else fill.astype(np.float32)
+        blended = crop.astype(np.float32) * (1.0 - alpha) + target * alpha
         result[y1:y2, x1:x2] = np.clip(blended, 0, 255).astype(np.uint8)
 
     return result
+
+
+def _wipe_structure_mask(light_pixels: np.ndarray) -> np.ndarray:
+    """Dark structure inside a wipe crop that must never be painted over: long lines that run into the crop edge (panel
+    / window / UI borders) and big dark areas (artwork), grown by a few pixels. Short glyph ghosts are not structure."""
+    dark = (~light_pixels).astype(np.uint8)
+    h, w = dark.shape
+    # thick strokes (glyph ghosts are >= 5 px wide) survive the opening; lines / outlines (3 px) do not
+    thick = cv2.morphologyEx(dark, cv2.MORPH_OPEN, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5)))
+    thin = dark & (1 - thick)
+    count, labels, stats, _ = cv2.connectedComponentsWithStats(thin, 8)
+    keep = np.zeros(count, np.uint8)
+    for i in range(1, count):
+        cx, cy, cw, ch, area = (int(v) for v in stats[i])
+        if max(cw, ch) >= 70:
+            keep[i] = 1
+    out = (keep[labels] > 0)
+    count, labels, stats, _ = cv2.connectedComponentsWithStats(thick, 8)
+    for i in range(1, count):
+        if int(stats[i][4]) >= 2500:
+            out |= labels == i
+    if not out.any():
+        return out
+    return cv2.dilate(out.astype(np.uint8), np.ones((7, 7), np.uint8)) > 0
+
+
+def _local_light_background(crop: np.ndarray, light_pixels: np.ndarray, fallback: np.ndarray, sigma: float | None = None) -> np.ndarray:
+    """Per-pixel colour of the plain light backdrop: Gaussian-normalised average of the light pixels only (ring fit that
+    follows gradients), so the wipe repaints with the LOCAL colour instead of one median rectangle."""
+    sigma = sigma or float(os.environ.get("LIGHT_RENDER_CLEAR_BG_SIGMA", "18"))
+    wgt = light_pixels.astype(np.float32)
+    den = cv2.GaussianBlur(wgt, (0, 0), sigma)
+    num = cv2.GaussianBlur(crop.astype(np.float32) * wgt[..., None], (0, 0), sigma)
+    bg = num / np.maximum(den[..., None], 1e-3)
+    return np.where(den[..., None] > 0.03, bg, fallback.astype(np.float32)[None, None, :]).astype(np.float32)
 
 
 def clear_light_bubble_text_render_regions(image: np.ndarray, blocks, original: np.ndarray | None = None) -> np.ndarray:
@@ -2262,6 +2306,28 @@ def _dump_clean_debug(path: Path, image: np.ndarray, mask: np.ndarray) -> None:
         print(f"  [clean-dump] failed: {exc}", flush=True)
 
 
+def clean_postprocess(image: np.ndarray, cleaned: np.ndarray, mask: np.ndarray, blocks=None) -> np.ndarray:
+    """After LaMa + watermark flat fill: (1) catch leftover source text the first mask missed (CLEAN_RESIDUAL_PASS),
+    (2) calm down objectively bad fills (CLEAN_FILL_QA) over first + residual masks. Best-effort, never raises."""
+    full_mask = mask
+    try:
+        from modules.inpainting import residual
+        cleaned, rrep = residual.residual_pass(sys.modules[__name__], image, cleaned, mask, blocks,
+                                               Config(hd_strategy="Resize", hd_strategy_resize_limit=2048))
+        if rrep.get("added"):
+            print(f"  [clean-residual] components added={rrep['added']} passes={rrep['passes']} px={rrep['px']}", flush=True)
+            full_mask = cv2.bitwise_or((mask > 0).astype(np.uint8) * 255, rrep["mask"])
+    except Exception as exc:
+        print(f"  [clean-residual] skipped: {exc}", flush=True)
+    try:
+        cleaned, rep = fill_qa.qa_pass(image, cleaned, full_mask, skip=watermark_clear_mask(image, blocks))
+        if rep.get("bad"):
+            print(f"  [clean-qa] bad fills={rep['bad']} fixed={rep['fixed']} {rep['kinds']}", flush=True)
+    except Exception as exc:
+        print(f"  [clean-qa] skipped: {exc}", flush=True)
+    return cleaned
+
+
 def _stage_clean(task: tuple) -> tuple:
     """Phase-3a worker: YOLOv8 segmentasyon maskesi + block-aware LaMa ile temizlik."""
     idx, path, image, blocks, args = task
@@ -2278,6 +2344,7 @@ def _stage_clean(task: tuple) -> tuple:
     else:
         cleaned = block_inpaint(image, mask, config)
         cleaned = watermark_lib.flat_fill(image, cleaned, watermark_clear_mask(image, blocks))
+        cleaned = clean_postprocess(image, cleaned, mask, blocks)
         _dump_clean_debug(path, image, mask)
     assert cleaned.shape == image.shape, f"cleaned shape {cleaned.shape} != page {image.shape}"
     cleaned = restore_untranslated_regions(image, cleaned, blocks)
