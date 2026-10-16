@@ -244,6 +244,8 @@ VALID_STYLES = {"normal", "shout", "whisper", "thought", "narration", "sfx", "si
 MIN_LINE_SPACING = float(os.environ.get("RENDER_MIN_LINE_SPACING", "1.12"))  # room for İ dots / Ğ breves in capitals
 MAX_TARGET_SIZE = int(os.environ.get("RENDER_MAX_TARGET_SIZE", "400"))  # source-derived size replaces the old 58 cap
 BUBBLE_MAX_GROW = 1.22  # balloons with room may set Turkish a little larger than the English
+TINY_PX = int(os.environ.get("RENDER_TINY_PX", "14"))  # balloon text below this size (at 800 px width) retries on its original box
+STRICT_FLOOR = int(os.environ.get("RENDER_STRICT_FLOOR", "14"))  # a strict-fit block below this size falls back to growing
 TARGET_MAX_GROW = 1.08   # Turkish may be set up to 8 percent bigger than the English cap height
 TARGET_MIN_KEEP = 0.82   # try to keep at least 82 percent of the source size before shrinking further
 
@@ -432,6 +434,7 @@ def split_merged_blocks(blocks, orig_boxes, image, cleaned):
             sub.xyxy = box.copy()
             sub.bubble_xyxy = None
             sub.text_class = "text_free"
+            sub.split_origin = True
             one_row = len(g["rows"]) == 1  # a single text row: the pieces are menu items, not stacked lines
             sub.translation = " ".join(seg) if one_row else "\n".join(seg)
             sub.text = ""  # source text of a merged block cannot be split per group
@@ -447,6 +450,25 @@ def _source_cap(image: np.ndarray, obox) -> float:
         return float(tst.cap_height(mask)) if mask.any() else 0.0
     except Exception:
         return 0.0
+
+
+def drop_split_duplicates(blocks, orig_boxes):
+    """A title detected twice (alone + as the first line of a bigger merged UI block) leaves a split piece that repeats
+    the standalone block: drop the piece (RENDER_STRIP_NEIGHBOR_LINES=false disables). Nothing is lost, the standalone
+    block draws the same words."""
+    from modules.utils import block_cleanup as bcl
+
+    if not bcl.strip_line_enabled() or len(blocks) < 2:
+        return blocks, orig_boxes
+    boxes = [[float(v) for v in o] for o in orig_boxes]
+    drop = set(bcl.split_piece_duplicates([(b.translation or "") for b in blocks], boxes,
+                                          [bool(getattr(b, "split_origin", False)) for b in blocks]))
+    if not drop:
+        return blocks, orig_boxes
+    if os.environ.get("RENDER_DEBUG"):
+        print(f"[split-dup] dropped split pieces {sorted(drop)} that repeat a neighbour block", flush=True)
+    keep = [i for i in range(len(blocks)) if i not in drop]
+    return [blocks[i] for i in keep], [orig_boxes[i] for i in keep]
 
 
 def dedupe_duplicate_blocks(blocks, orig_boxes):
@@ -513,6 +535,34 @@ def prepare_balloon_blocks(blocks, orig_boxes, image):
         bubbles[first] = base_bubble
         drop.update(idx[1:])
         return merged
+
+    from modules.utils import block_cleanup as bcl
+
+    if bcl.echo_merge_enabled():
+        # OCR windows of ONE paragraph (each window re-read the previous window's last words): translated separately
+        # they repeat words at several sizes. Join them into one paragraph, repeated leading words dropped.
+        cand = [i for i in range(n) if (blocks[i].translation or "").strip() and not getattr(blocks[i], "is_ad", False)]
+        srcs = [(getattr(blocks[i], "text", "") or "") for i in cand]
+        for grp in bcl.overlap_chain_groups([boxes[i] for i in cand], srcs):
+            idx = [cand[k] for k in grp]
+            done, parts = "", []
+            for pos, i in enumerate(idx):
+                t = blocks[i].translation.strip()
+                if pos:
+                    ov = bcl.ocr_overlap_words(getattr(blocks[idx[pos - 1]], "text", "") or "", getattr(blocks[i], "text", "") or "")
+                    t = bcl.dedupe_overlap_translation(done, t, max(ov, 1))
+                parts.append(t)
+                done = " ".join(parts)
+            blocks[idx[0]] = copy.copy(blocks[idx[0]])
+            for i, t in zip(idx, parts):
+                if i != idx[0]:
+                    blocks[i] = copy.copy(blocks[i])
+                blocks[i].translation = t
+            base = max(idx, key=lambda i: (boxes[i][2] - boxes[i][0]) * (boxes[i][3] - boxes[i][1]))
+            merged = merge(idx, base)
+            merged.translation = bcl.collapse_repeats(merged.translation)
+            if os.environ.get("RENDER_DEBUG"):
+                print(f"[merge-echo] {len(idx)} OCR windows -> one paragraph: {merged.translation[:70]!r}", flush=True)
 
     for g in bl.group_by_balloon(bubbles, boxes):
         g = [i for i in g if (blocks[i].translation or "").strip() and not getattr(blocks[i], "is_ad", False) and i not in drop]
@@ -603,7 +653,7 @@ def resolve_item_overlaps(items: list, plans: list, W: int, H: int, direction) -
         if not pairs:
             return 0
         idx = sorted({k for a, b, _ in pairs for k in (a, b)})
-        flat = [k for k in idx if not float(items[k].get("rotation") or 0.0)]
+        flat = [k for k in idx if not float(items[k].get("rotation") or 0.0) and not plans[k].get("strict_fit")]
         if flat and rnd < 4:
             boxes = [[items[k]["position"][0], items[k]["position"][1], items[k]["width"], items[k]["height"]] for k in flat]
             shift = [(0.15 if plans[k]["bubble"] else 0.6) * items[k]["height"] for k in flat]
@@ -629,6 +679,7 @@ def build_items(blocks, image, cleaned, orig_boxes, render_settings, alignment, 
     policy = casing_policy(render_settings.upper_case)
     plans = []
     blocks, orig_boxes = split_merged_blocks(blocks, orig_boxes, image, cleaned)
+    blocks, orig_boxes = drop_split_duplicates(blocks, orig_boxes)
     blocks, orig_boxes = dedupe_duplicate_blocks(blocks, orig_boxes)
     blocks, orig_boxes = prepare_balloon_blocks(blocks, orig_boxes, image)
     for blk, obox in zip(blocks, orig_boxes):
@@ -675,7 +726,20 @@ def build_items(blocks, image, cleaned, orig_boxes, render_settings, alignment, 
         angle, rect = (0.0, None)
         if not in_bubble or style in {"sign", "phone", "title", "sfx"}:
             angle, rect = tst.text_angle(mask) if cap_h >= 8 else (0.0, None)
+            if (not angle and cap_h >= 8 and style in {"sign", "phone", "title", "sfx", "narration"}
+                    and (not in_bubble or style in {"sign", "phone"}) and os.environ.get("RENDER_TILT_FALLBACK", "true").lower() == "true"):
+                # the cleaned-page diff is ragged (leftover strokes) or too square for minAreaRect: read the tilt of the
+                # lettering from the ORIGINAL ink instead, so diagonal source text stays diagonal
+                rim_t, rim_toff = tst.ink_mask_original(image, obox)
+                t_ang, t_rect = tst.estimate_tilt(rim_t)
+                r_ang, _ = tst.text_angle(rim_t)
+                # a rectangle fit that finds ANOTHER tilt contradicts the projection estimate (mixed horizontal + tilted
+                # ink); pieces cut from a merged block are never re-tilted
+                if t_ang and t_rect is not None and (not r_ang or abs(r_ang - t_ang) <= 6.0) and not getattr(blk, "split_origin", False):
+                    angle = t_ang
+                    rect = (t_rect[0] + rim_toff[0] - off[0], t_rect[1] + rim_toff[1] - off[1], t_rect[2], t_rect[3])
         region, is_bubble, inner, ioff = None, False, None, (0, 0)
+        guard_inner, guard_off = None, (0, 0)
         if angle != 0.0 and rect is not None:
             cx, cy, long_len, short_len = rect
             cx, cy = cx + off[0], cy + off[1]
@@ -714,6 +778,9 @@ def build_items(blocks, image, cleaned, orig_boxes, render_settings, alignment, 
                 ow, oh = ox2 - ox1, oy2 - oy1
                 region = (int(max(0, ox1 - 0.12 * ow)), int(max(0, oy1 - 0.45 * oh)),
                           int(min(W, ox2 + 0.12 * ow)), int(min(H, oy2 + 0.45 * oh)))
+                bb_ = blk.bubble_xyxy
+                if float(inner.sum()) >= 0.35 * max(1.0, float((bb_[2] - bb_[0]) * (bb_[3] - bb_[1]))):
+                    guard_inner, guard_off = inner, ioff  # a spiky balloon is legitimately non-convex: keep it as the line guard
                 inner, shaped = None, True
         if not is_bubble and not angle and not list_like and not flat and style not in {"sfx", "shout", "title"} and cap_h >= 8:
             # free text over artwork (hologram ellipses, signs on busy scenes): the backdrop shape is unknown, so the
@@ -746,7 +813,7 @@ def build_items(blocks, image, cleaned, orig_boxes, render_settings, alignment, 
                 # a list never grows past the panel text column: original ink + a small margin
                 region = (int(max(0, ink[0] - 0.02 * iw)), int(max(0, ink[1] - 0.04 * ih)),
                           int(min(W, ink[2] + 0.06 * iw)), int(min(H, ink[3] + 0.06 * ih)))
-        plans.append(dict(list_center=list_center, shaped=shaped, italic=italic, ink=ink, src_centers=src_centers, blk=blk, style=style, text=text, family=family, font_rel=rel, region=region,
+        plans.append(dict(guard_inner=guard_inner, guard_off=guard_off, list_center=list_center, shaped=shaped, italic=italic, ink=ink, src_centers=src_centers, blk=blk, style=style, text=text, family=family, font_rel=rel, region=region,
                           bubble=is_bubble, colors=(text_rgb, bg_rgb, flat), analysis=colors, angle=angle,
                           cap_h=cap_h, list_like=list_like, obox=[int(v) for v in obox], region_kind=("interior" if is_bubble else "other"), src_traits=src_traits, inner=inner, inner_off=ioff,
                           n_src_lines=n_src_lines))
@@ -757,8 +824,9 @@ def build_items(blocks, image, cleaned, orig_boxes, render_settings, alignment, 
     if bl.unify_enabled() and len(plans) >= 2:
         speech = [p["style"] in bl.SPEECH_STYLES and not p["list_like"] for p in plans]
         cand = [i for i in range(len(plans)) if speech[i]]
+        touch = 12.0 if os.environ.get("RENDER_GROUP_TOUCHING", "true").lower() == "true" else 0.0
         for g in bl.group_by_balloon([None if plans[i]["blk"].bubble_xyxy is None else tuple(float(v) for v in plans[i]["blk"].bubble_xyxy) for i in cand],
-                                     [plans[i]["obox"] for i in cand]):
+                                     [plans[i]["obox"] for i in cand], touch_gap=touch):
             balloon_groups.append([cand[k] for k in g])
         for g in balloon_groups:
             for i in g:
@@ -787,6 +855,25 @@ def build_items(blocks, image, cleaned, orig_boxes, render_settings, alignment, 
                     plans[i]["text"] = fp.sanitize_for_font(plans[i]["text"], plans[lead]["font_rel"])
             if os.environ.get("RENDER_DEBUG"):
                 print(f"[balloon-group] {g} family={plans[lead]['family']} caps={[round(plans[i]['cap_h'], 1) for i in g]}", flush=True)
+
+    if os.environ.get("RENDER_STRICT_FIT", "true").lower() == "true":
+        # crowded panel / UI blocks (touching another block, or cut from a merged OCR block): each translation must stay
+        # inside its OWN original box (shrink only, no growth, no pushing into neighbours)
+        for i, p in enumerate(plans):
+            if p["bubble"] or p["style"] not in {"sign", "phone", "narration"}:
+                continue
+            ob = p["obox"]
+            touching = any(j != i and not plans[j]["bubble"] and ob[0] - 10 < plans[j]["obox"][2] and plans[j]["obox"][0] < ob[2] + 10
+                           and ob[1] - 10 < plans[j]["obox"][3] and plans[j]["obox"][1] < ob[3] + 10 for j in range(len(plans)))
+            if touching or getattr(p["blk"], "split_origin", False):
+                p["strict_fit"] = True
+                p["region0"] = p["region"]
+                if not p["angle"]:
+                    bw, bh = ob[2] - ob[0], ob[3] - ob[1]
+                    p["region"] = (int(max(0, ob[0] - 0.03 * bw)), int(max(0, ob[1] - 0.03 * bh)),
+                                   int(min(W, ob[2] + 0.03 * bw)), int(min(H, ob[3] + 0.03 * bh)))
+                if os.environ.get("RENDER_DEBUG"):
+                    print(f"[strict-fit] block {ob} fits its own box", flush=True)
 
     def fit_list(plan, region, max_size):
         """List / status window: every entry stays on ONE row (never wraps); the size shrinks until the widest
@@ -825,10 +912,22 @@ def build_items(blocks, image, cleaned, orig_boxes, render_settings, alignment, 
         target = size_for_cap(plan["family"], plan["cap_h"], plan["font_rel"]) if plan["cap_h"] >= 8 else 0.0
         plan["target"] = target
         grow = BUBBLE_MAX_GROW if plan["bubble"] else TARGET_MAX_GROW
+        if plan.get("strict_fit"):
+            grow = 1.0
         cap = max_size if not target else max(FLOOR_SIZE, min(MAX_TARGET_SIZE, int(math.ceil(target * grow))))
         region = plan["region"]
         best = fit_once(plan, region, cap)
         plan["fit_region"] = region
+        if plan.get("strict_fit"):
+            if best[1] >= STRICT_FLOOR:
+                return best
+            # its own box is too small for a readable size: fall back to the normal (growing) fit
+            plan["strict_fit"] = False
+            region = plan["region"] = plan.get("region0", region)
+            grow = BUBBLE_MAX_GROW if plan["bubble"] else TARGET_MAX_GROW
+            cap = max_size if not target else max(FLOOR_SIZE, min(MAX_TARGET_SIZE, int(math.ceil(target * grow))))
+            best = fit_once(plan, region, cap)
+            plan["fit_region"] = region
         if plan["bubble"] and plan["inner"] is not None and best[1] < cap:
             # balloons are ellipses: the largest rectangle is narrow and tall. Try wider layouts and
             # keep one only if every laid-out line still lies inside the balloon interior.
@@ -924,10 +1023,15 @@ def build_items(blocks, image, cleaned, orig_boxes, render_settings, alignment, 
             out, size = fits[i][0], fits[i][1]
             guard = 0
             was = plan.get("strict")
-            if hard and plan["inner"] is not None and plan["bubble"] and not plan["angle"]:
-                plan["strict"] = True
-            while (plan["inner"] is not None and size > FLOOR_SIZE and guard < (30 if hard else 14)
-                   and not lines_inside(plan, out, size, plan["fit_region"], line_spacing, 0.97 if plan.get("strict") else 0.9)):
+            probe, floor = plan, FLOOR_SIZE
+            if (hard and plan["inner"] is None and plan.get("guard_inner") is not None and plan["bubble"] and not plan["angle"]
+                    and os.environ.get("RENDER_SPIKY_GUARD", "true").lower() == "true"):
+                # ragged / spiky balloon: the interior is trusted for the line check only (never shrunk below 70 percent)
+                probe, floor = dict(plan, inner=plan["guard_inner"], inner_off=plan["guard_off"]), max(FLOOR_SIZE, int(0.7 * size))
+            if hard and probe["inner"] is not None and plan["bubble"] and not plan["angle"]:
+                plan["strict"] = probe["strict"] = True
+            while (probe["inner"] is not None and size > floor and guard < (30 if hard else 14)
+                   and not lines_inside(probe, out, size, plan["fit_region"], line_spacing, 0.97 if probe.get("strict") else 0.9)):
                 fits[i] = fit_once(plan, plan["fit_region"], size - 1)
                 out, size = fits[i][0], fits[i][1]
                 guard += 1
@@ -942,6 +1046,31 @@ def build_items(blocks, image, cleaned, orig_boxes, render_settings, alignment, 
         balloon_cap(lambda sizes, caps: [int(math.ceil(min(sizes) * (1.0 + bl.band()))) if not bl.is_emphasis(
             caps[k], [c for j, c in enumerate(caps) if j != k]) else None for k in range(len(sizes))])
         guard_fit()
+
+    def tiny_retry():
+        """Balloon text that ended unreadably small although the English lettering was big: the measured interior is a
+        narrow sliver (hologram, textured balloon). The original text box stood on safe ground: retry on it, kept inside
+        the balloon box (RENDER_TINY_PX, default 14 at 800 px width; 0 disables)."""
+        for i, plan in enumerate(plans):
+            target = plan.get("target") or 0.0
+            if not (TINY_PX and target and plan["bubble"] and fits[i][1] < TINY_PX * W / 800.0 and fits[i][1] < 0.6 * target):
+                continue
+            ox1, oy1, ox2, oy2 = [float(v) for v in plan["obox"]]
+            bb = getattr(plan["blk"], "bubble_xyxy", None)
+            if bb is not None:
+                bw_, bh_ = float(bb[2]) - float(bb[0]), float(bb[3]) - float(bb[1])
+                ox1, oy1 = max(ox1, float(bb[0]) + 0.05 * bw_), max(oy1, float(bb[1]) + 0.05 * bh_)
+                ox2, oy2 = min(ox2, float(bb[2]) - 0.05 * bw_), min(oy2, float(bb[3]) - 0.05 * bh_)
+            region = (int(ox1), int(oy1), int(ox2), int(oy2))
+            if region[2] - region[0] <= 40 or region[3] - region[1] <= 20:
+                continue
+            cand = fit_once(plan, region, int(math.ceil(target * TARGET_MAX_GROW)))
+            if cand[1] > fits[i][1]:
+                fits[i], plan["fit_region"], plan["inner"] = cand, region, None  # inner was the unreliable part
+                if os.environ.get("RENDER_DEBUG"):
+                    print(f"[tiny-retry] block {plan['obox']}: size -> {cand[1]}", flush=True)
+
+    tiny_retry()
 
     items = []
     for plan, (out, size, dw, dh) in zip(plans, fits):

@@ -370,6 +370,14 @@ Bu komut torch/torchvision'ın CUDA 13 sürümlerini ve `onnxruntime-gpu`'yu kur
 | `RENDER_HARD_GUARD` | `true` | her balon bloğunun tüm satırları (+%2 boşluk) balon içinde kalır; gerekirse blok küçülür |
 | `BLOCK_CONTAINMENT_PRUNE`, `BLOCK_CONTAINMENT_RATIO`, `BLOCK_TEXT_COVER` | `true`, `0.6`, `0.8` | çeviriden önce: başka bir bloğun içinde (>= %60) duran ve kelimeleri (>= %80) o bloğta zaten bulunan blok atılır |
 | `RENDER_RESOLVE_OVERLAP` | `true` | üst üste binen yazı kutuları ayrılır / küçültülür |
+| `RENDER_MERGE_OCR_ECHO` | `true` | uç uca binen OCR pencereleri (bir paragrafın örtüşen parçalar halinde okunması) tek paragraf olur, tekrar eden baştaki kelimeler atılır |
+| `RENDER_STRIP_NEIGHBOR_LINES` | `true` | birleşik UI bloğundan kesilen ve komşu bloğun çevirisini aynen tekrarlayan parça (iki kez algılanan başlık) tekrar çizilmez |
+| `RENDER_STRICT_FIT`, `RENDER_STRICT_FLOOR` | `true`, `14` | kalabalık tabela/telefon/anlatım blokları kendi özgün kutusunda kalır: yalnız küçülür, büyümez, komşuya itilmez; taban boyutun altında normal sığdırmaya döner |
+| `RENDER_TILT_FALLBACK` | `true` | çapraz kaynak yazı çapraz kalır: temizlenmiş sayfadan eğim bulunamazsa özgün mürekkepten okunur |
+| `RENDER_TINY_PX` | `14` | 800 px genişlikte bu boyutun altında kalan balon yazısı, balon kutusu içinde özgün yazı kutusunda yeniden denenir (`0` kapatır) |
+| `RENDER_SPIKY_GUARD` | `true` | sivri / dışbükey olmayan balon içi sert satır-içeride denetiminde kullanılır; yazı balon çizgisini aşmaz (en fazla %30 küçülür) |
+| `LIGHT_RENDER_CLEAR_PAD_X`, `LIGHT_RENDER_CLEAR_PAD_Y` | `16`, `10` | serbest yazı beyaz silme işleminin blok kutusu çevresindeki payı |
+| `LIGHT_RENDER_CLEAR_LOCAL_BG`, `LIGHT_RENDER_CLEAR_MAX_STD`, `LIGHT_RENDER_CLEAR_BG_SIGMA` | `true`, `22`, `18` | silme yerel arka plan rengiyle boyar (degradeleri izler, gri dikdörtgen kalmaz), düz olmayan bölgeleri atlar, uzun ince çizgilerin / büyük koyu alanların üstünü boyamaz; `LOCAL_BG=false` = eski tek medyan dolgu |
 
 Herhangi birini değiştirmek için aynı adlı ortam değişkenini ayarlayın, örneğin `BATCH_PIPELINE=false`.
 

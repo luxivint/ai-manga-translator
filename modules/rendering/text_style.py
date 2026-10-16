@@ -196,6 +196,46 @@ def text_angle(mask: np.ndarray, min_aspect: float = 1.8, max_abs: float = 38.0)
     return float(ang), (cx, cy, long_len, short_len)
 
 
+def estimate_tilt(mask: np.ndarray, max_abs: float = 30.0, min_gain: float = 1.35, min_abs: float = 3.0):
+    """Tilt (deg clockwise) of text lines from the ink pixels alone: the angle at which the pixels collapse onto the
+    fewest perpendicular offsets (sharpest row histogram). Works for several stacked lines and for ragged masks where
+    minAreaRect fails. Returns (angle, (cx, cy, long_len, short_len)) or (0.0, None) when no clear tilt exists."""
+    ys, xs = np.nonzero(mask)
+    if len(xs) < 60:
+        return 0.0, None
+    k = max(1.0, max(mask.shape) / 320.0)
+    if k > 1.0:
+        keep = (np.arange(len(xs)) % int(round(k * k))) == 0
+        xs, ys = xs[keep], ys[keep]
+    x = xs.astype(np.float32) / k
+    y = ys.astype(np.float32) / k
+    x -= x.mean()
+    y -= y.mean()
+
+    def score(theta):
+        t = math.radians(theta)
+        v = -x * math.sin(t) + y * math.cos(t)
+        h = np.bincount(np.round(v - v.min()).astype(np.int64))
+        return float((h.astype(np.float64) ** 2).sum())
+
+    base = score(0.0)
+    cand = [(score(a), a) for a in np.arange(-max_abs, max_abs + 0.1, 1.0)]
+    sc, ang = max(cand)
+    for a in np.arange(ang - 0.75, ang + 0.76, 0.25):
+        s2 = score(float(a))
+        if s2 > sc:
+            sc, ang = s2, float(a)
+    if base <= 0 or sc / base < min_gain or abs(ang) < min_abs:
+        return 0.0, None
+    t = math.radians(ang)
+    u = (x * math.cos(t) + y * math.sin(t))
+    v = (-x * math.sin(t) + y * math.cos(t))
+    long_len, short_len = float(np.ptp(u)) * k, float(np.ptp(v)) * k
+    cx = float(xs.mean()) if k <= 1.0 else float(np.mean(xs))
+    cy = float(ys.mean()) if k <= 1.0 else float(np.mean(ys))
+    return float(ang), (cx, cy, max(long_len, short_len), min(long_len, short_len))
+
+
 # ------------------------------------------------------------------ colours
 def _lum(rgb) -> float:
     r, g, b = [float(v) for v in rgb]

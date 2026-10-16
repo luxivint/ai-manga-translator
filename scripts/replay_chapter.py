@@ -11,6 +11,7 @@ local_batch.build_text_items_state) code paths are executed. Nothing here touche
 blocked while the tool runs.
 
 Sub-commands (python scripts/replay_chapter.py <cmd> ...):
+  recut     raw chapter -> recut-NNNNN.png pieces exactly like the job (local detector, no API)
   parse     log -> dump.json (page assignment by detector-box matching when the dump has no page= field)
   detect    run the detector on every raw page and cache the blocks (pickle)
   render    replay clean+render for pages -> PNGs (--mode before|after switches the new block clean-up on/off)
@@ -59,6 +60,11 @@ def _lit(s: str):
         return s.strip("'\"")
 
 
+def _unescape_nl(s):
+    """The dump writer escapes real newlines to a literal backslash-n before repr(): undo it."""
+    return s.replace("\\n", "\n") if isinstance(s, str) else s
+
+
 def parse_dump_lines(lines, stage: str = "after-clean-translate") -> list[dict]:
     """Block dict list in log order. Old format (no page field) and new format (| page=.. bubble_xyxy=[..] ...)."""
     out, in_stage = [], False
@@ -74,7 +80,8 @@ def parse_dump_lines(lines, stage: str = "after-clean-translate") -> list[dict]:
             continue
         ent = dict(
             line=ln_no, idx=int(m["idx"]), cls=m["cls"], bubble=m["bubble"] == "True",
-            box=[int(v) for v in m["box"].split(",")], text=_lit(m["text"]), trans=_lit(m["trans"]),
+            box=[int(v) for v in m["box"].split(",")], text=_unescape_nl(_lit(m["text"])),
+            trans=_unescape_nl(_lit(m["trans"])),
         )
         for k, v in _EXTRA_RE.findall(m["extra"] or ""):
             ent[k] = _lit(v) if v[:1] in "[\"'" else v
@@ -658,6 +665,26 @@ def _cmd_sheet(a):
 
 
 # ---------------------------------------------------------------------------------------------- CLI
+def _cmd_recut(a):
+    """Rebuild the safe-recut pieces of a raw chapter (local detector only, no API): the dump page names of a job that
+    ran with --safe-recut are 'recut-NNNNN.png'. Writes the pieces into --out (must be empty)."""
+    from modules.detection.factory import DetectionEngineFactory
+    from scripts.safe_recut import prepare
+
+    lb, args = make_args()
+    engine = DetectionEngineFactory.create_engine(lb.LocalSettings(args), args.detector)
+    engine.confidence_threshold = min(engine.confidence_threshold, 0.25)
+
+    def detect(image):
+        bubbles, texts = engine._detect_single_image(image)
+        return list(bubbles) + list(texts)
+
+    plan = prepare(lb.iter_images(Path(a.input)), Path(a.out), detect, target=args.recut_target_height,
+                   minimum=min(800, args.recut_target_height // 2),
+                   soft_max=max(args.recut_target_height, min(3600, args.recut_max_height)), hard_max=args.recut_max_height)
+    print(f"{len(plan.images)} pieces -> {a.out}")
+
+
 def _cmd_parse(a):
     lines = Path(a.log).read_text(encoding="utf-8", errors="replace").splitlines()
     start = 0
@@ -684,6 +711,10 @@ def main(argv=None) -> int:
     p.add_argument("--cache", required=True)
     p.add_argument("--out", required=True)
     p.set_defaults(fn=_cmd_parse)
+    p = sub.add_parser("recut")
+    p.add_argument("--input", required=True)
+    p.add_argument("--out", required=True)
+    p.set_defaults(fn=_cmd_recut)
     p = sub.add_parser("styles")
     p.add_argument("--dump", required=True)
     p.add_argument("--input", required=True)

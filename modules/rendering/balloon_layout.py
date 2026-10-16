@@ -80,7 +80,18 @@ def _contained_frac(a, b) -> float:
     return (ix * iy) / area if area > 0 else 0.0
 
 
-def group_by_balloon(bubbles: list, boxes: list) -> list[list[int]]:
+def _touching(a, b, gap: float) -> bool:
+    """Two balloon boxes stacked one above the other with at most `gap` px between them (or slightly overlapping) and
+    sharing >= 50 percent of the narrower width: the lobes of one balloon outline."""
+    top, low = (a, b) if a[1] <= b[1] else (b, a)
+    dy = low[1] - top[3]
+    if dy > gap or dy < -0.15 * min(a[3] - a[1], b[3] - b[1]):
+        return False
+    xo = min(a[2], b[2]) - max(a[0], b[0])
+    return xo >= 0.5 * min(a[2] - a[0], b[2] - b[0])
+
+
+def group_by_balloon(bubbles: list, boxes: list, touch_gap: float = 0.0) -> list[list[int]]:
     """Groups (>= 2 members, reading order) of blocks that sit in one balloon.
 
     bubbles[i] = balloon box of block i or None (free text); boxes[i] = text box. A block without a balloon box joins
@@ -110,6 +121,8 @@ def group_by_balloon(bubbles: list, boxes: list) -> list[list[int]]:
                 v = _iou(bi, bj)
                 if v >= 0.8:
                     union(i, j)
+                elif touch_gap > 0 and _touching(bi, bj, touch_gap):
+                    union(i, j)  # two balloon boxes of one outline (lobes) that merely touch
                 elif robust and v >= 0.3 and _inside(bi, centre(j)) and _inside(bj, centre(i)):
                     # the detector sized one balloon differently for two of its lettering blocks: each balloon box
                     # holds the other block's text, so it is the same balloon
@@ -176,6 +189,8 @@ def size_limits(sizes: list[int], caps: list[float], b: float | None = None) -> 
     if not ref:
         return [None] * len(sizes)
     med = statistics.median(ref)
+    if len(ref) == 2 and _flag("RENDER_PAIR_MIN"):
+        med = min(ref)  # the median of two is their mean: a 35/22 pair would stay 32/22 (two sizes in one balloon)
     hi = int(math.ceil(med * (1.0 + b)))
     return [None if is_emphasis(caps[i], [c for j, c in enumerate(caps) if j != i]) else hi for i in range(len(sizes))]
 

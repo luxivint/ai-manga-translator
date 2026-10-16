@@ -351,6 +351,8 @@ Out of the box `local_batch.py` and the worker use:
 | `OCR_MAX_FAIL_RATIO` | `0.0` | share of pages that may fail OCR/translation; above it the job exits 3 (`FAILED: OCR failed on N pages: [...]`) before publishing, raw pages kept, job retried. Raw is never deleted if any page failed |
 | `PASSTHROUGH_SUSPECT_RATIO` | `0.5` | fails the job when more than this share of pages with detected text bubbles ended with 0 blocks (OCR returned nothing) |
 | `WATERMARK_POLICY` | `clean` | `clean` erases competitor watermarks/banners whole (never the site's own brand); `keep` leaves them untouched |
+| `CLEAN_FILL_QA` | `true` | after LaMa, every filled component is measured against its untouched ring; objectively bad fills (dithered blue "static", pink/green speckle, grey stipple) get a calmer fill (tuning: `CLEAN_FILL_QA_NOISE/_NOISE_ABS/_CHROMA/_CHROMA_ABS/_BLOBS/_BLOB_RATIO/_MIN_AREA/_RING`) |
+| `CLEAN_RESIDUAL_PASS` | `true` | segments the cleaned page again and cleans text-like leftovers near cleaned blocks (small / rotated / UI text); `CLEAN_RESIDUAL_PASSES` (max 2), `_NEAR`, `_CONF`, `_MAX_FRAC`, `_MIN_CONTRAST`, `_GROW` |
 | `RENDER_V2`, `RENDER_STYLE_TAGS` | `true` | balloon- and style-aware typesetting |
 | `RENDER_BALLOON_UNIFY` | `true` | blocks sharing one balloon use one font and one size band (`RENDER_BALLOON_BAND`, default `0.12` = +-12% of the balloon median; blocks whose source cap height differs by more than `RENDER_EMPHASIS_RATIO`, default `1.4`, keep their size) and every line must lie inside the balloon interior; `false` = old per-block sizing |
 | `RENDER_MERGE_BALLOON` | `true` | a sentence the OCR split over several blocks of one balloon is laid out as one centred paragraph (separate speech, shouts/SFX and emphasis stay separate); also drops words repeated across the block boundary |
@@ -361,6 +363,14 @@ Out of the box `local_batch.py` and the worker use:
 | `RENDER_HARD_GUARD` | `true` | every balloon block keeps all line boxes (+2% clearance) inside the interior mask, shrinking the block (and so the balloon band) if needed |
 | `BLOCK_CONTAINMENT_PRUNE`, `BLOCK_CONTAINMENT_RATIO`, `BLOCK_TEXT_COVER` | `true`, `0.6`, `0.8` | before translation: a block >= 60% inside another block whose OCR words (>= 80%) the other already contains is dropped (the same text read twice at another scale; saves translation tokens) |
 | `RENDER_RESOLVE_OVERLAP` | `true` | rendered text boxes that overlap are pushed apart / shrunk; halo-text is drawn under other blocks |
+| `RENDER_MERGE_OCR_ECHO` | `true` | stacked OCR windows whose texts overlap at the seam (one paragraph read in overlapping pieces) become ONE paragraph, repeated leading words dropped |
+| `RENDER_STRIP_NEIGHBOR_LINES` | `true` | a piece cut from a merged UI block that repeats a neighbouring block's whole translation (title detected twice) is not drawn again |
+| `RENDER_STRICT_FIT`, `RENDER_STRICT_FLOOR` | `true`, `14` | crowded sign/phone/narration blocks (touching another block or cut from a merged OCR block) stay inside their OWN original box: shrink only, no growth, never pushed into neighbours; below the floor size they fall back to the normal fit |
+| `RENDER_TILT_FALLBACK` | `true` | diagonal source text stays diagonal: the tilt is read from the original ink when the cleaned-page mask gives none |
+| `RENDER_TINY_PX` | `14` | balloon text that ends below this size (at 800 px width) retries on its original text box inside the balloon box (`0` disables) |
+| `RENDER_SPIKY_GUARD` | `true` | a spiky / non-convex balloon interior (low convex-hull ratio) is trusted for the hard line-inside check, so lettering cannot cross its outline (never shrunk below 70%) |
+| `LIGHT_RENDER_CLEAR_PAD_X`, `LIGHT_RENDER_CLEAR_PAD_Y` | `16`, `10` | padding of the free-text white wipe around a block's box |
+| `LIGHT_RENDER_CLEAR_LOCAL_BG`, `LIGHT_RENDER_CLEAR_MAX_STD`, `LIGHT_RENDER_CLEAR_BG_SIGMA` | `true`, `22`, `18` | the wipe repaints with the local backdrop colour (follows gradients, no grey rectangle), skips non-plain zones and never paints over long thin lines / big dark areas; `LOCAL_BG=false` = old single-median fill |
 
 Set the matching environment variable to override any of them, for example `BATCH_PIPELINE=false`.
 

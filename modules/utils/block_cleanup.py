@@ -183,3 +183,93 @@ def overlap_groups(boxes, min_frac: float = 0.3) -> list[list[int]]:
     for i in range(n):
         gs.setdefault(find(i), []).append(i)
     return [g for g in gs.values() if len(g) >= 2]
+
+
+# ---------------------------------------------------------------------------- OCR echo chains
+def echo_merge_enabled() -> bool:
+    return _flag("RENDER_MERGE_OCR_ECHO")
+
+
+def _word_match(a: str, b: str) -> bool:
+    return a == b or (len(a) >= 4 and len(b) >= 4 and difflib.SequenceMatcher(None, a, b).ratio() >= 0.84)
+
+
+def ocr_overlap_words(prev_text: str, next_text: str, max_words: int = 6) -> int:
+    """How many words end `prev_text` AND start `next_text` (an OCR window that re-read the previous window's tail).
+    A single shared word only counts when it is long (>= 5 letters)."""
+    pw, nw = words(prev_text), words(next_text)
+    for n in range(min(max_words, len(pw), len(nw)), 0, -1):
+        if all(_word_match(a, b) for a, b in zip(pw[-n:], nw[:n])):
+            if n >= 2 or len(nw[0]) >= 5:
+                return n
+    return 0
+
+
+def overlap_chain_groups(boxes, texts, min_x_overlap: float = 0.5, gap_ratio: float = 0.8) -> list[list[int]]:
+    """Index groups (top to bottom) of stacked blocks whose OCR texts overlap at the seam: the detector cut one
+    paragraph into windows and each window's OCR repeated the neighbour's boundary words. Geometry must also fit:
+    the boxes share a column and the vertical gap is small compared with their height."""
+    n = len(boxes)
+    order = sorted(range(n), key=lambda k: (boxes[k][1], boxes[k][0]))
+    owner = list(range(n))
+
+    def find(i):
+        while owner[i] != i:
+            owner[i] = owner[owner[i]]
+            i = owner[i]
+        return i
+
+    for a_pos, i in enumerate(order):
+        for j in order[a_pos + 1:]:
+            if boxes[j][1] > boxes[i][3] + 4 * max(boxes[i][3] - boxes[i][1], 1.0):
+                break
+            wi, wj = boxes[i][2] - boxes[i][0], boxes[j][2] - boxes[j][0]
+            xo = max(0.0, min(boxes[i][2], boxes[j][2]) - max(boxes[i][0], boxes[j][0])) / max(1.0, min(wi, wj))
+            hmin = min(boxes[i][3] - boxes[i][1], boxes[j][3] - boxes[j][1])
+            gap = boxes[j][1] - boxes[i][3]
+            if xo < min_x_overlap or gap > gap_ratio * hmin + 8:
+                continue
+            if ocr_overlap_words(texts[i], texts[j]) > 0:
+                owner[find(i)] = find(j)
+    gs: dict[int, list[int]] = {}
+    for k in order:
+        gs.setdefault(find(k), []).append(k)
+    return [g for g in gs.values() if len(g) >= 2]
+
+
+def dedupe_overlap_translation(prev: str, nxt: str, max_drop: int) -> str:
+    """`nxt` without up to `max_drop` leading words that `prev` already says (same stem: first 5 letters, words of >= 4
+    letters only so connectives like 've' are never eaten). At least one word is always kept."""
+    pw, nw = prev.split(), nxt.split()
+    pstems = {fold(re.sub(r"[^\w]+", "", w))[:5] for w in pw if len(fold(re.sub(r"[^\w]+", "", w))) >= 4}
+    drop = 0
+    while drop < min(max_drop, len(nw) - 1):
+        f = fold(re.sub(r"[^\w]+", "", nw[drop]))
+        if len(f) >= 4 and f[:5] in pstems:
+            drop += 1
+        else:
+            break
+    return " ".join(nw[drop:])
+
+
+# ---------------------------------------------------------------------------- piece of a split block that repeats a neighbour
+def strip_line_enabled() -> bool:
+    return _flag("RENDER_STRIP_NEIGHBOR_LINES")
+
+
+def split_piece_duplicates(translations, boxes, is_piece, max_dy: float = 320.0) -> list[int]:
+    """Indices of split pieces (is_piece[i]) whose whole translation repeats another block's translation (a title that
+    was detected twice: alone, and again as the first line of a merged UI block). The other block still draws these
+    words, so dropping the piece loses nothing. Only blocks within `max_dy` px vertically count as 'the same title'."""
+    drop: list[int] = []
+    norm = ["".join(words(t)) for t in translations]
+    for i, piece in enumerate(is_piece):
+        if not piece or len(norm[i]) < 6:
+            continue
+        for j in range(len(translations)):
+            if j == i or j in drop or len(norm[j]) < 6 or abs(boxes[i][1] - boxes[j][1]) > max_dy:
+                continue
+            if norm[i] == norm[j] or (len(norm[j]) >= len(norm[i]) and norm[i] in norm[j]) or                     difflib.SequenceMatcher(None, norm[i], norm[j]).ratio() >= 0.92:
+                drop.append(i)
+                break
+    return drop
