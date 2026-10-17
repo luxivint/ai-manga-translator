@@ -241,13 +241,14 @@ class GPTTranslation(BaseLLMTranslation):
                 data=json.dumps(payload),
                 timeout=self.timeout,
                 kind="translate",
+                cache="manual",  # committed by translate_keyed once the answer parsed
             )
             if response.status_code == 400 and "temperature" in response.text.lower():
                 # some models only accept the default sampling parameters: retry without them
                 payload = {k: v for k, v in payload.items() if k not in ("temperature", "top_p")}
                 response = gateway.resilient_post(self.api_base_url, headers=headers,
                                                   data=json.dumps(payload), timeout=self.timeout,
-                                                  kind="translate")
+                                                  kind="translate", cache="manual")
 
             response.raise_for_status()
             response_data = response.json()

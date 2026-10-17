@@ -9,6 +9,7 @@ import imkit as imk
 from ..base import LLMTranslation
 from ...utils.textblock import TextBlock
 import json
+from modules.utils import gateway
 from ...utils.translator_utils import (
     apply_translation_json, get_raw_text, redistribute_lines, set_texts_from_json, translation_temperature,
 )
@@ -99,9 +100,15 @@ class BaseLLMTranslation(LLMTranslation):
         finally:
             self.max_tokens = saved
         m = re.search(r"\{[\s\S]*\}", content or "")
-        if not m:
-            raise RuntimeError(f"no JSON in the translation response (len={len(content or '')})")
-        return json.loads(m.group(0))
+        try:
+            if not m:
+                raise RuntimeError(f"no JSON in the translation response (len={len(content or '')})")
+            parsed = json.loads(m.group(0))
+        except Exception:
+            gateway.cache_discard()  # a bad answer (also a cached one) is asked again next time
+            raise
+        gateway.cache_commit()
+        return parsed
 
     # ---------------------------------------------------------------- line-count enforcement
     @staticmethod

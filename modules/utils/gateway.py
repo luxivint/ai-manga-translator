@@ -26,6 +26,8 @@ from typing import Callable
 
 import requests
 
+from modules.utils import gateway_cache
+
 
 class GatewayError(RuntimeError):
     """The gateway call failed after all retries (as opposed to answering with nothing)."""
@@ -214,11 +216,70 @@ def _short(text: str, limit: int = 200) -> str:
     return text if len(text) <= limit else text[:limit] + "..."
 
 
+_CACHE_STATE = threading.local()
+
+
+def cache_commit() -> bool:
+    """Store the answer of this thread's last `cache="manual"` call (the caller has validated it)."""
+    pending = getattr(_CACHE_STATE, "pending", None)
+    if not pending:
+        return False
+    key, kind, body = pending
+    _CACHE_STATE.pending = None
+    _CACHE_STATE.committed = key
+    return gateway_cache.put(key, kind, body)
+
+
+def cache_discard() -> None:
+    """The caller rejected the last answer (missing keys, suspicious OCR): forget it so a retry asks again."""
+    pending = getattr(_CACHE_STATE, "pending", None)
+    committed = getattr(_CACHE_STATE, "committed", None)
+    _CACHE_STATE.pending = None
+    _CACHE_STATE.committed = None
+    for key in (pending[0] if pending else None, committed):
+        if key:
+            gateway_cache.drop(key)
+
+
 def resilient_post(url: str, *, headers: dict, data, timeout: float, kind: str = "api",
                    limiter: AdaptiveLimiter | None = None, breaker: CircuitBreaker | None = None,
-                   backoffs: tuple[float, ...] | None = None, post=None, sleep=None, rand=None):
+                   backoffs: tuple[float, ...] | None = None, post=None, sleep=None, rand=None,
+                   cache: str | None = None):
     """POST with retry/backoff + circuit breaker. Returns a response (2xx with a decodable JSON body, or a
-    non-retryable 4xx). Raises GatewayError once every attempt failed transiently."""
+    non-retryable 4xx). Raises GatewayError once every attempt failed transiently.
+
+    cache=None: no local cache. cache="auto": a stored answer for the identical request is returned without any network
+    call and every good answer is stored. cache="manual": same lookup, but the answer is stored only when the caller
+    calls `cache_commit()` after validating it (`cache_discard()` if it turns out bad). See gateway_cache."""
+    _CACHE_STATE.pending = None
+    _CACHE_STATE.committed = None
+    cache_key = None
+    if cache and gateway_cache.enabled():
+        cache_key = gateway_cache.make_key(kind, url, data)
+        hit = gateway_cache.get(cache_key)
+        if hit is not None:
+            _CACHE_STATE.committed = cache_key
+            print(f"  [gateway-cache] hit kind={kind} (no request sent)", flush=True)
+            return hit
+    resp = _resilient_post(url, headers=headers, data=data, timeout=timeout, kind=kind, limiter=limiter,
+                           breaker=breaker, backoffs=backoffs, post=post, sleep=sleep, rand=rand)
+    if cache_key is not None and getattr(resp, "status_code", 0) == 200:
+        try:
+            body = resp.json()
+        except ValueError:
+            body = None
+        if isinstance(body, dict):
+            if cache == "auto":
+                gateway_cache.put(cache_key, kind, body)
+                _CACHE_STATE.committed = cache_key
+            else:
+                _CACHE_STATE.pending = (cache_key, kind, body)
+    return resp
+
+
+def _resilient_post(url: str, *, headers: dict, data, timeout: float, kind: str = "api",
+                    limiter: AdaptiveLimiter | None = None, breaker: CircuitBreaker | None = None,
+                    backoffs: tuple[float, ...] | None = None, post=None, sleep=None, rand=None):
     post = post or _post
     sleep = sleep or _sleep
     rand = rand or _rand

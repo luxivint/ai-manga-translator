@@ -98,6 +98,7 @@ class QwenGridOCR(OCREngine):
                     timeout=int(os.environ.get("QWEN_GRID_OCR_TIMEOUT", "90")),
                     kind="ocr",
                     limiter=gateway.ocr_limiter(),
+                    cache="manual",  # identical crop sheet + prompt -> stored answer, no new request
                 )
             except GatewayError as exc:
                 print(f"Qwen grid OCR failed: {exc}", flush=True)
@@ -111,7 +112,10 @@ class QwenGridOCR(OCREngine):
             content = ((data.get("choices") or [{}])[0].get("message") or {}).get("content") or ""
             parsed = self._parse_json(content)
             if not self._looks_like_failed_batch(parsed, len(id_to_idx)):
+                if parsed or self._is_valid_empty_answer(content):
+                    gateway.cache_commit()
                 break
+            gateway.cache_discard()  # a suspicious answer must never be replayed from the cache
             if attempt < max_attempts:
                 print(
                     f"Qwen grid OCR retry {attempt}/{max_attempts}: suspicious empty result "
@@ -121,6 +125,7 @@ class QwenGridOCR(OCREngine):
 
         if not parsed and not self._is_valid_empty_answer(content):
             # no JSON list at all (empty / prose / cut-off stream): that is a failed read, not "no text"
+            gateway.cache_discard()
             raise OCRFailedError(f"OCR answer is not parseable JSON (len={len(content)})")
 
         for item in parsed:

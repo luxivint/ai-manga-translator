@@ -678,10 +678,11 @@ def build_segmenter_mask(image: np.ndarray, blocks=None, require_translation: bo
     allowed_mask = None
     text_boxes = None
 
-    segmenter = _get_segmenter()
-    seg, fine = _tiled_segment(segmenter, image, conf)
-    if seg.sum() == 0 and blocks is None:
-        return seg
+    seg = fine = None
+    if blocks is None:
+        seg, fine = _tiled_segment(_get_segmenter(), image, conf)
+        if seg.sum() == 0:
+            return seg
 
     # Temizleme kriteri = render kriteri: SADECE yazısı basılacak (çevirisi olan)
     # blokların bölgesini temizle. Çevirisi olmayan balon hiç dokunulmaz ->
@@ -740,7 +741,8 @@ def build_segmenter_mask(image: np.ndarray, blocks=None, require_translation: bo
             if not getattr(blk, "is_ad", False):
                 target_boxes.append((x1, y1, x2, y2))
         if not has_target:
-            return wm_clear
+            return wm_clear  # nothing to clean: the (GPU) segmenter is not needed at all
+        seg, fine = _tiled_segment(_get_segmenter(), image, conf)
         # Detector kutusu bir satırın yalnızca bir kısmını kapsıyorsa (ör. baştaki
         # harfler kutu dışında kalır) satırı tamamla: kutuyla yeterince örtüşen
         # segmenter bileşenini bütün olarak kabul et. Kutuyla ilgisiz metin
@@ -810,6 +812,7 @@ def block_inpaint(image: np.ndarray, mask: np.ndarray, config) -> np.ndarray:
     lama = _get_lama()
     result = image.copy()
     n, labels = cv2.connectedComponents((mask > 0).astype(np.uint8))
+    jobs = []
     for lbl in range(1, n):
         ys, xs = np.where(labels == lbl)
         if len(ys) < 10:
@@ -823,21 +826,37 @@ def block_inpaint(image: np.ndarray, mask: np.ndarray, config) -> np.ndarray:
         cmask = mask[cy1:cy2, cx1:cx2].copy()
         if cmask.sum() == 0:
             continue
+        jobs.append((cy1, cy2, cx1, cx2, crop, cmask))
+
+    def fill(job):
+        # depends only on the ORIGINAL crop + mask, so the crops of one page can run concurrently
+        crop, cmask = job[4], job[5]
         out = imk.convert_scale_abs(lama(crop, cmask, config))
         cm = cmask > 0
         if os.environ.get("CLEAN_LAMA_BLEND", "true").lower() == "true":
-            # LaMa dolgusu çoğu zaman zeminden hafif ton kayar (açık/koyu kutu
-            # artefaktı) ve maske kenarında sert dikdörtgen bırakır: maske
-            # çevresindeki halkadan ton farkını düzelt + kenarı yumuşat.
-            ring = (cv2.dilate(cm.astype(np.uint8), cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (15, 15))) > 0) & ~cm
-            band = cm & ~(cv2.erode(cm.astype(np.uint8), cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9, 9))) > 0)
-            if os.environ.get("CLEAN_LAMA_COLOR_MATCH", "false").lower() == "true" and ring.sum() >= 30 and band.sum() >= 30:
+            if os.environ.get("CLEAN_LAMA_COLOR_MATCH", "false").lower() == "true":
                 # Dolgunun kenar bandı ile dışındaki orijinal halka arasındaki ton farkı
-                off = np.median(crop[ring].astype(np.float32), axis=0) - np.median(out[band].astype(np.float32), axis=0)
-                out = np.clip(out.astype(np.float32) + np.clip(off, -40, 40), 0, 255).astype(np.uint8)
+                ring = (cv2.dilate(cm.astype(np.uint8), cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (15, 15))) > 0) & ~cm
+                band = cm & ~(cv2.erode(cm.astype(np.uint8), cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9, 9))) > 0)
+                if ring.sum() >= 30 and band.sum() >= 30:
+                    off = np.median(crop[ring].astype(np.float32), axis=0) - np.median(out[band].astype(np.float32), axis=0)
+                    out = np.clip(out.astype(np.float32) + np.clip(off, -40, 40), 0, 255).astype(np.uint8)
             # Düz parlak iç yüzeylerde (balon/kutu/gökyüzü) ton + doku eşleme: LaMa'nın pürüzsüz/ton kaymış
             # dolgusu kâğıt greniyle uyuşmayan gri dikdörtgen bırakır (CLEAN_PATCH_MATCH=false ile kapanır).
             out = patch_match.refine_fill(crop, out, cm)
+        return out, cm
+
+    # CLEAN_LAMA_THREADS crops in flight (default 2; 1 = sequential). Results are composited in the original order.
+    workers = max(1, min(len(jobs), int(os.environ.get("CLEAN_LAMA_THREADS", "2") or 2)))
+    if workers > 1:
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            filled = list(pool.map(fill, jobs))
+    else:
+        filled = [fill(j) for j in jobs]
+    for (cy1, cy2, cx1, cx2, _crop, _cmask), (out, cm) in zip(jobs, filled):
+        if os.environ.get("CLEAN_LAMA_BLEND", "true").lower() == "true":
+            # LaMa dolgusu çoğu zaman zeminden hafif ton kayar ve maske kenarında sert dikdörtgen bırakır:
+            # maske kenarını yumuşat.
             alpha = np.maximum(cm.astype(np.float32), cv2.GaussianBlur(cm.astype(np.float32), (0, 0), float(os.environ.get("CLEAN_LAMA_FEATHER", "2.5"))))
             base = result[cy1:cy2, cx1:cx2].astype(np.float32)
             result[cy1:cy2, cx1:cx2] = np.clip(base * (1 - alpha[..., None]) + out.astype(np.float32) * alpha[..., None], 0, 255).astype(np.uint8)
@@ -998,6 +1017,7 @@ def recover_empty_bubble_text_with_gpt(image: np.ndarray, blocks, args: argparse
         response = gateway.resilient_post(
             get_openai_chat_completions_url(),
             kind="ocr-empty-bubble",
+            cache="auto",
             limiter=gateway.ocr_limiter(),
             headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
             data=json.dumps(
@@ -1307,7 +1327,7 @@ def debug_dump_items(page: str, items: list) -> None:
               f"{round(float(d.get('height', 0)))}] style={dbg.get('style')} bub={dbg.get('bub')} text={text!r} | page={page}", flush=True)
 
 
-def bubble_outline_protection_mask(image: np.ndarray, blocks) -> np.ndarray:
+def _bubble_outline_protection_mask_impl(image: np.ndarray, blocks) -> np.ndarray:
     if os.environ.get("PROTECT_BUBBLE_OUTLINES", "true").lower() != "true":
         return np.zeros(image.shape[:2], dtype=bool)
 
@@ -1385,6 +1405,25 @@ def bubble_outline_protection_mask(image: np.ndarray, blocks) -> np.ndarray:
         protect[by1:by2, bx1:bx2] = np.maximum(protect[by1:by2, bx1:bx2], component_mask)
 
     return protect > 0
+
+
+_PROTECT_MEMO = threading.local()
+
+
+def bubble_outline_protection_mask(image: np.ndarray, blocks) -> np.ndarray:
+    """Same result as the impl; the mask depends only on the original page and the block geometry, and one page asks for
+    it twice (segmenter mask, residual pass), so the last answer of this thread is reused (identical object -> identical
+    pixels). A copy is returned so callers may modify it."""
+    key = (image.shape, tuple((getattr(b, "text_class", None),
+                               tuple(int(v) for v in getattr(b, "xyxy", (0, 0, 0, 0))),
+                               None if getattr(b, "bubble_xyxy", None) is None
+                               else tuple(int(v) for v in b.bubble_xyxy)) for b in blocks))
+    memo = getattr(_PROTECT_MEMO, "last", None)
+    if memo is not None and memo[0] is image and memo[1] == key:
+        return memo[2].copy()
+    result = _bubble_outline_protection_mask_impl(image, blocks)
+    _PROTECT_MEMO.last = (image, key, result)
+    return result.copy()
 
 
 def restore_protected_pixels(original: np.ndarray, edited: np.ndarray, protect_mask: np.ndarray) -> np.ndarray:
@@ -2081,6 +2120,7 @@ def detect_ad_regions(pending: list, args: argparse.Namespace) -> dict:
             resp = gateway.resilient_post(
                 get_openai_chat_completions_url(),
                 kind="vision",
+                cache="auto",
                 headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
                 data=json.dumps({
                     "model": model,
@@ -2215,6 +2255,7 @@ def _batch_translate_all(page_results: list, args: argparse.Namespace) -> None:
             missing = [k for k in batch_keys if k not in batch_result]
             if not missing:
                 return batch_result
+            gateway.cache_discard()  # keys lost / shifted: never replay this answer from the cache
             # A key missing from the answer means the model lost track of the blocks (merged two, shifted the
             # rest up by one): the keys that DID come back are not trustworthy either. Keep only the fullest
             # partial answer as a last resort and re-ask for the WHOLE batch with an explicit order rule.

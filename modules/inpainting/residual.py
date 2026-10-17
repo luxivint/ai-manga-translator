@@ -94,6 +94,31 @@ def translated_boxes(blocks, h: int, w: int, pad: int = 6, max_frac: float = 0.2
     return out
 
 
+class _NearMask:
+    """`cv2.dilate(first_mask, ellipse(2r+1))[comp].any()` without the (very slow) full-page 301x301 dilation.
+
+    A Euclidean distance transform decides every component whose closest pixel is clearly inside (d <= r - 0.5: the
+    ellipse always covers it) or clearly outside (d > r + 1: it can never reach); only the thin borderline band is
+    resolved with the real dilation on that component's window, so the answer is identical to the full dilation."""
+
+    def __init__(self, first_mask: np.ndarray, radius: int):
+        self.fm = (first_mask > 0).astype(np.uint8)
+        self.r = radius
+        self.dist = cv2.distanceTransform((self.fm == 0).astype(np.uint8), cv2.DIST_L2, cv2.DIST_MASK_PRECISE)
+        self.kernel = _ell(2 * radius + 1)
+
+    def any_near(self, x: int, y: int, cw: int, ch: int, comp: np.ndarray) -> bool:
+        d = float(self.dist[y:y + ch, x:x + cw][comp].min())
+        if d <= self.r - 0.5:
+            return True
+        if d > self.r + 1.0:
+            return False
+        h, w = self.fm.shape
+        y0, y1, x0, x1 = max(0, y - self.r), min(h, y + ch + self.r), max(0, x - self.r), min(w, x + cw + self.r)
+        win = cv2.dilate(np.ascontiguousarray(self.fm[y0:y1, x0:x1]), self.kernel) > 0
+        return bool(win[y - y0:y - y0 + ch, x - x0:x - x0 + cw][comp].any())
+
+
 def select_components(seg: np.ndarray, cleaned: np.ndarray, first_mask: np.ndarray, exclude: np.ndarray,
                       protected: np.ndarray | None = None, debug: list | None = None) -> tuple[np.ndarray, int]:
     """Accepted text-like coarse components (uint8 mask 0/255) and how many there are. Pure function (testable with a
@@ -102,7 +127,7 @@ def select_components(seg: np.ndarray, cleaned: np.ndarray, first_mask: np.ndarr
     near_px = int(_f("CLEAN_RESIDUAL_NEAR", 150))
     max_frac = _f("CLEAN_RESIDUAL_MAX_FRAC", 0.25)
     min_con = _f("CLEAN_RESIDUAL_MIN_CONTRAST", 28.0)
-    near = cv2.dilate((first_mask > 0).astype(np.uint8), _ell(2 * near_px + 1)) > 0
+    near = _NearMask(first_mask, near_px)
     lab = cv2.cvtColor(cleaned, cv2.COLOR_RGB2LAB).astype(np.float32)
     grouped = cv2.dilate((seg > 0).astype(np.uint8), _ell(9))
     n, labels, stats, _ = cv2.connectedComponentsWithStats(grouped, connectivity=8)
@@ -116,7 +141,7 @@ def select_components(seg: np.ndarray, cleaned: np.ndarray, first_mask: np.ndarr
         if s_roi.sum() < 30:
             why((x, y, cw, ch), 'tiny')
             continue
-        if not near[y:y + ch, x:x + cw][comp].any():
+        if not near.any_near(x, y, cw, ch, comp):
             why((x, y, cw, ch), 'far')
             continue
         if exclude[y:y + ch, x:x + cw][s_roi].mean() > 0.3:

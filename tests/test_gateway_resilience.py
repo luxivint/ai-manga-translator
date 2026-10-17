@@ -227,6 +227,11 @@ class LimiterTests(unittest.TestCase):
 
 
 class OCREngineTests(unittest.TestCase):
+    def setUp(self):  # these tests count requests: the on-disk answer cache must not serve them
+        env = mock.patch.dict("os.environ", {"GATEWAY_CACHE": "false"})
+        env.start()
+        self.addCleanup(env.stop)
+
     def make_engine(self):
         from modules.ocr.qwen_grid_ocr import OpenAICompatibleGridOCR
         eng = OpenAICompatibleGridOCR()

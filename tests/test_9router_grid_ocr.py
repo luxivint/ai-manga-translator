@@ -47,6 +47,7 @@ class NineRouterGridOCRTests(unittest.TestCase):
                 "OPENAI_MODEL": "cx/gpt-6-luna",
                 "OPENAI_API_KEY": "router-key",
                 "QWEN_GRID_OCR_USAGE_PATH": "",
+                "GATEWAY_CACHE": "false",
             },
             clear=True,
         ):

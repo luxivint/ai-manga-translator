@@ -355,6 +355,7 @@ Bu komut torch/torchvision'ın CUDA 13 sürümlerini ve `onnxruntime-gpu`'yu kur
 | `BATCH_WORKERS` | `3` | detect+OCR ve temizleme aşamaları için thread havuzu tabanı |
 | `BATCH_WORKERS_AUTO` / `BATCH_WORKERS_MAX` | `true` / `4` | auto açıkken CPU boşta (<%35) ise taban +1, meşgulse (>%80) -1 olur, `BATCH_WORKERS_MAX` değerini aşmaz; günlükte `[CPU n%] worker: 3 -> 4` görünür. Tam `BATCH_WORKERS` için `BATCH_WORKERS_AUTO=false` |
 | `BATCH_TRANSLATE_CONCURRENCY` | `3` | paralel GPT çeviri çağrısı (her çağrı 3 sayfa); `1` = sıralı; gateway devre kesici açıkken 1'e düşer |
+| `GATEWAY_CACHE` | `true` | OCR / çeviri / vision çağrıları için diskte yanıt önbelleği (`GATEWAY_CACHE_DIR`, varsayılan `work/cache/gateway`, `GATEWAY_CACHE_TTL_DAYS` 30); birebir aynı istek tekrarlanırsa (retry / yeniden çalıştırma) istek gitmez, token harcanmaz. Sadece kabul edilen yanıtlar saklanır; sır yok |
 | `OCR_CONCURRENCY` | `2` | aynı anda uçuşta olabilecek OCR isteği sayısı (`BATCH_WORKERS`'tan bağımsız) |
 | `GATEWAY_BACKOFFS` | `3,8,20` | OCR, çeviri ve vision çağrılarında 5xx/429/zaman aşımı için bekleme süreleri (sn, jitter'lı); art arda 3 hata 20 sn -> 60 sn ortak bekleme açar |
 | `OCR_MAX_FAIL_RATIO` | `0.0` | OCR/çeviri hatası verebilecek sayfa oranı; aşılırsa iş yayınlanmadan 3 koduyla düşer (`FAILED: OCR failed on N pages`), ham sayfalar silinmez, iş yeniden denenir |

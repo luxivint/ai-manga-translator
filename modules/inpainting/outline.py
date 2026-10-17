@@ -181,6 +181,12 @@ def glyph_pieces(cleaned: np.ndarray, done: np.ndarray, exclude: np.ndarray, pro
     reach = int(_f("CLEAN_OUTLINE_REACH", 24))
     con = _f("CLEAN_FRINGE_CONTRAST", 40.0)
     max_side = int(_f("CLEAN_FRINGE_MAX", 160))
+    neighbour = int(_f("CLEAN_OUTLINE_NEIGHBOUR", 60))
+    # Candidates must lie within `reach` of `done` AND within `neighbour` of an outline: when the closest outline pixel is
+    # further than both radii (+ ellipse rounding) from every cleaned pixel nothing can qualify, so skip the heavy work.
+    dist_to_outline = cv2.distanceTransform((protected == 0).astype(np.uint8), cv2.DIST_L2, cv2.DIST_MASK_PRECISE)
+    if float(dist_to_outline[done > 0].min()) > reach + neighbour + 3:
+        return keep, bands, 0
     near = cv2.dilate((done > 0).astype(np.uint8), _ell(2 * reach + 1)) > 0
     ys, xs = np.nonzero(near)
     pad = 60
@@ -202,7 +208,7 @@ def glyph_pieces(cleaned: np.ndarray, done: np.ndarray, exclude: np.ndarray, pro
     sh, sw = sub.shape[:2]
     # only ink within reach of a protected outline is ours (it may be glued to the outline or hover right next to it);
     # leftovers elsewhere belong to the fringe pass
-    cand &= cv2.dilate(prot.astype(np.uint8), _ell(2 * int(_f("CLEAN_OUTLINE_NEIGHBOUR", 60)) + 1)) > 0
+    cand &= cv2.dilate(prot.astype(np.uint8), _ell(2 * neighbour + 1)) > 0
     sh, sw = sub.shape[:2]
     nd, dlab, dst, _ = cv2.connectedComponentsWithStats(
         cv2.dilate((done[y0:y1, x0:x1] > 0).astype(np.uint8), _ell(9)), connectivity=8)

@@ -346,6 +346,7 @@ Out of the box `local_batch.py` and the worker use:
 | `BATCH_WORKERS` | `3` | thread-pool base for detect+OCR and clean phases |
 | `BATCH_WORKERS_AUTO` / `BATCH_WORKERS_MAX` | `true` / `4` | with auto on, the base goes +1 when the CPU is idle (<35%) and -1 when busy (>80%), never above `BATCH_WORKERS_MAX`; the log shows `[CPU n%] worker: 3 -> 4`. Set `BATCH_WORKERS_AUTO=false` for exactly `BATCH_WORKERS` |
 | `BATCH_TRANSLATE_CONCURRENCY` | `3` | parallel GPT translate calls (each call is 3 pages); `1` = sequential; drops to 1 while the gateway breaker is open |
+| `GATEWAY_CACHE` | `true` | on-disk answer cache (`GATEWAY_CACHE_DIR`, default `work/cache/gateway`, `GATEWAY_CACHE_TTL_DAYS` 30) for OCR / translate / vision calls keyed by the exact request; retries and re-runs of the same pages send no request and spend no tokens. Only accepted answers are stored; no secrets |
 | `OCR_CONCURRENCY` | `2` | process-wide cap of OCR requests in flight (independent of `BATCH_WORKERS`) |
 | `GATEWAY_BACKOFFS` | `3,8,20` | retry delays (s, with jitter) for 5xx/429/timeouts on OCR, translate and vision calls; 3 consecutive failures open a shared 20 s -> 60 s cool-down |
 | `OCR_MAX_FAIL_RATIO` | `0.0` | share of pages that may fail OCR/translation; above it the job exits 3 (`FAILED: OCR failed on N pages: [...]`) before publishing, raw pages kept, job retried. Raw is never deleted if any page failed |
