@@ -292,6 +292,116 @@ def _groups(m: np.ndarray):
         yield (y0, y1, x0, x1), comp, m[y0:y1, x0:x1] & ~comp
 
 
+def flat_modes(lab: np.ndarray, ring: np.ndarray) -> tuple[np.ndarray, float] | None:
+    """Flat colours (Lab, <= 3 modes of >= 10 % share) of the ring and how much of the ring they explain, or None."""
+    px = lab[ring]
+    if len(px) < 150:
+        return None
+    q = np.round(px / 4.0).astype(np.int32)
+    keys, inv, cnt = np.unique(q, axis=0, return_inverse=True, return_counts=True)
+    order = np.argsort(-cnt)[:3]
+    modes = [np.median(px[inv.ravel() == o], axis=0) for o in order if cnt[o] >= 0.10 * len(px)]
+    if not modes:
+        return None
+    modes = np.array(modes)
+    d = np.min(np.linalg.norm(px[:, None, :] - modes[None], axis=2), axis=1)
+    return modes, float((d <= 5.0).mean())
+
+
+def _run_labels(comp: np.ndarray, lab: np.ndarray, modes: np.ndarray, hole: np.ndarray, reach: int = 40) -> np.ndarray:
+    """Per masked pixel: index of the flat colour that BOTH ends of its horizontal run of masked pixels agree on (the
+    pixels `skip` px outside the run; -1 when they disagree / are not one of the flat colours / the run touches the
+    crop). This keeps a tone step (white band over grey) a straight line through the hole."""
+    H, W = comp.shape
+    d = np.linalg.norm(lab[:, :, None, :] - modes[None, None], axis=3)
+    near = np.where(d.min(2) <= 6.0, d.argmin(2), -1)
+    near[hole] = -1
+    out = np.full((H, W), -1, np.int16)
+    for y in range(H):
+        row = comp[y]
+        if not row.any():
+            continue
+        e = np.diff(np.concatenate([[0], row.astype(np.int8), [0]]))
+        for a, b in zip(np.nonzero(e == 1)[0], np.nonzero(e == -1)[0]):
+            la = lb_ = -1
+            for x in range(a - 1, max(-1, a - 1 - reach), -1):
+                if near[y, x] >= 0:
+                    la = near[y, x]
+                    break
+            for x in range(b, min(W, b + reach)):
+                if near[y, x] >= 0:
+                    lb_ = near[y, x]
+                    break
+            if la >= 0 and la == lb_:
+                out[y, a:b] = la
+    return out
+
+
+def flat_snap(cleaned: np.ndarray, mask: np.ndarray, skip: np.ndarray | None = None) -> tuple[np.ndarray, dict]:
+    """Ghost removal: a balloon / flat panel is one flat colour, a LaMa fill inside it must be too. When the ring around a
+    filled group is flat (<= 3 colours explain >= CLEAN_FLAT_COVER of it) every filled pixel within CLEAN_FLAT_TOL (Lab
+    distance, default 14) of one of these colours snaps to the nearest one. Pixels further away (outline, art) stay.
+    Knobs: CLEAN_FLAT_SNAP (true), CLEAN_FLAT_TOL, CLEAN_FLAT_COVER (0.8)."""
+    rep = dict(groups=0, snapped=0)
+    if os.environ.get("CLEAN_FLAT_SNAP", "true").strip().lower() in ("false", "0", "no", "off") or mask is None or not (mask > 0).any():
+        return cleaned, rep
+    tol, cover = _f("CLEAN_FLAT_TOL", 14.0), _f("CLEAN_FLAT_COVER", 0.8)
+    out = cleaned.copy()
+    try:
+        for (y0, y1, x0, x1), comp, others in _groups(mask > 0):
+            if skip is not None and (skip[y0:y1, x0:x1] > 0)[comp].mean() > 0.3:
+                continue
+            c8 = comp.astype(np.uint8)
+            ring = (cv2.dilate(c8, _ell(31)) > 0) & ~(cv2.dilate(c8, _ell(5)) > 0) & ~others
+            lab = _lab(cleaned[y0:y1, x0:x1])
+            ring &= ~_strong_edges(lab[..., 0])
+            res = flat_modes(lab, ring)
+            if res is None or res[1] < cover:
+                continue
+            modes, _cov = res
+            rgb = np.array([_from_lab(m_.reshape(1, 1, 3).astype(np.float32))[0, 0] for m_ in modes], np.float32)
+            # LaMa's feathered edge ends a few px outside the mask: the halo (small deviations only) is snapped as well
+            reg = cv2.dilate(c8, _ell(2 * int(_f("CLEAN_FLAT_HALO", 8)) + 1)) > 0
+            reg &= ~others | comp
+            reg &= ~_strong_edges(lab[..., 0], 12.0) | comp
+            # which flat colour a pixel belongs to is decided on the median-filtered fill (LaMa's mottling must not flip
+            # a pixel across a tone step); undecided pixels take the nearest decided colour (run ends / flat ring)
+            lab_med = _lab(cv2.medianBlur(np.ascontiguousarray(cleaned[y0:y1, x0:x1]), 25))
+            dm_all = np.linalg.norm(lab_med[reg][:, None, :] - modes[None], axis=2)
+            j, dmed = dm_all.argmin(1), dm_all.min(1)
+            rl = _run_labels(reg, lab, modes, cv2.dilate(reg.astype(np.uint8), _ell(5)) > 0)
+            rj = rl[reg]
+            j = np.where(rj >= 0, rj, j)
+            ok = (dmed <= tol) | (rj >= 0)
+            lblmap = np.full(comp.shape, -1, np.int16)
+            lblmap[reg] = np.where(ok, j, -1)
+            dr = np.linalg.norm(lab[:, :, None, :] - modes[None, None], axis=3)
+            ringlab = np.where(dr.min(2) <= 6.0, dr.argmin(2), -1)
+            rg = ring & (ringlab >= 0)
+            src = (lblmap >= 0) | rg
+            lblmap = np.where(rg, ringlab, lblmap)
+            if src.any() and not ok.all():
+                _, nn = cv2.distanceTransformWithLabels((~src).astype(np.uint8), cv2.DIST_L2, 3, labelType=cv2.DIST_LABEL_PIXEL)
+                sy, sx = np.nonzero(src)
+                lut = np.zeros(int(nn.max()) + 1, np.int16)
+                lut[nn[sy, sx]] = lblmap[sy, sx]
+                j = np.where(ok, j, lut[nn[reg]])
+            dself = np.linalg.norm(lab[reg] - modes[j], axis=1)
+            sel = np.where(comp[reg], dself <= 4.0 * tol, dself <= tol)  # line art / outline pixels far from every flat colour stay
+            if not sel.any():
+                continue
+            crop = out[y0:y1, x0:x1]
+            vals = crop[reg].astype(np.float32)
+            vals[sel] = rgb[j[sel]]
+            crop[reg] = np.clip(vals, 0, 255).astype(np.uint8)
+            rep["groups"] += 1
+            rep["snapped"] += int(sel.sum())
+        return out, rep
+    except Exception as exc:
+        rep["error"] = str(exc)
+        return cleaned, rep
+
+
 def qa_pass(image: np.ndarray, cleaned: np.ndarray, mask: np.ndarray, skip: np.ndarray | None = None) -> tuple[np.ndarray, dict]:
     """Page-level QA: every filled component that is objectively bad gets the calmer fill. `skip` (e.g. whole-watermark
     regions, which are art continuations / flat fills) is never touched. Never raises."""

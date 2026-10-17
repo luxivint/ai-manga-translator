@@ -105,6 +105,72 @@ def select_components(seg: np.ndarray, cleaned: np.ndarray, first_mask: np.ndarr
     return keep, count
 
 
+def fringe_components(cleaned: np.ndarray, done: np.ndarray, exclude: np.ndarray, protected: np.ndarray | None = None,
+                      debug: list | None = None) -> tuple[np.ndarray, int]:
+    """Pixel-based leftovers the segmenter is blind to: cut-off glyph pieces / dots hugging the cleaned area (short
+    letters at the edge of a line, a trailing '.', an 'at'). A component of ink (clearly different from the local
+    flat background) that touches the neighbourhood of `done` is accepted when it is small (letter sized), sits on a
+    flat background (its ring is one colour, so no art / hair / line work) and is not an outline or an untouched block.
+    Pure function (testable on synthetic pages). Knobs: CLEAN_FRINGE_PASS, CLEAN_FRINGE_REACH (px, 20),
+    CLEAN_FRINGE_MAX (longest side px, 160), CLEAN_FRINGE_CONTRAST (Lab distance, 40)."""
+    h, w = cleaned.shape[:2]
+    keep = np.zeros((h, w), np.uint8)
+    why = (lambda *a: debug.append(a)) if debug is not None else (lambda *a: None)
+    reach = int(_f("CLEAN_FRINGE_REACH", 20))
+    max_side = int(_f("CLEAN_FRINGE_MAX", 160))
+    con = _f("CLEAN_FRINGE_CONTRAST", 40.0)
+    if not (done > 0).any():
+        return keep, 0
+    near = cv2.dilate((done > 0).astype(np.uint8), _ell(2 * reach + 1)) > 0
+    ys, xs = np.nonzero(near)
+    y0, y1, x0, x1 = max(0, ys.min() - 20), min(h, ys.max() + 21), max(0, xs.min() - 20), min(w, xs.max() + 21)
+    sub = np.ascontiguousarray(cleaned[y0:y1, x0:x1])
+    lab = cv2.cvtColor(sub, cv2.COLOR_RGB2LAB)
+    bg = cv2.medianBlur(lab, 41).astype(np.float32)
+    ink = (np.linalg.norm(lab.astype(np.float32) - bg, axis=2) > con).astype(np.uint8)
+    ink &= (near[y0:y1, x0:x1]).astype(np.uint8)
+    ink[(done[y0:y1, x0:x1] > 0)] = 0
+    if protected is not None:  # bubble outline never belongs to a leftover glyph (and must not glue pieces together)
+        ink[protected[y0:y1, x0:x1] > 0] = 0
+    grouped = cv2.dilate(ink, _ell(5))
+    n, labels, stats, _ = cv2.connectedComponentsWithStats(grouped, connectivity=8)
+    labf = lab.astype(np.float32)
+    count = 0
+    for i in range(1, n):
+        x, y, cw, ch, _a = [int(v) for v in stats[i]]
+        comp = labels[y:y + ch, x:x + cw] == i
+        core = comp & (ink[y:y + ch, x:x + cw] > 0)
+        if core.sum() < 20:
+            why((x + x0, y + y0, cw, ch), 'tiny')
+            continue
+        if max(cw, ch) > max_side or min(cw, ch) > 80:
+            why((x + x0, y + y0, cw, ch), 'size')
+            continue
+        gx, gy = x + x0, y + y0
+        if exclude[gy:gy + ch, gx:gx + cw][core].mean() > 0.3:
+            why((gx, gy, cw, ch), 'excluded')
+            continue
+        if protected is not None and protected[gy:gy + ch, gx:gx + cw][core].mean() > 0.3:
+            why((gx, gy, cw, ch), 'protected')
+            continue
+        pad = 12
+        by0, by1, bx0, bx1 = max(0, y - pad), min(y1 - y0, y + ch + pad), max(0, x - pad), min(x1 - x0, x + cw + pad)
+        full = np.zeros((by1 - by0, bx1 - bx0), np.uint8)
+        full[y - by0:y - by0 + ch, x - bx0:x - bx0 + cw] = comp
+        ring = (cv2.dilate(full, _ell(2 * pad + 1)) > 0) & (full == 0) & (ink[by0:by1, bx0:bx1] == 0)  # other ink is judged on its own
+        rl = labf[by0:by1, bx0:bx1][ring]
+        if len(rl) < 40:
+            why((gx, gy, cw, ch), 'ring')
+            continue
+        flat = (np.linalg.norm(rl - np.median(rl, axis=0), axis=1) <= 14.0).mean()
+        if flat < 0.6:
+            why((gx, gy, cw, ch), 'busy', round(float(flat), 2))
+            continue
+        keep[gy:gy + ch, gx:gx + cw][core] = 255
+        count += 1
+    return keep, count
+
+
 def residual_pass(lb, image: np.ndarray, cleaned: np.ndarray, first_mask: np.ndarray, blocks, config) -> tuple[np.ndarray, dict]:
     """Run up to CLEAN_RESIDUAL_PASSES residual rounds. Returns (cleaned, report{added, passes, px, mask}); report['mask']
     is the union of all added masks (uint8) so the fill QA can treat them like the first mask."""
@@ -143,6 +209,19 @@ def residual_pass(lb, image: np.ndarray, cleaned: np.ndarray, first_mask: np.nda
             rep["added"] += n
             rep["px"] += int((add > 0).sum())
             rep["passes"] += 1
+        if os.environ.get("CLEAN_FRINGE_PASS", "true").strip().lower() not in ("false", "0", "no", "off"):
+            keep, n = fringe_components(cur, done, exclude, protected)
+            if n:
+                add = cv2.dilate(keep, _ell(2 * int(_f("CLEAN_RESIDUAL_GROW", 5)) + 1))
+                add[exclude > 0] = 0
+                if protected is not None:
+                    add[protected > 0] = 0
+                if add.any():
+                    cur = lb.block_inpaint(cur, add, config)
+                    rep["mask"] = add if rep["mask"] is None else cv2.bitwise_or(rep["mask"], add)
+                    rep["added"] += n
+                    rep["fringe"] = n
+                    rep["px"] += int((add > 0).sum())
         return cur, rep
     except Exception as exc:  # best effort
         rep["error"] = str(exc)
