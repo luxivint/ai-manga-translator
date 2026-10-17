@@ -16,6 +16,10 @@ WATERMARK_PATTERNS = (
     r"read\s+(?:this\s+series\s+)?first\s+at",
     r"discord\.gg|t\.me/|www\.|https?://",
     r"\b(?:patreon|ko-?fi)\b",
+    # scan-group credit strips without a domain ("THUNDERSCANS TEAM", "VIOLETSCANS", "PRODUCE BY X TEAM")
+    r"\b[a-z0-9]{3,}scans?\b",
+    r"\bscans?\s+(?:team|group)\b|\bscanlations?\b",
+    r"\b(?:translated|cleaned|redrawn|typeset(?:ted)?|proofread|produced?)\s+by\b.*\b(?:team|scans?)\b",
 )
 
 

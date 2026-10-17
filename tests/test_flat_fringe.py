@@ -71,3 +71,48 @@ class FringeTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class BoxLeftoverAndRestoreTest(unittest.TestCase):
+    def test_box_mode_takes_speck_next_to_cleaned_area_only(self):
+        img = np.full((300, 500, 3), 245, np.uint8)
+        cv2.rectangle(img, (150, 100), (160, 130), (90, 90, 90), -1)  # low-contrast speck inside a translated box
+        cv2.rectangle(img, (400, 100), (410, 130), (90, 90, 90), -1)  # same speck, far from anything cleaned
+        done = np.zeros((300, 500), np.uint8)
+        done[90:140, 170:300] = 255
+        region = np.zeros_like(done)
+        region[80:150, 100:450] = 255
+        region &= (cv2.dilate(done, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (81, 81)))).astype(np.uint8)
+        keep, n = residual.fringe_components(img, done, np.zeros_like(done), region=region, contrast=30.0)
+        self.assertEqual(n, 1)
+        self.assertTrue(keep[115, 155] > 0)
+        self.assertEqual(int(keep[:, 380:].sum()), 0)
+
+    def test_translated_boxes_skip_ads_untranslated_and_huge(self):
+        from types import SimpleNamespace as NS
+        blocks = [NS(translation="ok", xyxy=(10, 10, 60, 40), is_ad=False),
+                  NS(translation="", xyxy=(100, 10, 160, 40), is_ad=False),
+                  NS(translation="ok", xyxy=(200, 10, 260, 40), is_ad=True),
+                  NS(translation="ok", xyxy=(0, 0, 400, 280), is_ad=False)]
+        m = residual.translated_boxes(blocks, 300, 500)
+        self.assertTrue(m[20, 30] > 0)
+        self.assertEqual(int(m[20, 120]), 0)
+        self.assertEqual(int(m[20, 220]), 0)
+        self.assertEqual(int(m[200, 300]), 0)
+
+    def test_untranslated_block_gets_its_letters_back(self):
+        from types import SimpleNamespace as NS
+        lbm = NS(watermark_match=lambda b: None)
+        img = np.full((100, 200, 3), 250, np.uint8)
+        img[30:50, 20:60] = 10
+        cleaned = img.copy()
+        cleaned[30:50, 20:40] = 250  # half erased by a neighbour's mask
+        mask = np.zeros((100, 200), np.uint8)
+        mask[30:50, 20:40] = 255
+        blocks = [NS(translation="", text="Abc", xyxy=(15, 25, 65, 55), is_ad=False)]
+        out, n = residual.restore_untouched(lbm, img, cleaned, mask, blocks)
+        self.assertEqual(n, 1)
+        self.assertTrue((out[30:50, 20:60] == 10).all())
+        blocks[0].translation = "Tamam"  # translated block: the cleaning stays
+        out2, n2 = residual.restore_untouched(lbm, img, cleaned, mask, blocks)
+        self.assertEqual(n2, 0)

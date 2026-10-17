@@ -2265,7 +2265,8 @@ def _batch_translate_all(page_results: list, args: argparse.Namespace) -> None:
             val, style = got
             src_text = (getattr(blk, "text", "") or "")
             looks_ad = "[[AD]]" in val.upper().replace(" ", "")
-            if not looks_ad and own_key not in src_text.lower() and _AD_URL_RE.search(src_text):
+            if not looks_ad and own_key not in src_text.lower() and (
+                    _AD_URL_RE.search(src_text) or watermark_lib.match_watermark(src_text)):
                 looks_ad = True
             if looks_ad:
                 blk.is_ad = True
@@ -2321,7 +2322,9 @@ def clean_postprocess(image: np.ndarray, cleaned: np.ndarray, mask: np.ndarray, 
         cleaned, rrep = residual.residual_pass(sys.modules[__name__], image, cleaned, mask, blocks,
                                                Config(hd_strategy="Resize", hd_strategy_resize_limit=2048))
         if rrep.get("added"):
-            print(f"  [clean-residual] components added={rrep['added']} passes={rrep['passes']} px={rrep['px']}", flush=True)
+            print(f"  [clean-residual] components added={rrep['added']} passes={rrep['passes']} px={rrep['px']}"
+                  + (f" outline={rrep['outline']}" if rrep.get("outline") else "")
+                  + (f" box={rrep['box']}" if rrep.get("box") else ""), flush=True)
             full_mask = cv2.bitwise_or((mask > 0).astype(np.uint8) * 255, rrep["mask"])
     except Exception as exc:
         print(f"  [clean-residual] skipped: {exc}", flush=True)
@@ -2337,6 +2340,13 @@ def clean_postprocess(image: np.ndarray, cleaned: np.ndarray, mask: np.ndarray, 
             print(f"  [clean-flat] groups={frep['groups']} snapped_px={frep['snapped']}", flush=True)
     except Exception as exc:
         print(f"  [clean-flat] skipped: {exc}", flush=True)
+    try:  # last: the QA / snap passes must not touch what stays as drawn
+        from modules.inpainting import residual as _res
+        cleaned, n_back = _res.restore_untouched(sys.modules[__name__], image, cleaned, full_mask, blocks)
+        if n_back:
+            print(f"  [clean-restore] untranslated blocks restored={n_back}", flush=True)
+    except Exception as exc:
+        print(f"  [clean-restore] skipped: {exc}", flush=True)
     return cleaned
 
 

@@ -25,6 +25,12 @@ class MatchTests(unittest.TestCase):
         for t in ("VORTEXSCANS.COM", "EN-THUNDERSCANS.COM", "READ THIS SERIES FIRST AT:", "discord.gg/abc"):
             self.assertIsNotNone(wm.match_watermark(t), t)
 
+    def test_scan_group_credit_strips_match(self):
+        for t in ("THUNDERSCANS TEAM", "VIOLETSCANS TEAM", "PRODUCE BY REZO TEAM", "Mock Scans Group", "ASURASCANS"):
+            self.assertIsNotNone(wm.match_watermark(t), t)
+        for t in ("THE DEVELOPMENT TEAM IS LATE.", "A TEAM OF TWELVE", "THE CT SCANS ARE READY."):
+            self.assertIsNone(wm.match_watermark(t), t)
+
     def test_dialogue_does_not_match(self):
         for t in ("HELLO THERE", "I WILL FIND YOU.", ""):
             self.assertIsNone(wm.match_watermark(t))

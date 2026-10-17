@@ -7,7 +7,9 @@ fill logic. Rotated lines are measured with cv2.minAreaRect, not axis-aligned bo
 
 Knobs (env, defaults ON): CLEAN_RESIDUAL_PASS (true/false), CLEAN_RESIDUAL_PASSES (max 2), CLEAN_RESIDUAL_NEAR (px
 from the first mask, default 150), CLEAN_RESIDUAL_CONF (segmenter confidence, 0.1), CLEAN_RESIDUAL_MAX_FRAC (thickest
-allowed component as a share of the page width, 0.25), CLEAN_RESIDUAL_MIN_CONTRAST (Lab distance, 28), CLEAN_RESIDUAL_GROW (extra mask dilation px, 5).
+allowed component as a share of the page width, 0.25), CLEAN_RESIDUAL_MIN_CONTRAST (Lab distance, 28), CLEAN_RESIDUAL_GROW (extra mask dilation px, 5),
+CLEAN_BOX_LEFTOVERS (true; letter-sized ink left inside a translated block's box, CLEAN_BOX_CONTRAST 30, CLEAN_BOX_REACH 40 px from the cleaned area), CLEAN_RESTORE_UNTOUCHED (true; put back letters of an untranslated block that a neighbour's mask half-erased),
+CLEAN_OUTLINE_GLYPHS (true; letters glued to a balloon outline: erase them, redraw the outline, see outline.py).
 """
 from __future__ import annotations
 
@@ -15,6 +17,8 @@ import os
 
 import cv2
 import numpy as np
+
+from modules.inpainting import outline
 
 
 def _f(name: str, default: float) -> float:
@@ -40,6 +44,52 @@ def untouched_boxes(blocks, h: int, w: int, pad: int = 6) -> np.ndarray:
         if len(tr) > 1 and not getattr(blk, "is_ad", False):
             continue
         x1, y1, x2, y2 = [int(v) for v in getattr(blk, "xyxy", (0, 0, 0, 0))]
+        out[max(0, y1 - pad):min(h, y2 + pad), max(0, x1 - pad):min(w, x2 + pad)] = 255
+    return out
+
+
+def restore_untouched(lb, image: np.ndarray, cleaned: np.ndarray, mask: np.ndarray, blocks) -> tuple[np.ndarray, int]:
+    """A block we deliberately do not translate (empty translation, Latin text, not a watermark/ad) stays as drawn. When a
+    neighbouring block's mask reached into its box, half of its letters were erased and the rest looks like debris
+    ("Ahem" -> "H", "n"): put the original pixels back inside that box. CLEAN_RESTORE_UNTOUCHED=false disables."""
+    if os.environ.get("CLEAN_RESTORE_UNTOUCHED", "true").strip().lower() in ("false", "0", "no", "off") or mask is None:
+        return cleaned, 0
+    h, w = cleaned.shape[:2]
+    out = cleaned
+    n = 0
+    for blk in blocks or []:
+        tr = (getattr(blk, "translation", "") or "").strip()
+        txt = (getattr(blk, "text", "") or "").strip()
+        if len(tr) > 1 or not txt or getattr(blk, "is_ad", False) or lb.watermark_match(blk):
+            continue
+        x1, y1, x2, y2 = [int(v) for v in getattr(blk, "xyxy", (0, 0, 0, 0))]
+        x1, y1, x2, y2 = max(0, x1 - 4), max(0, y1 - 4), min(w, x2 + 4), min(h, y2 + 4)
+        if x2 <= x1 or y2 <= y1:
+            continue
+        if not (mask[y1:y2, x1:x2] > 0).any():
+            continue
+        # the inpainter's feathered fill spills past the mask: every pixel that changed inside the box goes back
+        sel = (cleaned[y1:y2, x1:x2] != image[y1:y2, x1:x2]).any(axis=2)
+        if not sel.any():
+            continue
+        if out is cleaned:
+            out = cleaned.copy()
+        out[y1:y2, x1:x2][sel] = image[y1:y2, x1:x2][sel]
+        n += 1
+    return out, n
+
+
+def translated_boxes(blocks, h: int, w: int, pad: int = 6, max_frac: float = 0.25) -> np.ndarray:
+    """Boxes of blocks whose text we replace (translated, not an ad / watermark): every letter-sized ink left inside them
+    is source text. Boxes covering more than `max_frac` of the page are skipped (merged OCR boxes span art)."""
+    out = np.zeros((h, w), np.uint8)
+    for blk in blocks or []:
+        tr = (getattr(blk, "translation", "") or "").strip()
+        if len(tr) <= 1 or getattr(blk, "is_ad", False):
+            continue
+        x1, y1, x2, y2 = [int(v) for v in getattr(blk, "xyxy", (0, 0, 0, 0))]
+        if (x2 - x1) * (y2 - y1) > max_frac * h * w:
+            continue
         out[max(0, y1 - pad):min(h, y2 + pad), max(0, x1 - pad):min(w, x2 + pad)] = 255
     return out
 
@@ -106,7 +156,8 @@ def select_components(seg: np.ndarray, cleaned: np.ndarray, first_mask: np.ndarr
 
 
 def fringe_components(cleaned: np.ndarray, done: np.ndarray, exclude: np.ndarray, protected: np.ndarray | None = None,
-                      debug: list | None = None) -> tuple[np.ndarray, int]:
+                      debug: list | None = None, region: np.ndarray | None = None,
+                      contrast: float | None = None) -> tuple[np.ndarray, int]:
     """Pixel-based leftovers the segmenter is blind to: cut-off glyph pieces / dots hugging the cleaned area (short
     letters at the edge of a line, a trailing '.', an 'at'). A component of ink (clearly different from the local
     flat background) that touches the neighbourhood of `done` is accepted when it is small (letter sized), sits on a
@@ -118,10 +169,15 @@ def fringe_components(cleaned: np.ndarray, done: np.ndarray, exclude: np.ndarray
     why = (lambda *a: debug.append(a)) if debug is not None else (lambda *a: None)
     reach = int(_f("CLEAN_FRINGE_REACH", 20))
     max_side = int(_f("CLEAN_FRINGE_MAX", 160))
-    con = _f("CLEAN_FRINGE_CONTRAST", 40.0)
-    if not (done > 0).any():
-        return keep, 0
-    near = cv2.dilate((done > 0).astype(np.uint8), _ell(2 * reach + 1)) > 0
+    con = _f("CLEAN_FRINGE_CONTRAST", 40.0) if contrast is None else contrast
+    if region is None:
+        if not (done > 0).any():
+            return keep, 0
+        near = cv2.dilate((done > 0).astype(np.uint8), _ell(2 * reach + 1)) > 0
+    else:  # block-box mode: any letter-sized ink inside the region (translated blocks) is a leftover
+        near = region > 0
+        if not near.any():
+            return keep, 0
     ys, xs = np.nonzero(near)
     y0, y1, x0, x1 = max(0, ys.min() - 20), min(h, ys.max() + 21), max(0, xs.min() - 20), min(w, xs.max() + 21)
     sub = np.ascontiguousarray(cleaned[y0:y1, x0:x1])
@@ -147,6 +203,9 @@ def fringe_components(cleaned: np.ndarray, done: np.ndarray, exclude: np.ndarray
             why((x + x0, y + y0, cw, ch), 'size')
             continue
         gx, gy = x + x0, y + y0
+        if region is not None and max(cw, ch) > 14 * max(1, min(cw, ch)):  # a long thin line is art / a frame, not a letter
+            why((gx, gy, cw, ch), 'line')
+            continue
         if exclude[gy:gy + ch, gx:gx + cw][core].mean() > 0.3:
             why((gx, gy, cw, ch), 'excluded')
             continue
@@ -182,6 +241,7 @@ def residual_pass(lb, image: np.ndarray, cleaned: np.ndarray, first_mask: np.nda
         conf = _f("CLEAN_RESIDUAL_CONF", 0.1)
         exclude = untouched_boxes(blocks, h, w)
         protected = lb.bubble_outline_protection_mask(image, blocks)
+        protected_raw = None if protected is None else (protected > 0).astype(np.uint8)
         if protected is not None:
             protected = cv2.dilate((protected > 0).astype(np.uint8), _ell(5))
         done = (first_mask > 0).astype(np.uint8) * 255
@@ -209,6 +269,39 @@ def residual_pass(lb, image: np.ndarray, cleaned: np.ndarray, first_mask: np.nda
             rep["added"] += n
             rep["px"] += int((add > 0).sum())
             rep["passes"] += 1
+        if outline.enabled() and protected_raw is not None:
+            # glyph pieces glued to a balloon outline: erase them, then redraw the outline along its fitted curve
+            keep, bands, n = outline.glyph_pieces(cur, done, exclude, protected_raw)
+            if n:
+                add = cv2.dilate(keep, _ell(2 * int(_f("CLEAN_RESIDUAL_GROW", 5)) + 1))
+                add = cv2.bitwise_or(add, outline.gap_mask(add.shape, keep, bands))
+                add[exclude > 0] = 0
+                filled = lb.block_inpaint(cur, add, config)
+                cur = outline.redraw(filled, add, bands)
+                rep["mask"] = add if rep["mask"] is None else cv2.bitwise_or(rep["mask"], add)
+                done = cv2.bitwise_or(done, add)
+                rep["added"] += n
+                rep["outline"] = n
+                rep["px"] += int((add > 0).sum())
+        if os.environ.get("CLEAN_BOX_LEFTOVERS", "true").strip().lower() not in ("false", "0", "no", "off"):
+            region = translated_boxes(blocks, h, w)
+            reach = int(_f("CLEAN_BOX_REACH", 40))  # only next to what was cleaned: a caption that was never masked is not half-erased
+            region &= (cv2.dilate((done > 0).astype(np.uint8), _ell(2 * reach + 1)) * 255).astype(np.uint8)
+            if region.any():
+                keep, n = fringe_components(cur, done, exclude, protected, region=region,
+                                            contrast=_f("CLEAN_BOX_CONTRAST", 30.0))
+                if n:
+                    add = cv2.dilate(keep, _ell(2 * int(_f("CLEAN_RESIDUAL_GROW", 5)) + 1))
+                    add[exclude > 0] = 0
+                    if protected is not None:
+                        add[protected > 0] = 0
+                    if add.any():
+                        cur = lb.block_inpaint(cur, add, config)
+                        rep["mask"] = add if rep["mask"] is None else cv2.bitwise_or(rep["mask"], add)
+                        done = cv2.bitwise_or(done, add)
+                        rep["added"] += n
+                        rep["box"] = n
+                        rep["px"] += int((add > 0).sum())
         if os.environ.get("CLEAN_FRINGE_PASS", "true").strip().lower() not in ("false", "0", "no", "off"):
             keep, n = fringe_components(cur, done, exclude, protected)
             if n:
