@@ -1550,6 +1550,7 @@ def clear_light_free_text_render_regions(image: np.ndarray, blocks) -> np.ndarra
     white_ratio_min = float(os.environ.get("LIGHT_RENDER_CLEAR_WHITE_RATIO", "0.52"))
     gray_min = int(os.environ.get("LIGHT_RENDER_CLEAR_GRAY_MIN", "180"))
     sat_max = int(os.environ.get("LIGHT_RENDER_CLEAR_SAT_MAX", "100"))
+    wiped = False
 
     for block in blocks:
         if getattr(block, "bubble_xyxy", None) is not None:
@@ -1588,7 +1589,12 @@ def clear_light_free_text_render_regions(image: np.ndarray, blocks) -> np.ndarra
         target = _local_light_background(crop, light_pixels, fill) if local_bg else fill.astype(np.float32)
         blended = crop.astype(np.float32) * (1.0 - alpha) + target * alpha
         result[y1:y2, x1:x2] = np.clip(blended, 0, 255).astype(np.uint8)
+        wiped = True
 
+    if wiped and os.environ.get("LIGHT_RENDER_CLEAR_PROTECT_OUTLINES", "true").lower() == "true":
+        # a tilted caption's axis-aligned box can reach into a neighbouring balloon: its dark outline (3-6 px strokes
+        # that the closing above would paint over) is restored from the page the wipe started from
+        result = restore_protected_pixels(image, result, bubble_outline_protection_mask(image, blocks))
     return result
 
 
@@ -2325,6 +2331,12 @@ def clean_postprocess(image: np.ndarray, cleaned: np.ndarray, mask: np.ndarray, 
             print(f"  [clean-qa] bad fills={rep['bad']} fixed={rep['fixed']} {rep['kinds']}", flush=True)
     except Exception as exc:
         print(f"  [clean-qa] skipped: {exc}", flush=True)
+    try:
+        cleaned, frep = fill_qa.flat_snap(cleaned, full_mask, skip=watermark_clear_mask(image, blocks))
+        if frep.get("snapped"):
+            print(f"  [clean-flat] groups={frep['groups']} snapped_px={frep['snapped']}", flush=True)
+    except Exception as exc:
+        print(f"  [clean-flat] skipped: {exc}", flush=True)
     return cleaned
 
 

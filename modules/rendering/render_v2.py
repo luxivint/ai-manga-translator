@@ -10,6 +10,7 @@ import json
 import math
 import statistics
 import os
+import re
 from pathlib import Path
 
 import cv2
@@ -32,6 +33,7 @@ _FAMILY_CACHE: dict[str, str] = {}
 _COVERAGE: dict[str, bool] | None = None
 FLOOR_SIZE = int(os.environ.get("RENDER_FLOOR_SIZE", "9"))
 BAND_RATIO = float(os.environ.get("RENDER_BAND_RATIO", "1.45"))
+RENDER_UNMEASURED_FILL = float(os.environ.get("RENDER_UNMEASURED_FILL", "0.80"))
 
 
 def render_v2_enabled() -> bool:
@@ -672,16 +674,24 @@ def resolve_item_overlaps(items: list, plans: list, W: int, H: int, direction) -
     return remaining
 
 
-def build_items(blocks, image, cleaned, orig_boxes, render_settings, alignment, target_code: str):
-    """Returns list of TextItemProperties dicts (V2 layout)."""
+def build_items(blocks, image, cleaned, orig_boxes, render_settings, alignment, target_code: str, _rescue: bool = False):
+    """Returns list of TextItemProperties dicts (V2 layout). `_rescue` = internal re-run of blocks the safety net found
+    unrendered (no merge / dedupe / split steps: they were what lost the text)."""
+    import copy
+    from modules.utils import block_cleanup as bcl
+
     H, W = image.shape[:2]
     line_spacing = max(float(render_settings.line_spacing), MIN_LINE_SPACING)
     policy = casing_policy(render_settings.upper_case)
     plans = []
-    blocks, orig_boxes = split_merged_blocks(blocks, orig_boxes, image, cleaned)
-    blocks, orig_boxes = drop_split_duplicates(blocks, orig_boxes)
-    blocks, orig_boxes = dedupe_duplicate_blocks(blocks, orig_boxes)
-    blocks, orig_boxes = prepare_balloon_blocks(blocks, orig_boxes, image)
+    deliberate: list = []  # boxes skipped on purpose (original lettering kept / kept as-is)
+    net = bcl.safety_net_enabled() and not _rescue
+    snapshot = [(copy.copy(b), [float(v) for v in o]) for b, o in zip(blocks, orig_boxes)] if net else []
+    if not _rescue:
+        blocks, orig_boxes = split_merged_blocks(blocks, orig_boxes, image, cleaned)
+        blocks, orig_boxes = drop_split_duplicates(blocks, orig_boxes)
+        blocks, orig_boxes = dedupe_duplicate_blocks(blocks, orig_boxes)
+        blocks, orig_boxes = prepare_balloon_blocks(blocks, orig_boxes, image)
     for blk, obox in zip(blocks, orig_boxes):
         raw = (blk.translation or "")
         if not raw.strip() or len(raw.strip()) == 1:
@@ -694,12 +704,14 @@ def build_items(blocks, image, cleaned, orig_boxes, render_settings, alignment, 
             # a translation drawn on top would double the text, so keep the original
             if os.environ.get("RENDER_DEBUG"):
                 print(f"[skip] original text left untouched at {[int(v) for v in obox]}", flush=True)
+            deliberate.append([float(v) for v in obox])
             continue
         mask, off = page_glyph_mask(image, cleaned, obox)
         src_key = "".join((getattr(blk, "text", "") or "").casefold().split())
         if src_key and src_key == "".join(raw.casefold().split()):
             ox1, oy1, ox2, oy2 = [int(v) for v in obox]
             if int(mask.sum()) < 0.02 * max(1, (ox2 - ox1) * (oy2 - oy1)):
+                deliberate.append([float(v) for v in obox])
                 continue  # kept as-is (logo/URL/name) and the cleaner left it untouched: do not draw it twice
         cap_h = tst.cap_height(mask) if mask.any() else 0.0
         if cap_h >= 8:
@@ -943,6 +955,11 @@ def build_items(blocks, image, cleaned, orig_boxes, render_settings, alignment, 
             # balloons whose interior could not be measured): grow around the ORIGINAL text box instead of
             # shrinking the font to a tiny size. The original lettering stood there, so it is safe ground.
             max_w = (region[2] - region[0]) if (plan["list_like"] or plan["shaped"]) else max(1.55 * (plan["obox"][2] - plan["obox"][0]), region[2] - region[0])
+            bb_ = getattr(plan["blk"], "bubble_xyxy", None)
+            if bb_ is not None and plan["bubble"] is False and not plan["list_like"]:
+                # a balloon whose interior could not be measured (dashed / open outline): the grown text must still fit
+                # the balloon's own box with a margin for the curved outline
+                max_w = min(max_w, max(region[2] - region[0], RENDER_UNMEASURED_FILL * float(bb_[2] - bb_[0])))
             bases = [region]
             if plan["bubble"] or plan["region_kind"] == "interior":
                 bases.append(free_region(plan["blk"], W, H, plan["obox"]))
@@ -1170,10 +1187,49 @@ def build_items(blocks, image, cleaned, orig_boxes, render_settings, alignment, 
         if os.environ.get("RENDER_DEBUG"):
             print("[item]", {k: v for k, v in d["debug"].items() if k != "src"}, "text=", repr(out[:40]), flush=True)
         items.append(d)
+    if net:
+        items.extend(_rescue_missed(snapshot, items, deliberate, image, cleaned, render_settings, alignment, target_code))
     resolve_item_overlaps(items, plans, W, H, render_settings.direction)
     if bl.overlap_enabled():
         items.sort(key=lambda d: d.get("glow_color") is None)  # soft halos go under every other block's lettering (stable)
     return items
+
+
+def _rescue_missed(snapshot, items, deliberate, image, cleaned, render_settings, alignment, target_code: str) -> list:
+    """Safety net: every source block with OCR text + translation must show up on the page. Whatever the merge / dedupe /
+    split steps lost is logged loudly and rendered on its own (plain layout). Blocks with OCR text but no translation
+    are only reported."""
+    from modules.utils import block_cleanup as bcl
+
+    srcs = [dict(text=getattr(b, "text", "") or "", translation=getattr(b, "translation", "") or "", box=o) for b, o in snapshot]
+    seen = []
+    for d in items:
+        dbg = d.get("debug") or {}
+        text = d.get("text") or ""
+        if dbg.get("obox"):
+            seen.append(dict(text=text, box=dbg["obox"]))
+        x, y = d["position"]
+        seen.append(dict(text=text, box=[x, y, x + float(d["width"]), y + float(d["height"])]))
+    missed = bcl.coverage_misses(srcs, seen, deliberate)
+    for k, (b, o) in enumerate(snapshot):
+        if k not in missed and (srcs[k]["text"].strip() and not srcs[k]["translation"].strip()
+                                and getattr(b, "text_class", "") == "text_bubble" and len(bcl.words(srcs[k]["text"])) >= 2
+                                and not re.search(r"\.(com|net|org|io|gg|me)|www\.", srcs[k]["text"], re.I)):
+            print(f"[render-untranslated] OCR text without translation at {[int(v) for v in o]}: {srcs[k]['text'][:60]!r}", flush=True)
+    if not missed:
+        return []
+    for k in missed:
+        print(f"[render-miss] translation never reached the page at {[int(v) for v in snapshot[k][1]]}: "
+              f"{srcs[k]['translation'][:70]!r} -> rendering it on its own", flush=True)
+    try:
+        extra = build_items([snapshot[k][0] for k in missed], image, cleaned, [snapshot[k][1] for k in missed],
+                            render_settings, alignment, target_code, _rescue=True)
+    except Exception as exc:  # the net must never take the page down
+        print(f"[render-miss] rescue failed: {exc!r}", flush=True)
+        return []
+    for d in extra:
+        (d.setdefault("debug", {}))["rescued"] = True
+    return extra
 
 
 # ------------------------------------------------------- perspective (stage E)

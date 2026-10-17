@@ -353,6 +353,8 @@ Out of the box `local_batch.py` and the worker use:
 | `WATERMARK_POLICY` | `clean` | `clean` erases competitor watermarks/banners whole (never the site's own brand); `keep` leaves them untouched |
 | `CLEAN_FILL_QA` | `true` | after LaMa, every filled component is measured against its untouched ring; objectively bad fills (dithered blue "static", pink/green speckle, grey stipple) get a calmer fill (tuning: `CLEAN_FILL_QA_NOISE/_NOISE_ABS/_CHROMA/_CHROMA_ABS/_BLOBS/_BLOB_RATIO/_MIN_AREA/_RING`) |
 | `CLEAN_RESIDUAL_PASS` | `true` | segments the cleaned page again and cleans text-like leftovers near cleaned blocks (small / rotated / UI text); `CLEAN_RESIDUAL_PASSES` (max 2), `_NEAR`, `_CONF`, `_MAX_FRAC`, `_MIN_CONTRAST`, `_GROW` |
+| `CLEAN_FRINGE_PASS` | `true` | also removes small cut-off glyph pieces next to the cleaned area that sit on a flat background (`CLEAN_FRINGE_REACH`, `_MAX`, `_CONTRAST`) |
+| `CLEAN_FLAT_SNAP` | `true` | removes the faint ghost of the old text inside flat balloons: filled pixels snap to the ring's flat colour(s) (`CLEAN_FLAT_TOL`, `_COVER`, `_HALO`) |
 | `RENDER_V2`, `RENDER_STYLE_TAGS` | `true` | balloon- and style-aware typesetting |
 | `RENDER_BALLOON_UNIFY` | `true` | blocks sharing one balloon use one font and one size band (`RENDER_BALLOON_BAND`, default `0.12` = +-12% of the balloon median; blocks whose source cap height differs by more than `RENDER_EMPHASIS_RATIO`, default `1.4`, keep their size) and every line must lie inside the balloon interior; `false` = old per-block sizing |
 | `RENDER_MERGE_BALLOON` | `true` | a sentence the OCR split over several blocks of one balloon is laid out as one centred paragraph (separate speech, shouts/SFX and emphasis stay separate); also drops words repeated across the block boundary |
@@ -391,3 +393,5 @@ progress every five seconds and stops the process tree after 600 seconds without
 (configurable with `TRANSLATION_STALL_SECONDS`). Cancellation also stops the batch tree.
 Account usage-limit errors persist their reset deadline in `work/gateway-quota.json`, pause
 job claiming and requeue the current job without consuming a retry. Jobs resume after reset.
+
+- Render safety net (`RENDER_SAFETY_NET`): an OCR block with a translation that never reaches the page is logged as `[render-miss]` and rendered anyway; the white wipe keeps neighbouring balloon outlines (`LIGHT_RENDER_CLEAR_PROTECT_OUTLINES`); one-word balloons are not hyphenated (`RENDER_SINGLE_WORD_HYPHEN_PREF`). `replay_chapter.py run/render/styles --log JOB.log` re-applies the job's page crops.

@@ -8,6 +8,8 @@ Env knobs (read at call time):
   BLOCK_CONTAINMENT_RATIO (0.6)   share of a block's area that must lie inside another block to count as 'contained'
   BLOCK_TEXT_COVER (0.8)          share of the contained block's words that must also be in the container's text
   RENDER_DEDUPE_TRANSLATIONS (true) drop a translation that repeats another block's translation / collapse repeats
+  RENDER_SAFETY_NET (true)        after layout, a block with OCR text + translation that reached the page nowhere is
+                                  logged loudly ('[render-miss]') and rendered anyway
 """
 from __future__ import annotations
 
@@ -273,3 +275,48 @@ def split_piece_duplicates(translations, boxes, is_piece, max_dy: float = 320.0)
                 drop.append(i)
                 break
     return drop
+
+
+# ---------------------------------------------------------------------------- render safety net
+def safety_net_enabled() -> bool:
+    return _flag("RENDER_SAFETY_NET")
+
+
+def _rect_overlap(a, b) -> float:
+    """Share of rect `a`'s area that lies inside rect `b`."""
+    return inside_fraction([float(v) for v in a], [float(v) for v in b])
+
+
+def coverage_misses(sources, items, deliberate=(), cover: float = 0.8) -> list[int]:
+    """Indices of source blocks whose translation reached the page nowhere (the render dropped it silently).
+
+    sources     [{'text','translation','box'}] as the render received them (box = original text box x1,y1,x2,y2)
+    items       [{'text','box'}] what was rendered (box = the region the item stands on: its original box or position)
+    deliberate  boxes the render skipped on purpose (original lettering kept by the cleaner / logo kept as-is)
+
+    A source counts as covered when its centre lies in a deliberate box, when a rendered item stands on >= 30 percent
+    of its box (or the other way round), or when a nearby item already says >= `cover` of its words (a duplicate that
+    was folded into a neighbour). Only sources with OCR text AND a real translation can be 'missed'."""
+    missed: list[int] = []
+    for k, s in enumerate(sources):
+        tr = (s.get("translation") or "").strip()
+        if not (s.get("text") or "").strip() or len(tr) < 2 or not words(tr):
+            continue
+        box = [float(v) for v in s["box"]]
+        cx, cy = (box[0] + box[2]) / 2, (box[1] + box[3]) / 2
+        if any(d[0] <= cx <= d[2] and d[1] <= cy <= d[3] for d in deliberate):
+            continue
+        h = max(1.0, box[3] - box[1])
+        done = False
+        for it in items:
+            ib = [float(v) for v in it["box"]]
+            if _rect_overlap(box, ib) >= 0.3 or _rect_overlap(ib, box) >= 0.3:
+                done = True
+                break
+            near = ib[0] < box[2] + 60 and box[0] < ib[2] + 60 and ib[1] < box[3] + 1.2 * h + 120 and box[1] < ib[3] + 1.2 * h + 120
+            if near and covered_fraction(tr, it.get("text") or "") >= cover:
+                done = True
+                break
+        if not done:
+            missed.append(k)
+    return missed

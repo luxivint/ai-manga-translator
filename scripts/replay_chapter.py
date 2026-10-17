@@ -89,6 +89,69 @@ def parse_dump_lines(lines, stage: str = "after-clean-translate") -> list[dict]:
     return out
 
 
+# ---------------------------------------------------------------------------------------------- page crops
+_VCROP_RE = re.compile(r"\[vision-crop\] \[\d+\] (?P<page>\S+): .*?%=(?P<top>[\d.]+) alt%=(?P<bot>[\d.]+) (?P<verdict>kırpıldı|REDDEDİLDİ)")
+_BCROP_RE = re.compile(r"\[banner-crop\] \[\d+\] (?P<page>\S+): üst=(?P<top>\d+)px alt=(?P<bot>\d+)px")
+
+
+def parse_crops(lines) -> dict:
+    """The live job crops promo strips off a page BEFORE detection/OCR, so every dumped box is in the CROPPED frame.
+    Log lines: '[vision-crop] [i] page: üst%=T alt%=B kırpıldı|REDDEDİLDİ' and '[banner-crop] [i] page: üst=Npx alt=Npx'.
+    -> {page: {'vision': (T, B) or None, 'banner': (top_px, bottom_px)}}"""
+    out: dict = {}
+    for ln in lines:
+        m = _VCROP_RE.search(ln)
+        if m:
+            d = out.setdefault(m["page"], {"vision": None, "banner": (0, 0)})
+            d["vision"] = (float(m["top"]), float(m["bot"])) if m["verdict"] == "kırpıldı" else None
+            continue
+        m = _BCROP_RE.search(ln)
+        if m:
+            d = out.setdefault(m["page"], {"vision": None, "banner": (0, 0)})
+            d["banner"] = (int(m["top"]), int(m["bot"]))
+    return out
+
+
+def crop_rows(h: int, crop: dict | None) -> tuple[int, int]:
+    """Same arithmetic as local_batch._stage_detect_ocr: (y1, y2) rows kept of a page h pixels tall."""
+    if not crop:
+        return 0, h
+    y1, y2 = 0, h
+    if crop.get("vision"):
+        top, bottom = crop["vision"]
+        vy1, vy2 = int(h * top / 100), int(h * (100 - bottom) / 100)
+        if vy2 - vy1 >= h * 0.08:
+            y1, y2 = vy1, vy2
+    btop, bbot = crop.get("banner") or (0, 0)
+    if btop or bbot:
+        y1, y2 = max(y1, int(btop)), min(y2, h - int(bbot))
+    if (y1, y2) != (0, h) and y2 - y1 >= h * 0.08:
+        return y1, y2
+    return 0, h
+
+
+def read_page(path, crops: dict | None = None):
+    """imk.read_image + the live crop (when the job log says the page was cropped)."""
+    import imkit as imk
+    image = imk.read_image(str(path))
+    if crops:
+        y1, y2 = crop_rows(image.shape[0], crops.get(Path(path).name))
+        if (y1, y2) != (0, image.shape[0]):
+            image = image[y1:y2].copy()
+    return image
+
+
+_CROPS_CACHE: dict = {}
+
+
+def load_crops(log) -> dict:
+    if not log:
+        return {}
+    if log not in _CROPS_CACHE:
+        _CROPS_CACHE[log] = parse_crops(Path(log).read_text(encoding="utf-8", errors="replace").splitlines())
+    return _CROPS_CACHE[log]
+
+
 # ---------------------------------------------------------------------------------------------- geometry
 def iou(a, b) -> float:
     ix = max(0, min(a[2], b[2]) - max(a[0], b[0]))
@@ -227,7 +290,7 @@ def build_blocks(lb, args, image, ents: list[dict]):
     return out
 
 
-def replay_page(lb, args, main, path: Path, ents: list[dict], out_png: Path, hooks=None):
+def replay_page(lb, args, main, path: Path, ents: list[dict], out_png: Path, hooks=None, crops=None):
     """clean + render exactly like _stage_clean / _do_render_and_save (without stamp). Returns the final image."""
     import imkit as imk
     import numpy as np
@@ -235,7 +298,7 @@ def replay_page(lb, args, main, path: Path, ents: list[dict], out_png: Path, hoo
     from modules.inpainting.schema import Config
     from modules.utils import watermark as watermark_lib
 
-    image = imk.read_image(str(path))
+    image = read_page(path, crops)
     blocks = build_blocks(lb, args, image, ents)
     if hooks and hooks.get("pre_clean"):
         blocks = hooks["pre_clean"](blocks, image)
@@ -273,7 +336,7 @@ def _cmd_render(a):
     lb, args, main = _setup()
     wanted = [p if p.endswith(".webp") else f"{int(p):03d}.webp" for p in a.pages.split(",")] if a.pages else sorted(by_page)
     for name in wanted:
-        replay_page(lb, args, main, Path(a.input) / name, by_page.get(name, []), Path(a.out) / name.replace(".webp", ".png"))
+        replay_page(lb, args, main, Path(a.input) / name, by_page.get(name, []), Path(a.out) / name.replace(".webp", ".png"), crops=load_crops(getattr(a, 'log', '')))
         print("rendered", name, flush=True)
 
 
@@ -324,7 +387,7 @@ def _cmd_styles(a):
                 e.setdefault("style", guess_style(e))
             continue
         live = np.asarray(Image.open(live_p).convert("L")).astype(np.int16)
-        image = imk.read_image(str(Path(a.input) / name))
+        image = read_page(Path(a.input) / name, load_crops(getattr(a, 'log', '')))
         blocks = build_blocks(lb, args, image, pe)
         cleaned = _clean_page(lb, image, blocks)
         for bi, e in enumerate(pe):
@@ -483,7 +546,7 @@ def _cmd_run(a):
     out_dir = Path(a.out)
     for name in wanted:
         pe = by_page.get(name, [])
-        image = imk.read_image(str(Path(a.input) / name))
+        image = read_page(Path(a.input) / name, load_crops(getattr(a, 'log', '')))
         if a.synth:
             pe = SYNTH[a.synth](pe, image) if a.synth in SYNTH else pe
         blocks0 = build_blocks(lb, args, image, pe)
@@ -717,6 +780,7 @@ def main(argv=None) -> int:
     p.set_defaults(fn=_cmd_recut)
     p = sub.add_parser("styles")
     p.add_argument("--dump", required=True)
+    p.add_argument("--log", default="", help="job log: apply its vision/banner page crops so dump boxes line up")
     p.add_argument("--input", required=True)
     p.add_argument("--live", required=True)
     p.add_argument("--pages", default="", help="only infer these pages (others keep the default guess)")
@@ -724,6 +788,7 @@ def main(argv=None) -> int:
     p.set_defaults(fn=_cmd_styles)
     p = sub.add_parser("run")
     p.add_argument("--dump", required=True)
+    p.add_argument("--log", default="", help="job log: apply its vision/banner page crops so dump boxes line up")
     p.add_argument("--input", required=True)
     p.add_argument("--pages", default="")
     p.add_argument("--modes", default="before,after")
@@ -748,6 +813,7 @@ def main(argv=None) -> int:
     p.set_defaults(fn=_cmd_sheet)
     p = sub.add_parser("render")
     p.add_argument("--dump", required=True)
+    p.add_argument("--log", default="", help="job log: apply its vision/banner page crops so dump boxes line up")
     p.add_argument("--input", required=True)
     p.add_argument("--pages", default="")
     p.add_argument("--out", required=True)

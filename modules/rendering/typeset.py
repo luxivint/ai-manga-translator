@@ -7,6 +7,8 @@ page-level font size band.
 """
 from __future__ import annotations
 
+import os
+
 import re
 from typing import Callable, Optional
 
@@ -202,6 +204,9 @@ def fit_text(text: str, measure: Callable[[int], tuple], box_w: float, box_h: fl
         return _fit_paragraphs(text, measure, box_w, box_h, max_size, floor, pad)
     plain = _fit(text, measure, box_w, box_h, max_size, min_size, floor, pad, False)
     hyph = _fit(text, measure, box_w, box_h, max_size, min_size, floor, pad, True)
+    if len(text.split()) == 1:
+        # a single-word balloon ('MERHABA.') reads better whole at a somewhat smaller size than cut as 'MER-/HABA.'
+        hyphen_pref = min(hyphen_pref, float(os.environ.get("RENDER_SINGLE_WORD_HYPHEN_PREF", "0.5")))
     if not plain[4] and (hyph[4] or plain[1] >= hyphen_pref * hyph[1]):
         return plain
     return hyph

@@ -419,3 +419,7 @@ işlerinde çalışır. Yerel denemeler ve R2 worker işleri aynı ön işlemden
 ## GPU olmayan sunucu / Docker
 
 CPU sunucu kurulumu, örnek environment ve çalıştırma komutları: [DEPLOY.cpu.md](DEPLOY.cpu.md).
+
+- Render guvenlik agi (`RENDER_SAFETY_NET`): ceviriye sahip ama sayfaya hic cizilmeyen blok `[render-miss]` ile loglanir ve yine cizilir; beyaz silme komsu balon cizgisini korur; tek kelimelik balon bolunmez.
+
+- `CLEAN_FRINGE_PASS` / `CLEAN_FLAT_SNAP` (varsayilan `true`): kesik harf artiklari ve duz balonlardaki hayalet iz temizligi.
