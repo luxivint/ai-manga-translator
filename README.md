@@ -363,6 +363,7 @@ Out of the box `local_batch.py` and the worker use:
 | `RENDER_ABSORB_STRAYS` | `true` | a tiny 1-2 word block (clearly smaller source lettering) inside a balloon joins the balloon's main text instead of being drawn tiny |
 | `RENDER_MERGE_NARRATION` | `true` | stacked narration/caption lines of one box become one paragraph |
 | `RENDER_HARD_GUARD` | `true` | every balloon block keeps all line boxes (+2% clearance) inside the interior mask, shrinking the block (and so the balloon band) if needed |
+| `RENDER_OUTLINE_MARGIN` | `0.05` | clearance between each line and the balloon outline (share of balloon width, min 8 px, 0 = off); `RENDER_LEAK_ELLIPSE` (`true`) uses the inscribed ellipse for dashed/open outlines, `RENDER_TILT_FIT` (`true`) keeps tilted text inside its box; QA: `scripts/replay_chapter.py fit` |
 | `BLOCK_CONTAINMENT_PRUNE`, `BLOCK_CONTAINMENT_RATIO`, `BLOCK_TEXT_COVER` | `true`, `0.6`, `0.8` | before translation: a block >= 60% inside another block whose OCR words (>= 80%) the other already contains is dropped (the same text read twice at another scale; saves translation tokens) |
 | `RENDER_RESOLVE_OVERLAP` | `true` | rendered text boxes that overlap are pushed apart / shrunk; halo-text is drawn under other blocks |
 | `RENDER_MERGE_OCR_ECHO` | `true` | stacked OCR windows whose texts overlap at the seam (one paragraph read in overlapping pieces) become ONE paragraph, repeated leading words dropped |

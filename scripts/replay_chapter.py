@@ -581,6 +581,89 @@ def _cmd_run(a):
         print(mode, {c: sum(r[c] for r in sel) for c in DEFECT_COLS}, "pages with any:", sum(1 for r in sel if any(r[c] for c in DEFECT_COLS)), flush=True)
 
 
+def _cmd_fit(a):
+    """Text-fit QA: clean once per page (cached as pickle), then render only and measure the share of ink pixels that lies
+    within --band px of a dark balloon outline pixel (per balloon, pooled), plus size statistics. NO network."""
+    import copy
+    import pickle
+    import statistics
+    import numpy as np
+    from PIL import Image
+    from modules.rendering.outline_metric import balloon_outline_overlap
+    from scripts import replay_clean as rcl
+
+    lb, args, main = _setup()
+    by_page = rcl._load_entries(Path(a.log))
+    crops = load_crops(a.log)
+    cache, out = Path(a.cache), Path(a.out)
+    cache.mkdir(parents=True, exist_ok=True)
+    out.mkdir(parents=True, exist_ok=True)
+    names = sorted(p.name for p in Path(a.input).glob("recut-*.png"))
+    if a.pages:
+        want = {f"recut-{int(x):05d}.png" for x in a.pages.split(",")}
+        names = [n for n in names if n in want]
+    tot_ink = tot_band = tot_near = n_bal = n_bad = 0
+    sizes, spreads, tiny, rows = [], [], 0, []
+    for n in names:
+        ents = by_page.get(n, [])
+        if not ents:
+            continue
+        cf = cache / (n[:-4] + ".pkl")
+        if cf.exists():
+            image, cleaned, blocks = pickle.loads(cf.read_bytes())
+        else:
+            image, cleaned, _, blocks = rcl.clean_page(lb, args, Path(a.input) / n, ents, crops=crops)
+            cf.write_bytes(pickle.dumps((image, cleaned, blocks)))
+        cl, state = lb.build_text_items_state(copy.deepcopy(blocks), image, cleaned.copy(), args, main)
+        from app.ui.canvas.save_renderer import ImageSaveRenderer
+        r = ImageSaveRenderer(cl)
+        r.add_state_to_image({"text_items_state": state})
+        final = np.ascontiguousarray(r.render_to_image().astype(np.uint8))
+        Image.fromarray(final).save(out / (n[:-4] + ".png"))
+        W = image.shape[1]
+        px = [d["font_size"] * 800.0 / W for d in state]
+        sizes += px
+        tiny += sum(1 for s in px if s < 11.0)
+        seen = set()
+        for b in blocks:
+            bb = getattr(b, "bubble_xyxy", None)
+            if bb is None or not (b.translation or "").strip():
+                continue
+            key = tuple(int(v) for v in bb)
+            if key in seen:
+                continue
+            seen.add(key)
+            skip = [(d["position"][0], d["position"][1], d["position"][0] + d["width"], d["position"][1] + d["height"])
+                    for d in state if not d["debug"]["bub"] or d["debug"]["style"] in ("sfx", "shout", "title")]
+            m = balloon_outline_overlap(cl, final, bb, band_px=a.band, skip_rects=skip)
+            if m is None:
+                continue
+            m8 = balloon_outline_overlap(cl, final, bb, band_px=a.band * 2, skip_rects=skip)
+            n_bal += 1
+            tot_ink += m[0]
+            tot_band += m[1]
+            tot_near += m8[1]
+            if m8[1] / m[0] > 0.01:
+                n_bad += 1
+                rows.append((round(m[1] / m[0], 4), round(m8[1] / m[0], 4), n, key))
+            mem = [d["font_size"] for d in state if key[0] <= d["position"][0] + d["width"] / 2 <= key[2] and key[1] <= d["position"][1] + d["height"] / 2 <= key[3]]
+            if len(mem) >= 2:
+                spreads.append(max(mem) / min(mem))
+                if max(mem) / min(mem) > 1.5:
+                    print("SPREAD", n, list(key), mem, flush=True)
+        print(n, "items", len(state), flush=True)
+    rows.sort(key=lambda r: -r[1])
+    res = dict(balloons=n_bal, ink_in_band_pct=round(100.0 * tot_band / max(1, tot_ink), 3),
+               ink_near_pct=round(100.0 * tot_near / max(1, tot_ink), 3), balloons_near_over_1pct=n_bad,
+               items=len(sizes), tiny=tiny, size_median=round(statistics.median(sizes), 2) if sizes else 0,
+               size_stdev=round(statistics.pstdev(sizes), 2) if sizes else 0,
+               balloon_spread_mean=round(statistics.mean(spreads), 3) if spreads else 0,
+               balloon_spread_max=round(max(spreads), 3) if spreads else 0)
+    print("RESULT", json.dumps(res))
+    print("WORST(touch,near,page,box)", json.dumps([(r[0], r[1], r[2], list(r[3])) for r in rows[:14]]))
+    (out / "fit_result.json").write_text(json.dumps(dict(result=res, worst=[(r[0], r[1], r[2], list(r[3])) for r in rows]), indent=1), encoding="utf-8")
+
+
 def _long_block(pe):
     """First text_bubble entry with >= 6 words of OCR text and a translation (index into pe) or None."""
     for k, e in enumerate(pe):
@@ -811,6 +894,14 @@ def main(argv=None) -> int:
     p.add_argument("--labels", nargs="*", default=[])
     p.add_argument("--out", required=True)
     p.set_defaults(fn=_cmd_sheet)
+    p = sub.add_parser("fit")
+    p.add_argument("--log", required=True)
+    p.add_argument("--input", required=True, help="recut-NNNNN.png dir")
+    p.add_argument("--cache", required=True)
+    p.add_argument("--pages", default="")
+    p.add_argument("--band", type=int, default=4)
+    p.add_argument("--out", required=True)
+    p.set_defaults(fn=_cmd_fit)
     p = sub.add_parser("render")
     p.add_argument("--dump", required=True)
     p.add_argument("--log", default="", help="job log: apply its vision/banner page crops so dump boxes line up")

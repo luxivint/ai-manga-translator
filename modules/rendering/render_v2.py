@@ -99,6 +99,23 @@ def _largest_rect(grid: np.ndarray) -> tuple[int, int, int, int]:
     return best[1]
 
 
+def _leaky(comp: np.ndarray) -> bool:
+    """True when the interior component runs off the balloon box over part of the box border (12 to 90 percent): a closed
+    ellipse touches its box only at four points and a rectangle (narration box) touches all of it."""
+    if os.environ.get("RENDER_LEAK_ELLIPSE", "true").lower() != "true":
+        return False
+    h, w = comp.shape
+    border = np.concatenate([comp[0], comp[-1], comp[:, 0], comp[:, -1]])
+    return 0.12 < float(border.mean()) < 0.90
+
+
+def _ellipse_mask(shape) -> np.ndarray:
+    h, w = shape
+    m = np.zeros((h, w), np.uint8)
+    cv2.ellipse(m, (w // 2, h // 2), (max(1, w // 2 - 1), max(1, h // 2 - 1)), 0, 0, 360, 1, -1)
+    return m
+
+
 def bubble_interior_ex(cleaned: np.ndarray, blk):
     """Largest safe rectangle inside the balloon, from the cleaned page.
 
@@ -129,6 +146,10 @@ def bubble_interior_ex(cleaned: np.ndarray, blk):
             return None, None, None
         lab = np.bincount(labels[ty1 - by1:ty2 - by1, tx1 - bx1:tx2 - bx1][ys, xs]).argmax()
     comp = (labels == lab).astype(np.uint8)
+    if getattr(blk, "text_class", "") == "text_bubble" and _leaky(comp):
+        # dashed / open outline: the flood fill escaped through the gaps and fills the whole box, so the box says nothing
+        # about the balloon shape. Use the ellipse inscribed in the balloon box instead (RENDER_LEAK_ELLIPSE=false: off).
+        comp = comp & _ellipse_mask(comp.shape)
     # fill holes (leftover glyph remnants) and keep a safety margin from the outline
     contours, _ = cv2.findContours(comp, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     filled = np.zeros_like(comp)
@@ -307,6 +328,13 @@ def widen(region, fw: float, W: int, H: int, fh: float = 1.0):
             min(W - mx, int(cx + w / 2)), min(H - my, int(cy + h / 2)))
 
 
+def outline_margin_px(width: float) -> float:
+    """Clearance between a laid-out line and the balloon outline: RENDER_OUTLINE_MARGIN (default 0.05) of the balloon width,
+    at least 8 px (0 disables)."""
+    f = float(os.environ.get("RENDER_OUTLINE_MARGIN", "0.05"))
+    return max(8.0, f * width) if f > 0 else 0.0
+
+
 def lines_inside(plan, text: str, size: int, region, line_spacing: float, frac: float = 0.97) -> bool:
     """True if every line of `text` (centred in `region`) lies inside the balloon interior mask."""
     inner, off = plan["inner"], plan["inner_off"]
@@ -314,7 +342,7 @@ def lines_inside(plan, text: str, size: int, region, line_spacing: float, frac: 
         return True
     width, line_h = make_measure(plan["family"], line_spacing)(size)
     strict = bool(plan.get("strict"))  # members of a multi-block balloon: every line box (plus clearance) inside
-    side = 0.02 * inner.shape[1] if strict else 0.0  # clearance to the outline on top of the eroded mask
+    side = max(0.02 * inner.shape[1] if strict else 0.0, outline_margin_px(inner.shape[1]))  # clearance to the outline
     lines = text.split("\n")
     total = line_h * len(lines)
     cx, cy = (region[0] + region[2]) / 2, (region[1] + region[3]) / 2
@@ -755,7 +783,9 @@ def build_items(blocks, image, cleaned, orig_boxes, render_settings, alignment, 
         if angle != 0.0 and rect is not None:
             cx, cy, long_len, short_len = rect
             cx, cy = cx + off[0], cy + off[1]
-            region = (int(cx - long_len * 0.58), int(cy - short_len * 0.62), int(cx + long_len * 0.58), int(cy + short_len * 0.62))
+            # a tilted text box that sits in a drawn box / balloon must not be taller than the box itself (RENDER_TILT_FIT)
+            sh = 0.47 if (in_bubble and os.environ.get("RENDER_TILT_FIT", "true").lower() == "true") else 0.62
+            region = (int(cx - long_len * 0.58), int(cy - short_len * sh), int(cx + long_len * 0.58), int(cy + short_len * sh))
         elif in_bubble:
             region, inner, ioff = bubble_interior_ex(cleaned, blk)
             is_bubble = region is not None

@@ -368,6 +368,7 @@ Bu komut torch/torchvision'ın CUDA 13 sürümlerini ve `onnxruntime-gpu`'yu kur
 | `RENDER_ABSORB_STRAYS` | `true` | balon içindeki küçük 1-2 kelimelik başıboş blok balonun ana metnine katılır |
 | `RENDER_MERGE_NARRATION` | `true` | üst üste dizili anlatım/altyazı satırları tek paragraf olur |
 | `RENDER_HARD_GUARD` | `true` | her balon bloğunun tüm satırları (+%2 boşluk) balon içinde kalır; gerekirse blok küçülür |
+| `RENDER_OUTLINE_MARGIN` | `0.05` | satır ile balon çizgisi arası boşluk (balon genişliğinin oranı, en az 8 px, 0 = kapalı); kesikli çizgide `RENDER_LEAK_ELLIPSE`, eğik kutuda `RENDER_TILT_FIT` |
 | `BLOCK_CONTAINMENT_PRUNE`, `BLOCK_CONTAINMENT_RATIO`, `BLOCK_TEXT_COVER` | `true`, `0.6`, `0.8` | çeviriden önce: başka bir bloğun içinde (>= %60) duran ve kelimeleri (>= %80) o bloğta zaten bulunan blok atılır |
 | `RENDER_RESOLVE_OVERLAP` | `true` | üst üste binen yazı kutuları ayrılır / küçültülür |
 | `RENDER_MERGE_OCR_ECHO` | `true` | uç uca binen OCR pencereleri (bir paragrafın örtüşen parçalar halinde okunması) tek paragraf olur, tekrar eden baştaki kelimeler atılır |

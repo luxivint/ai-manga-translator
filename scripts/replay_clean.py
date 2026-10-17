@@ -45,10 +45,9 @@ def _load_entries(log: Path) -> dict:
     return by_page
 
 
-def clean_page(lb, args, path: Path, ents: list[dict], idx: int = 0):
+def clean_page(lb, args, path: Path, ents: list[dict], idx: int = 0, crops: dict | None = None):
     """The live _stage_clean on a recut page (blocks rebuilt from the dump). Returns (image, cleaned, mask, blocks)."""
-    import imkit as imk
-    image = imk.read_image(str(path))
+    image = rc.read_page(path, crops)  # applies the live vision/banner crop so dump boxes line up
     blocks = rc.build_blocks(lb, args, image, ents)
     captured = {}
     orig_build = lb.build_segmenter_mask
@@ -72,6 +71,7 @@ def cmd_clean(a):
     from modules.inpainting import fill_qa
     lb, args = rc.make_args()
     by_page = _load_entries(Path(a.log))
+    crops = rc.load_crops(a.log)
     names = sorted(p.name for p in Path(a.input).glob("recut-*.png"))
     if a.pages:
         want = {f"recut-{int(x):05d}.png" for x in a.pages.split(",")}
@@ -83,7 +83,7 @@ def cmd_clean(a):
         ents = by_page.get(n, [])
         if not ents:
             continue
-        image, cleaned, mask, blocks = clean_page(lb, args, Path(a.input) / n, ents)
+        image, cleaned, mask, blocks = clean_page(lb, args, Path(a.input) / n, ents, crops=crops)
         Image.fromarray(np.ascontiguousarray(cleaned)).save(out / n)
         if mask is not None:
             np.save(out / (n[:-4] + ".mask.npy"), np.packbits(mask > 0))
