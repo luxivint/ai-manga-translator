@@ -167,6 +167,15 @@ def get_breaker() -> CircuitBreaker:
         return _BREAKER
 
 
+def reset_process_state() -> None:
+    """Drop the process-wide breaker and OCR slot pool (a long-lived worker process starts each job clean)."""
+    global _BREAKER, _OCR_LIMITER
+    with _BREAKER_LOCK:
+        _BREAKER = None
+    with _OCR_LIMITER_LOCK:
+        _OCR_LIMITER = None
+
+
 class AdaptiveLimiter:
     """At most `max_n` holders at once; only 1 while the (optional) breaker is open."""
 

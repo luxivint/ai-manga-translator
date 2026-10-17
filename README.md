@@ -193,6 +193,8 @@ migration + the "create a job" code for your own backend/admin panel.
 
 ### How the queue loop actually behaves
 
+Optional warm mode: `WORKER_INPROCESS=true` runs chapters inside one long-lived child (`scripts/warm_runner.py`) so the detector, YOLO and LaMa stay loaded between jobs (saves the ~30 s model load per chapter); it recycles after `WORKER_RECYCLE_JOBS` jobs / `WORKER_RECYCLE_RSS_MB` / `WORKER_RECYCLE_VRAM_MB`, frees the GPU after `WORKER_MODEL_IDLE_SECONDS` idle, and `WORKER_DRY_RUN=<dir>` runs fake jobs offline for testing (see `.env.example`).
+
 Every `WORKER_IDLE_SECONDS` (default 15s), the worker:
 
 1. Claims one `QUEUED` row from `pipeline_jobs`, ordered by `priority` then

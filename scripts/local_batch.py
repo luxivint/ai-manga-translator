@@ -401,6 +401,39 @@ def _prewarm_cleaners() -> None:
     threading.Thread(target=_run, daemon=True, name="clean-prewarm").start()
 
 
+def loaded_models() -> list[str]:
+    """Names of the cleaning/detection models currently held in this process."""
+    from modules.detection.factory import DetectionEngineFactory
+    held = [n for n, v in (("segmenter", _SEGMENTER), ("segmenter-cpu", _SEGMENTER_CPU), ("lama", _LAMA)) if v is not None]
+    return held + [f"detector:{k}" for k in DetectionEngineFactory._engines]
+
+
+def unload_models() -> list[str]:
+    """Release LaMa sessions, both YOLO segmenters and the detector engines, then give torch's cached CUDA blocks
+    back (warm worker idle unload). The next job loads them again. Must not run while a job is running."""
+    global _SEGMENTER, _SEGMENTER_CPU, _LAMA
+    from modules.detection.factory import DetectionEngineFactory
+    from modules.inpainting.lama import release_gpu_memory
+    with _MODEL_LOCK:
+        released = loaded_models()
+        lama, _LAMA = _LAMA, None
+        _SEGMENTER = _SEGMENTER_CPU = None
+        DetectionEngineFactory._engines.clear()
+        if lama is not None and hasattr(lama, "close"):
+            lama.close()
+        del lama
+    release_gpu_memory()
+    return released
+
+
+def reset_job_state() -> None:
+    """Forget per-job process state so a job in a long-lived process starts like one in a fresh process:
+    gateway circuit breaker + OCR slots, and the one-shot stamp warning. Models stay loaded."""
+    global _STAMP_WARNING_PRINTED
+    _STAMP_WARNING_PRINTED = False
+    gateway.reset_process_state()
+
+
 def _seg_predict(segmenter, crop, **kw):
     """segmenter.predict on the configured device. GPU calls are serialised
     (SEG_GPU_CONCURRENCY, default 1); a CUDA OOM retries that call on a CPU copy."""

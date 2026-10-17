@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import atexit
 import os
 import re
 import shlex
@@ -15,7 +16,7 @@ import urllib.request
 import urllib.error
 import json
 
-from batch_process import run_batch_process, batch_progress
+from batch_process import run_batch_process, batch_progress, WarmRunner, env_fingerprint
 
 from r2_storage import R2Config, client, delete_prefix, load_env, normalize_key, public_url
 
@@ -544,6 +545,45 @@ def invalidate_web_cache(manga_slug: str):
 
 LOCAL_BATCH_VALIDATION_EXIT = 3  # keep in sync with local_batch.EXIT_VALIDATION_FAILED
 
+_WARM: WarmRunner | None = None
+
+
+def _env_number(name: str, default: float) -> float:
+    try:
+        return float(os.environ.get(name, "") or default)
+    except ValueError:
+        return default
+
+
+def warm_runner() -> WarmRunner | None:
+    """WORKER_INPROCESS=true: chapters run in one long-lived child with the models kept loaded (see warm_runner.py).
+    Default off = the classic one subprocess per chapter. Returns None when off."""
+    global _WARM
+    if os.environ.get("WORKER_INPROCESS", "false").strip().lower() not in ("1", "true", "yes", "on"):
+        return None
+    if _WARM is None:
+        _WARM = WarmRunner(
+            ROOT,
+            idle_seconds=_env_number("WORKER_MODEL_IDLE_SECONDS", 600),
+            recycle_jobs=int(_env_number("WORKER_RECYCLE_JOBS", 20)),
+            recycle_rss_mb=int(_env_number("WORKER_RECYCLE_RSS_MB", 0)),
+            recycle_vram_mb=int(_env_number("WORKER_RECYCLE_VRAM_MB", 0)),
+            child_log=ROOT / "work/job-logs" / f"warm-runner-{WORKER_ID}.log",
+        )
+        atexit.register(_WARM.close)
+    return _WARM
+
+
+def run_translation_command(command: list, env: dict, job_id: str, tick=None):
+    """Run one chapter command (local_batch.py ...): in the warm child when WORKER_INPROCESS=true, else as its own
+    subprocess. Both write the job log, call tick() every 5 s, stop on stall/cancel and raise CalledProcessError."""
+    log = ROOT / "work/job-logs" / f"{job_id}.log"
+    stall = int(os.environ.get("TRANSLATION_STALL_SECONDS", "600"))
+    warm = warm_runner()
+    if warm is None:
+        return run_batch_process(command, ROOT, env, log, tick, stall_seconds=stall)
+    return warm.run(command, ROOT, env, log, tick, stall_seconds=stall, fingerprint=env_fingerprint(env, ROOT / ".env"))
+
 
 def translate_chapter(chapter: dict, delete_raw: bool, job_id: str, tick=None):
     raw_prefix = prefix_from_key(chapter["raw_key"])
@@ -577,8 +617,7 @@ def translate_chapter(chapter: dict, delete_raw: bool, job_id: str, tick=None):
         command.append("--no-r2-delete-input")
     print("running:", " ".join(command), flush=True)
     try:
-        run_batch_process(command, ROOT, env, ROOT / "work/job-logs" / f"{job_id}.log", tick,
-                          stall_seconds=int(os.environ.get("TRANSLATION_STALL_SECONDS", "600")))
+        run_translation_command(command, env, job_id, tick)
     except subprocess.CalledProcessError as exc:
         if exc.returncode == 4:
             raise QuotaWaitError("Model usage limit reached; waiting for reset") from exc
@@ -719,6 +758,39 @@ def keep_worker_online():
         time.sleep(20)
 
 
+def dry_run(queue_dir: Path, interval: float) -> int:
+    """WORKER_DRY_RUN=<dir>: offline test mode. No database, no R2, no gateway: every <dir>/*.json is a fake job
+    {"script": "...py", "args": [...], "env": {...}} run through the same runner as a real chapter (warm child or
+    subprocess). Finished files are renamed .done / .failed. Used to measure idle cost and warm-start savings."""
+    print(f"Translation worker DRY RUN on {queue_dir} (no database, no network)", flush=True)
+    queue_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        while True:
+            if DRAIN_FILE and Path(DRAIN_FILE).exists():
+                print("Worker drained", flush=True)
+                return 0
+            pending = sorted(queue_dir.glob("*.json"))
+            if not pending:
+                time.sleep(interval)
+                continue
+            job_file = pending[0]
+            spec = json.loads(job_file.read_text(encoding="utf-8"))
+            env = os.environ.copy()
+            env.update({str(k): str(v) for k, v in spec.get("env", {}).items()})
+            started = time.monotonic()
+            try:
+                run_translation_command([sys.executable, spec["script"], *map(str, spec.get("args", []))],
+                                        env, job_file.stem)
+                job_file.rename(job_file.with_suffix(".done"))
+                print(f"dry job {job_file.stem} done in {time.monotonic() - started:.1f}s", flush=True)
+            except Exception as exc:
+                job_file.rename(job_file.with_suffix(".failed"))
+                print(f"dry job {job_file.stem} failed after {time.monotonic() - started:.1f}s: {exc}", flush=True)
+    finally:
+        if _WARM is not None:
+            _WARM.close()
+
+
 def main() -> int:
     load_env(ROOT / ".env")
     command = os.environ.get("WORKER_STARTUP_COMMAND", "").strip()
@@ -727,6 +799,9 @@ def main() -> int:
         return subprocess.call(shlex.split(command))
 
     interval = int(os.environ.get("WORKER_IDLE_SECONDS", "15"))
+    dry = os.environ.get("WORKER_DRY_RUN", "").strip()
+    if dry:
+        return dry_run(Path(dry), interval)
     conn = connect()
     print("Translation worker connected to pipeline_jobs.", flush=True)
     startup_cleanup(conn)

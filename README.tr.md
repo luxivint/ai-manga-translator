@@ -199,6 +199,8 @@ gereken migration + "iş oluştur" kodunu üretmesini iste.
 
 ### Kuyruk döngüsü gerçekte nasıl çalışıyor
 
+İsteğe bağlı sıcak mod: `WORKER_INPROCESS=true` bölümleri tek bir uzun ömürlü çocuk süreçte (`scripts/warm_runner.py`) çalıştırır; detector, YOLO ve LaMa işler arasında yüklü kalır (bölüm başına ~30 sn model yüklemesi kazanılır); `WORKER_RECYCLE_JOBS` iş / `WORKER_RECYCLE_RSS_MB` / `WORKER_RECYCLE_VRAM_MB` sonrası yenilenir, `WORKER_MODEL_IDLE_SECONDS` boşta kalınca GPU'yu bırakır, `WORKER_DRY_RUN=<klasör>` sahte işleri çevrimdışı çalıştırır (bkz. `.env.example`).
+
 Her `WORKER_IDLE_SECONDS`'da (varsayılan 15sn), worker:
 
 1. `pipeline_jobs`'tan `priority` sonra `created_at`'e göre sıralı bir
