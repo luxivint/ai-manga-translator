@@ -604,6 +604,7 @@ def _cmd_fit(a):
         names = [n for n in names if n in want]
     tot_ink = tot_band = tot_near = n_bal = n_bad = 0
     sizes, spreads, tiny, rows = [], [], 0, []
+    qa_rows: list[dict] = []
     for n in names:
         ents = by_page.get(n, [])
         if not ents:
@@ -614,13 +615,29 @@ def _cmd_fit(a):
         else:
             image, cleaned, _, blocks = rcl.clean_page(lb, args, Path(a.input) / n, ents, crops=crops)
             cf.write_bytes(pickle.dumps((image, cleaned, blocks)))
-        cl, state = lb.build_text_items_state(copy.deepcopy(blocks), image, cleaned.copy(), args, main)
+        import contextlib
+        import io
+        cap = io.StringIO()
+        with (contextlib.nullcontext() if os.environ.get("RENDER_DEBUG") else contextlib.redirect_stdout(cap)):  # the render logs [render-miss] / [render-untranslated] lines: count them
+            cl, state = lb.build_text_items_state(copy.deepcopy(blocks), image, cleaned.copy(), args, main)
         from app.ui.canvas.save_renderer import ImageSaveRenderer
         r = ImageSaveRenderer(cl)
         r.add_state_to_image({"text_items_state": state})
         final = np.ascontiguousarray(r.render_to_image().astype(np.uint8))
         Image.fromarray(final).save(out / (n[:-4] + ".png"))
         W = image.shape[1]
+        pd = page_defects(lb, image, cl, final, blocks, state)
+        logtxt = cap.getvalue()
+        qa = dict(page=int(n[6:11]), items=len(state),
+                  untranslated=sum(1 for b in blocks if getattr(b, "text_class", "") == "text_bubble" and len((b.text or "").split()) >= 2
+                           and not (b.translation or "").strip() and not getattr(b, "is_ad", False) and not lb.watermark_match(b)), render_miss=logtxt.count("[render-miss]"),
+                  near_outline=0, overflow=pd["overflow"], spread=pd["size_spread"], overlap=pd["overlap"],
+                  tiny=pd["tiny"], band=_page_band(state), min_px=round(min([d["font_size"] * 800.0 / W for d in state] or [0]), 1))
+        qa["detail"] = " | ".join([ln.strip()[:110] for ln in logtxt.splitlines() if ln.startswith("[render-miss]")] + ([pd["detail"][:160]] if pd["detail"] else []))
+        if qa["band"]:
+            qa["detail"] += " | band=" + ",".join(f"{d['font_size']}@{int(d['position'][1])}" for d in state
+                                                  if d["debug"].get("bub") and d["debug"].get("style") in ("normal", "thought", "whisper"))
+        qa_rows.append(qa)
         px = [d["font_size"] * 800.0 / W for d in state]
         sizes += px
         tiny += sum(1 for s in px if s < 11.0)
@@ -645,6 +662,7 @@ def _cmd_fit(a):
             tot_near += m8[1]
             if m8[1] / m[0] > 0.01:
                 n_bad += 1
+                qa_rows[-1]["near_outline"] += 1
                 rows.append((round(m[1] / m[0], 4), round(m8[1] / m[0], 4), n, key))
             mem = [d["font_size"] for d in state if key[0] <= d["position"][0] + d["width"] / 2 <= key[2] and key[1] <= d["position"][1] + d["height"] / 2 <= key[3]]
             if len(mem) >= 2:
@@ -653,6 +671,7 @@ def _cmd_fit(a):
                     print("SPREAD", n, list(key), mem, flush=True)
         print(n, "items", len(state), flush=True)
     rows.sort(key=lambda r: -r[1])
+    _print_qa(qa_rows, out)
     res = dict(balloons=n_bal, ink_in_band_pct=round(100.0 * tot_band / max(1, tot_ink), 3),
                ink_near_pct=round(100.0 * tot_near / max(1, tot_ink), 3), balloons_near_over_1pct=n_bad,
                items=len(sizes), tiny=tiny, size_median=round(statistics.median(sizes), 2) if sizes else 0,
@@ -662,6 +681,29 @@ def _cmd_fit(a):
     print("RESULT", json.dumps(res))
     print("WORST(touch,near,page,box)", json.dumps([(r[0], r[1], r[2], list(r[3])) for r in rows[:14]]))
     (out / "fit_result.json").write_text(json.dumps(dict(result=res, worst=[(r[0], r[1], r[2], list(r[3])) for r in rows]), indent=1), encoding="utf-8")
+
+
+QA_COLS = ["untranslated", "render_miss", "near_outline", "overflow", "spread", "overlap", "tiny", "band"]
+
+
+def _page_band(state, ratio: float = 1.6) -> int:
+    """1 when the plain speech balloons of a page differ in font size by more than `ratio` (consistency across balloons)."""
+    s = [d["font_size"] for d in state if d["debug"].get("bub") and d["debug"].get("style") in ("normal", "thought", "whisper")]
+    return int(len(s) >= 2 and max(s) / max(1, min(s)) > ratio)
+
+
+def _print_qa(qa_rows: list[dict], out: Path) -> None:
+    """Per-page QA table (only pages with a defect) + totals; full table in qa.csv."""
+    with open(out / "qa.csv", "w", newline="", encoding="utf-8") as f:
+        w = csv.DictWriter(f, fieldnames=["page", "items", "min_px"] + QA_COLS + ["detail"])
+        w.writeheader()
+        for r in qa_rows:
+            w.writerow({k: r[k] for k in w.fieldnames})
+    print("QA page " + " ".join(f"{c[:9]:>9}" for c in QA_COLS) + "  min_px")
+    for r in qa_rows:
+        if any(r[c] for c in QA_COLS):
+            print(f"QA {r['page']:>4} " + " ".join(f"{r[c]:>9}" for c in QA_COLS) + f"  {r['min_px']}  {r['detail'][:200]}")
+    print("QA TOTAL " + " ".join(f"{c}={sum(r[c] for r in qa_rows)}" for c in QA_COLS) + f" pages_with_defect={sum(1 for r in qa_rows if any(r[c] for c in QA_COLS))}")
 
 
 def _long_block(pe):

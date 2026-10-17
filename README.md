@@ -350,10 +350,14 @@ Out of the box `local_batch.py` and the worker use:
 | `GATEWAY_BACKOFFS` | `3,8,20` | retry delays (s, with jitter) for 5xx/429/timeouts on OCR, translate and vision calls; 3 consecutive failures open a shared 20 s -> 60 s cool-down |
 | `OCR_MAX_FAIL_RATIO` | `0.0` | share of pages that may fail OCR/translation; above it the job exits 3 (`FAILED: OCR failed on N pages: [...]`) before publishing, raw pages kept, job retried. Raw is never deleted if any page failed |
 | `PASSTHROUGH_SUSPECT_RATIO` | `0.5` | fails the job when more than this share of pages with detected text bubbles ended with 0 blocks (OCR returned nothing) |
+| `WATERMARK_PATTERNS` extra | | built-in rules also cover scan-group credit strips without a domain (`XXXSCANS`, `... SCANS TEAM`, `PRODUCE BY ... TEAM`); matching blocks are treated as ads (not translated) and erased whole |
 | `WATERMARK_POLICY` | `clean` | `clean` erases competitor watermarks/banners whole (never the site's own brand); `keep` leaves them untouched |
 | `CLEAN_FILL_QA` | `true` | after LaMa, every filled component is measured against its untouched ring; objectively bad fills (dithered blue "static", pink/green speckle, grey stipple) get a calmer fill (tuning: `CLEAN_FILL_QA_NOISE/_NOISE_ABS/_CHROMA/_CHROMA_ABS/_BLOBS/_BLOB_RATIO/_MIN_AREA/_RING`) |
 | `CLEAN_RESIDUAL_PASS` | `true` | segments the cleaned page again and cleans text-like leftovers near cleaned blocks (small / rotated / UI text); `CLEAN_RESIDUAL_PASSES` (max 2), `_NEAR`, `_CONF`, `_MAX_FRAC`, `_MIN_CONTRAST`, `_GROW` |
 | `CLEAN_FRINGE_PASS` | `true` | also removes small cut-off glyph pieces next to the cleaned area that sit on a flat background (`CLEAN_FRINGE_REACH`, `_MAX`, `_CONTRAST`) |
+| `CLEAN_OUTLINE_GLYPHS` | `true` | letters glued to a balloon outline are erased (the outline is fitted as a circular arc / cubic, only ink off the curve is removed) and the outline is redrawn along the fitted curve over the repaired stretch |
+| `CLEAN_BOX_LEFTOVERS` | `true` | letter-sized ink left inside a translated block's box within `CLEAN_BOX_REACH` (40) px of the cleaned area is removed (`CLEAN_BOX_CONTRAST` 30): low-contrast specks / ghosts |
+| `CLEAN_RESTORE_UNTOUCHED` | `true` | an untranslated block (kept as drawn) that a neighbour's mask half-erased gets its original letters back instead of fragments |
 | `CLEAN_FLAT_SNAP` | `true` | removes the faint ghost of the old text inside flat balloons: filled pixels snap to the ring's flat colour(s) (`CLEAN_FLAT_TOL`, `_COVER`, `_HALO`) |
 | `RENDER_V2`, `RENDER_STYLE_TAGS` | `true` | balloon- and style-aware typesetting |
 | `RENDER_BALLOON_UNIFY` | `true` | blocks sharing one balloon use one font and one size band (`RENDER_BALLOON_BAND`, default `0.12` = +-12% of the balloon median; blocks whose source cap height differs by more than `RENDER_EMPHASIS_RATIO`, default `1.4`, keep their size) and every line must lie inside the balloon interior; `false` = old per-block sizing |
@@ -371,6 +375,13 @@ Out of the box `local_batch.py` and the worker use:
 | `RENDER_STRICT_FIT`, `RENDER_STRICT_FLOOR` | `true`, `14` | crowded sign/phone/narration blocks (touching another block or cut from a merged OCR block) stay inside their OWN original box: shrink only, no growth, never pushed into neighbours; below the floor size they fall back to the normal fit |
 | `RENDER_TILT_FALLBACK` | `true` | diagonal source text stays diagonal: the tilt is read from the original ink when the cleaned-page mask gives none |
 | `RENDER_TINY_PX` | `14` | balloon text that ends below this size (at 800 px width) retries on its original text box inside the balloon box (`0` disables) |
+| `RENDER_OCR_FRAGMENT_SKIP` | `true` | an OCR window that starts with the cut tail of a word still counts as an echo of the previous window (merged into one paragraph) |
+| `RENDER_GROUP_NESTED` | `true` | a thin "balloon" (<= 35% as tall) inside another balloon box is the same balloon (text written over the rim) |
+| `RENDER_ABSORB_RIM` | `true` | a short block whose source lettering sits on the balloon outline joins the balloon's main text |
+| `RENDER_ABSORB_TAIL` | `true` | the last 1-2 words of an unfinished sentence, right below it, join the balloon's main text |
+| `RENDER_MERGE_SHOUT` | `true` | blocks of one burst (shout) balloon read as one paragraph (shout only, never mixed with speech) |
+| `RENDER_UNIFY_REPEAT_COLORS` | `true` | the same lettering printed twice on a page (repeated sound effect) gets one typeface and colour scheme |
+| `RENDER_TINY_KEEP` | `0.8` | the tiny-size retry also fires below this share of the source size (was fixed 0.6) |
 | `RENDER_SPIKY_GUARD` | `true` | a spiky / non-convex balloon interior (low convex-hull ratio) is trusted for the hard line-inside check, so lettering cannot cross its outline (never shrunk below 70%) |
 | `LIGHT_RENDER_CLEAR_PAD_X`, `LIGHT_RENDER_CLEAR_PAD_Y` | `16`, `10` | padding of the free-text white wipe around a block's box |
 | `LIGHT_RENDER_CLEAR_LOCAL_BG`, `LIGHT_RENDER_CLEAR_MAX_STD`, `LIGHT_RENDER_CLEAR_BG_SIGMA` | `true`, `22`, `18` | the wipe repaints with the local backdrop colour (follows gradients, no grey rectangle), skips non-plain zones and never paints over long thin lines / big dark areas; `LOCAL_BG=false` = old single-median fill |
@@ -395,4 +406,4 @@ progress every five seconds and stops the process tree after 600 seconds without
 Account usage-limit errors persist their reset deadline in `work/gateway-quota.json`, pause
 job claiming and requeue the current job without consuming a retry. Jobs resume after reset.
 
-- Render safety net (`RENDER_SAFETY_NET`): an OCR block with a translation that never reaches the page is logged as `[render-miss]` and rendered anyway; the white wipe keeps neighbouring balloon outlines (`LIGHT_RENDER_CLEAR_PROTECT_OUTLINES`); one-word balloons are not hyphenated (`RENDER_SINGLE_WORD_HYPHEN_PREF`). `replay_chapter.py run/render/styles --log JOB.log` re-applies the job's page crops.
+- Render safety net (`RENDER_SAFETY_NET`): an OCR block with a translation that never reaches the page is logged as `[render-miss]` and rendered anyway; the white wipe keeps neighbouring balloon outlines (`LIGHT_RENDER_CLEAR_PROTECT_OUTLINES`); one-word balloons are not hyphenated (`RENDER_SINGLE_WORD_HYPHEN_PREF`). `replay_chapter.py run/render/styles --log JOB.log` re-applies the job's page crops. `replay_chapter.py fit` also prints a per-page QA table (untranslated, render-miss, near-outline, overflow, size spread, overlap, tiny, page size band) and writes `qa.csv`.

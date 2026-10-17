@@ -55,6 +55,19 @@ def absorb_enabled() -> bool:
     return _flag("RENDER_ABSORB_STRAYS")
 
 
+def merge_shout_enabled() -> bool:
+    """Blocks of one burst (shout) balloon may read as one paragraph like speech balloons do."""
+    return _flag("RENDER_MERGE_SHOUT")
+
+
+def absorb_rim_enabled() -> bool:
+    return _flag("RENDER_ABSORB_RIM")
+
+
+def absorb_tail_enabled() -> bool:
+    return _flag("RENDER_ABSORB_TAIL")
+
+
 def emphasis_ratio() -> float:
     return float(os.environ.get("RENDER_EMPHASIS_RATIO", "1.4"))
 
@@ -91,6 +104,16 @@ def _touching(a, b, gap: float) -> bool:
     return xo >= 0.5 * min(a[2] - a[0], b[2] - b[0])
 
 
+def _nested_strip(a, b, ca, cb) -> bool:
+    """One balloon box lies (>= 85 percent) inside the other, is at most 35 percent as tall, and its text centre is inside
+    the bigger box: the detector reported a piece of the bigger balloon (its rim) as a balloon of its own."""
+    for small, big, c in ((a, b, ca), (b, a, cb)):
+        sh, bh = small[3] - small[1], big[3] - big[1]
+        if bh > 0 and sh <= 0.35 * bh and _contained_frac(small, big) >= 0.85 and _inside(big, c):
+            return True
+    return False
+
+
 def group_by_balloon(bubbles: list, boxes: list, touch_gap: float = 0.0) -> list[list[int]]:
     """Groups (>= 2 members, reading order) of blocks that sit in one balloon.
 
@@ -110,6 +133,7 @@ def group_by_balloon(bubbles: list, boxes: list, touch_gap: float = 0.0) -> list
         owner[find(i)] = find(j)
 
     robust = _flag("RENDER_GROUP_ROBUST")
+    nested = _flag("RENDER_GROUP_NESTED")
 
     def centre(k):
         return ((boxes[k][0] + boxes[k][2]) / 2, (boxes[k][1] + boxes[k][3]) / 2)
@@ -127,6 +151,8 @@ def group_by_balloon(bubbles: list, boxes: list, touch_gap: float = 0.0) -> list
                     # the detector sized one balloon differently for two of its lettering blocks: each balloon box
                     # holds the other block's text, so it is the same balloon
                     union(i, j)
+                elif nested and _nested_strip(bi, bj, centre(i), centre(j)):
+                    union(i, j)  # a thin 'balloon' the detector cut out of another balloon's rim
             if robust and (_contained_frac(boxes[i], boxes[j]) >= 0.6 or _contained_frac(boxes[j], boxes[i]) >= 0.6):
                 union(i, j)  # one lettering box lying inside another: the same text region (echo / piece of it)
     for i in range(n):
@@ -213,7 +239,8 @@ def mergeable(texts: list[str], styles: list[str], gaps: list[float], row_height
     narration = bool(styles) and all(s == "narration" for s in styles)
     if narration and not narration_merge_enabled():
         return False
-    if not narration and any(s not in SPEECH_STYLES for s in styles):
+    all_shout = merge_shout_enabled() and bool(styles) and all(s == "shout" for s in styles)  # one burst balloon only
+    if not narration and not all_shout and any(s not in SPEECH_STYLES for s in styles):
         return False
     if any(not (t or "").strip() for t in texts):
         return False
@@ -279,6 +306,31 @@ def stray_fragments(translations: list[str], sources: list[str], caps: list[floa
         if _word_count(t) > 2 or _word_count(sources[k]) > 2:
             continue
         if caps[k] and caps[main] and caps[k] >= 0.8 * caps[main]:
+            continue
+        out.append(k)
+    return out
+
+
+def tail_fragments(translations: list[str], boxes: list, caps: list[float], inside: list[bool]) -> list[int]:
+    """Positions of 1-2 word blocks that are the LAST WORDS of the balloon's main sentence (same letter size, so
+    stray_fragments does not see them): the main text (>= 3 words) does not end its sentence, the fragment sits right
+    below it (gap <= 1.5 text rows), inside the main block's column, and its centre lies inside the balloon."""
+    if len(translations) < 2:
+        return []
+    main = max(range(len(translations)), key=lambda k: _word_count(translations[k]))
+    mt = (translations[main] or "").strip()
+    if _word_count(mt) < 3 or ends_sentence(mt):
+        return []
+    mb = boxes[main]
+    out = []
+    for k, t in enumerate(translations):
+        if k == main or not (t or "").strip() or not inside[k] or _word_count(t) > 2:
+            continue
+        b = boxes[k]
+        row = max(caps[k] or 0.0, caps[main] or 0.0) or (b[3] - b[1])
+        gap = b[1] - mb[3]
+        cx = (b[0] + b[2]) / 2
+        if gap < -0.3 * row or gap > 1.5 * row or not (mb[0] - 0.1 * (mb[2] - mb[0]) <= cx <= mb[2] + 0.1 * (mb[2] - mb[0])):
             continue
         out.append(k)
     return out

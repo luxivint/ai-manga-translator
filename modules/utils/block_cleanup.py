@@ -204,6 +204,13 @@ def ocr_overlap_words(prev_text: str, next_text: str, max_words: int = 6) -> int
         if all(_word_match(a, b) for a, b in zip(pw[-n:], nw[:n])):
             if n >= 2 or len(nw[0]) >= 5:
                 return n
+    # the window cut a word of the previous text in half ('ARE YOU? YOU' -> 'U? YOU LOOK'): a leading 1-2 letter
+    # fragment that is the tail of a previous word is skipped, the words after it must still repeat the previous tail
+    if _flag("RENDER_OCR_FRAGMENT_SKIP") and len(nw) >= 2 and len(pw) >= 2 and len(nw[0]) <= 2             and any(len(w) > len(nw[0]) and w.endswith(nw[0]) for w in pw[-3:]):
+        rest = nw[1:]
+        for n in range(min(max_words, len(pw), len(rest)), 0, -1):
+            if all(_word_match(a, b) for a, b in zip(pw[-n:], rest[:n])):
+                return n + 1
     return 0
 
 

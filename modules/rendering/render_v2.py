@@ -268,6 +268,7 @@ MIN_LINE_SPACING = float(os.environ.get("RENDER_MIN_LINE_SPACING", "1.12"))  # r
 MAX_TARGET_SIZE = int(os.environ.get("RENDER_MAX_TARGET_SIZE", "400"))  # source-derived size replaces the old 58 cap
 BUBBLE_MAX_GROW = 1.22  # balloons with room may set Turkish a little larger than the English
 TINY_PX = int(os.environ.get("RENDER_TINY_PX", "14"))  # balloon text below this size (at 800 px width) retries on its original box
+TINY_KEEP = float(os.environ.get("RENDER_TINY_KEEP", "0.8"))  # ... and below this share of the source size (was a fixed 0.6)
 STRICT_FLOOR = int(os.environ.get("RENDER_STRICT_FLOOR", "14"))  # a strict-fit block below this size falls back to growing
 TARGET_MAX_GROW = 1.08   # Turkish may be set up to 8 percent bigger than the English cap height
 TARGET_MIN_KEEP = 0.82   # try to keep at least 82 percent of the source size before shrinking further
@@ -530,7 +531,34 @@ def dedupe_duplicate_blocks(blocks, orig_boxes):
     return [blocks[i] for i in keep], [orig_boxes[i] for i in keep]
 
 
-def prepare_balloon_blocks(blocks, orig_boxes, image):
+def _rim_fragments(blocks, g, boxes, cleaned, max_words: int = 5, min_cover: float = 0.5) -> list[int]:
+    """Positions (in g) of short blocks of one balloon whose source lettering sits ON the balloon outline (less than half
+    of its box lies inside the interior of the balloon's main block): the sentence tail written over the rim. Laid out on
+    its own it would print across the outline, so it joins the main text instead."""
+    main = max(range(len(g)), key=lambda k: len((blocks[g[k]].translation or "").split()))
+    mb = blocks[g[main]]
+    if getattr(mb, "bubble_xyxy", None) is None or len((mb.translation or "").split()) < 3:
+        return []
+    _, inner, off = bubble_interior_ex(cleaned, mb)
+    if inner is None:
+        return []
+    out = []
+    for k, i in enumerate(g):
+        if k == main or not (blocks[i].translation or "").strip() or len((blocks[i].translation or "").split()) > max_words:
+            continue
+        x1, y1, x2, y2 = [int(v) for v in boxes[i]]
+        rx1, ry1, rx2, ry2 = x1 - off[0], y1 - off[1], x2 - off[0], y2 - off[1]
+        if rx2 <= 0 or ry2 <= 0 or rx1 >= inner.shape[1] or ry1 >= inner.shape[0]:
+            out.append(k)
+            continue
+        sub = inner[max(0, ry1):max(0, ry2), max(0, rx1):max(0, rx2)]
+        full_area = max(1, (x2 - x1) * (y2 - y1))
+        if sub.size and float(sub.sum()) / full_area < min_cover:
+            out.append(k)
+    return out
+
+
+def prepare_balloon_blocks(blocks, orig_boxes, image, cleaned=None):
     """Blocks that share a balloon: drop words one block repeats from the previous one (a sentence continued across
     blocks that the translator wrote out twice); absorb tiny stray 1-2 word blocks into the balloon's main text; and,
     when RENDER_MERGE_BALLOON is on and the blocks read as one continued speech (or stacked lines of one narration
@@ -611,6 +639,11 @@ def prepare_balloon_blocks(blocks, orig_boxes, image):
                 inside.append(any(b[0] <= cx <= b[2] and b[1] <= cy <= b[3] for b in owners))
             strays = bl.stray_fragments([blocks[i].translation for i in g], [getattr(blocks[i], "text", "") for i in g],
                                         [_source_cap(image, orig_boxes[i]) for i in g], inside)
+            if not strays and bl.absorb_tail_enabled():
+                strays = bl.tail_fragments([blocks[i].translation for i in g], [boxes[i] for i in g],
+                                           [_source_cap(image, orig_boxes[i]) for i in g], inside)
+            if not strays and cleaned is not None and bl.absorb_rim_enabled():
+                strays = _rim_fragments(blocks, g, boxes, cleaned)
             if strays:
                 main = max(range(len(g)), key=lambda k: len((blocks[g[k]].translation or "").split()))
                 idx = sorted([g[main]] + [g[k] for k in strays], key=lambda i: ((boxes[i][1] + boxes[i][3]) / 2, boxes[i][0]))
@@ -702,6 +735,53 @@ def resolve_item_overlaps(items: list, plans: list, W: int, H: int, direction) -
     return remaining
 
 
+def unify_repeat_colors(plans: list) -> int:
+    """The same free lettering printed twice on a page (a repeated sound effect: 'QUIVER QUIVER') must look alike. When one
+    copy's colour analysis is weak (fill close to the backdrop) it takes the fill, outline, gradient and glow
+    of the copy with the strongest contrast. RENDER_UNIFY_REPEAT_COLORS=false disables. Returns the number changed."""
+    if os.environ.get("RENDER_UNIFY_REPEAT_COLORS", "true").strip().lower() in ("false", "0", "no", "off"):
+        return 0
+
+    def contrast(p):
+        ana = p["analysis"]
+        fill = ana["fill"] or p["colors"][0]
+        ref = p["colors"][1]  # backdrop colour
+        if fill is None or ref is None:
+            return 0.0
+        return abs(_lum(fill) - _lum(ref))
+
+    groups: dict = {}
+    for p in plans:
+        key = (bcl_key(p["text"]), p["style"])
+        if not p["bubble"] and not p["list_like"] and len(key[0]) >= 3 and p["cap_h"] >= 12:
+            groups.setdefault(key, []).append(p)
+    changed = 0
+    for members in groups.values():
+        if len(members) < 2:
+            continue
+        best = max(members, key=contrast)
+        cb = contrast(best)
+        bfill = best["analysis"]["fill"] or best["colors"][0]
+        for p in members:
+            if p is best:
+                continue
+            if p["family"] != best["family"] or p["italic"] != best["italic"]:  # same lettering, one typeface
+                p.update(family=best["family"], font_rel=best["font_rel"], italic=best["italic"])
+                p["text"] = fp.sanitize_for_font(p["text"], best["font_rel"])
+                changed += 1
+            pfill = p["analysis"]["fill"] or p["colors"][0]
+            if bfill is not None and best["analysis"]["fill"] is not None and (
+                    contrast(p) < 0.7 * cb or (pfill is not None and abs(_lum(pfill) - _lum(bfill)) > 50)):
+                p["analysis"] = dict(best["analysis"])
+                p["colors"] = (best["colors"][0], p["colors"][1], p["colors"][2])
+                changed += 1
+    return changed
+
+
+def bcl_key(text: str) -> str:
+    return "".join(ch for ch in (text or "").casefold() if ch.isalnum())
+
+
 def build_items(blocks, image, cleaned, orig_boxes, render_settings, alignment, target_code: str, _rescue: bool = False):
     """Returns list of TextItemProperties dicts (V2 layout). `_rescue` = internal re-run of blocks the safety net found
     unrendered (no merge / dedupe / split steps: they were what lost the text)."""
@@ -719,7 +799,7 @@ def build_items(blocks, image, cleaned, orig_boxes, render_settings, alignment, 
         blocks, orig_boxes = split_merged_blocks(blocks, orig_boxes, image, cleaned)
         blocks, orig_boxes = drop_split_duplicates(blocks, orig_boxes)
         blocks, orig_boxes = dedupe_duplicate_blocks(blocks, orig_boxes)
-        blocks, orig_boxes = prepare_balloon_blocks(blocks, orig_boxes, image)
+        blocks, orig_boxes = prepare_balloon_blocks(blocks, orig_boxes, image, cleaned)
     for blk, obox in zip(blocks, orig_boxes):
         raw = (blk.translation or "")
         if not raw.strip() or len(raw.strip()) == 1:
@@ -1100,7 +1180,7 @@ def build_items(blocks, image, cleaned, orig_boxes, render_settings, alignment, 
         the balloon box (RENDER_TINY_PX, default 14 at 800 px width; 0 disables)."""
         for i, plan in enumerate(plans):
             target = plan.get("target") or 0.0
-            if not (TINY_PX and target and plan["bubble"] and fits[i][1] < TINY_PX * W / 800.0 and fits[i][1] < 0.6 * target):
+            if not (TINY_PX and target and plan["bubble"] and fits[i][1] < TINY_PX * W / 800.0 and fits[i][1] < TINY_KEEP * target):
                 continue
             ox1, oy1, ox2, oy2 = [float(v) for v in plan["obox"]]
             bb = getattr(plan["blk"], "bubble_xyxy", None)
@@ -1119,6 +1199,7 @@ def build_items(blocks, image, cleaned, orig_boxes, render_settings, alignment, 
 
     tiny_retry()
 
+    unify_repeat_colors(plans)
     items = []
     for plan, (out, size, dw, dh) in zip(plans, fits):
         blk = plan["blk"]

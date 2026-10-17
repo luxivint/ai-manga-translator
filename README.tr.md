@@ -376,6 +376,8 @@ Bu komut torch/torchvision'ın CUDA 13 sürümlerini ve `onnxruntime-gpu`'yu kur
 | `RENDER_STRICT_FIT`, `RENDER_STRICT_FLOOR` | `true`, `14` | kalabalık tabela/telefon/anlatım blokları kendi özgün kutusunda kalır: yalnız küçülür, büyümez, komşuya itilmez; taban boyutun altında normal sığdırmaya döner |
 | `RENDER_TILT_FALLBACK` | `true` | çapraz kaynak yazı çapraz kalır: temizlenmiş sayfadan eğim bulunamazsa özgün mürekkepten okunur |
 | `RENDER_TINY_PX` | `14` | 800 px genişlikte bu boyutun altında kalan balon yazısı, balon kutusu içinde özgün yazı kutusunda yeniden denenir (`0` kapatır) |
+| `RENDER_OCR_FRAGMENT_SKIP` `RENDER_GROUP_NESTED` `RENDER_ABSORB_RIM` `RENDER_ABSORB_TAIL` `RENDER_MERGE_SHOUT` `RENDER_UNIFY_REPEAT_COLORS` | `true` | balon kenarına taşan / yarım kalan parçaları ana balon metnine katar, aynı balonun çığlık bloklarını birleştirir, tekrar eden ses efektlerini aynı renk ve fonta eşitler (ayrıntı: README.md) |
+| `RENDER_TINY_KEEP` | `0.8` | küçük yazı yeniden denemesi özgün boyutun bu oranının altında da çalışır |
 | `RENDER_SPIKY_GUARD` | `true` | sivri / dışbükey olmayan balon içi sert satır-içeride denetiminde kullanılır; yazı balon çizgisini aşmaz (en fazla %30 küçülür) |
 | `LIGHT_RENDER_CLEAR_PAD_X`, `LIGHT_RENDER_CLEAR_PAD_Y` | `16`, `10` | serbest yazı beyaz silme işleminin blok kutusu çevresindeki payı |
 | `LIGHT_RENDER_CLEAR_LOCAL_BG`, `LIGHT_RENDER_CLEAR_MAX_STD`, `LIGHT_RENDER_CLEAR_BG_SIGMA` | `true`, `22`, `18` | silme yerel arka plan rengiyle boyar (degradeleri izler, gri dikdörtgen kalmaz), düz olmayan bölgeleri atlar, uzun ince çizgilerin / büyük koyu alanların üstünü boyamaz; `LOCAL_BG=false` = eski tek medyan dolgu |
@@ -423,4 +425,5 @@ CPU sunucu kurulumu, örnek environment ve çalıştırma komutları: [DEPLOY.cp
 
 - Render guvenlik agi (`RENDER_SAFETY_NET`): ceviriye sahip ama sayfaya hic cizilmeyen blok `[render-miss]` ile loglanir ve yine cizilir; beyaz silme komsu balon cizgisini korur; tek kelimelik balon bolunmez.
 
+- `CLEAN_OUTLINE_GLYPHS` / `CLEAN_BOX_LEFTOVERS` / `CLEAN_RESTORE_UNTOUCHED` (varsayilan `true`): balon cizgisine yapisik harfleri siler ve cizgiyi yeniden cizer; ceviri kutusundaki kalintilari temizler; cevirisiz blogun yarim silinen harflerini geri koyar. Scan-grup kredi seritleri (`...SCANS TEAM`) watermark kuralina eklendi.
 - `CLEAN_FRINGE_PASS` / `CLEAN_FLAT_SNAP` (varsayilan `true`): kesik harf artiklari ve duz balonlardaki hayalet iz temizligi.
