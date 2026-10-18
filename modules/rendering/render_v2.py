@@ -269,9 +269,11 @@ MAX_TARGET_SIZE = int(os.environ.get("RENDER_MAX_TARGET_SIZE", "400"))  # source
 BUBBLE_MAX_GROW = 1.22  # balloons with room may set Turkish a little larger than the English
 TINY_PX = int(os.environ.get("RENDER_TINY_PX", "14"))  # balloon text below this size (at 800 px width) retries on its original box
 TINY_KEEP = float(os.environ.get("RENDER_TINY_KEEP", "0.8"))  # ... and below this share of the source size (was a fixed 0.6)
+SMALL_KEEP = float(os.environ.get("RENDER_SMALL_RETRY_KEEP", "0.68"))  # balloon text below this share of the source size also retries on its original box (0 = off)
 STRICT_FLOOR = int(os.environ.get("RENDER_STRICT_FLOOR", "14"))  # a strict-fit block below this size falls back to growing
 TARGET_MAX_GROW = 1.08   # Turkish may be set up to 8 percent bigger than the English cap height
 TARGET_MIN_KEEP = 0.82   # try to keep at least 82 percent of the source size before shrinking further
+HYPHEN_KEEP = float(os.environ.get("RENDER_HYPHEN_KEEP", "0.75"))  # unbroken rewrap of a hyphenated balloon kept down to this size share (0 = off)
 
 
 def size_for_cap(family: str, cap_px: float, rel: str | None = None) -> float:
@@ -408,6 +410,18 @@ def caps_center_offset(family: str, size: float, n_lines: int, line_spacing: flo
     return (top + bottom) / 2.0
 
 
+def _plate_color(cleaned: np.ndarray, obox):
+    """Median colour of the cleaned page in the central part of a text box (the plate / paper the lettering was printed
+    on, after the lettering was removed), or None."""
+    H, W = cleaned.shape[:2]
+    x1, y1, x2, y2 = [float(v) for v in obox]
+    w, h = x2 - x1, y2 - y1
+    a, b, c, d = int(max(0, x1 + 0.2 * w)), int(max(0, y1 + 0.2 * h)), int(min(W, x2 - 0.2 * w)), int(min(H, y2 - 0.2 * h))
+    if c - a < 2 or d - b < 2:
+        return None
+    return tuple(int(v) for v in np.median(cleaned[b:d, a:c].reshape(-1, 3), axis=0))
+
+
 def needs_outline(cleaned: np.ndarray, xyxy, text_rgb, min_delta: float = 50.0, max_clash: float = 0.25) -> bool:
     """True when more than max_clash of the backdrop pixels behind the text are close in lightness to the text."""
     H, W = cleaned.shape[:2]
@@ -417,6 +431,78 @@ def needs_outline(cleaned: np.ndarray, xyxy, text_rgb, min_delta: float = 50.0, 
         return True
     lum = crop[..., 0] * 0.2126 + crop[..., 1] * 0.7152 + crop[..., 2] * 0.0722
     return float((np.abs(lum - _lum(text_rgb)) < min_delta).mean()) > max_clash
+
+
+def drop_row_slivers(blocks, orig_boxes, image):
+    """Partial OCR reads of one text row (a 14 px tall box inside a 45 px row, read twice as 'MISSING SEMICONDUCTOR)' /
+    'USING SEMICONDUCTOR)'): duplicates are dropped, the kept read is re-boxed to the whole row (RENDER_SLIVER_GUARD)."""
+    from modules.utils import block_cleanup as bcl
+
+    if not bcl.sliver_guard_enabled() or len(blocks) < 2:
+        return blocks, orig_boxes, []
+    H, W = image.shape[:2]
+    boxes = [[float(v) for v in o] for o in orig_boxes]
+    rows: list = []
+    for b, bx in zip(blocks, boxes):
+        h = bx[3] - bx[1]
+        if b.text_class == "text_bubble" or not (b.translation or "").strip() or h <= 0:
+            rows.append(None)
+            continue
+        probe = (bx[0], max(0.0, bx[1] - 3 * h - 20), bx[2], min(float(H), bx[3] + 3 * h + 20))
+        m, (_, oy) = tst.ink_mask_local(image, probe)
+        cy = (bx[1] + bx[3]) / 2 - oy
+        hit = [(oy + a, oy + e) for a, e in tst.row_runs(m, min_height=5) if a - 2 <= cy <= e + 2]
+        rows.append(hit[0] if hit else None)
+    drop = set(bcl.row_slivers(boxes, rows))
+    out_b, out_o, dropped = [], [], []
+    for k, (b, o) in enumerate(zip(blocks, orig_boxes)):
+        if k in drop:
+            if os.environ.get("RENDER_DEBUG"):
+                print(f"[sliver] dropped {list(map(int, o))} {b.translation!r} (another read of the same text row)", flush=True)
+            dropped.append(boxes[k])
+            continue
+        r = rows[k]
+        if r is not None and (boxes[k][3] - boxes[k][1]) < 0.55 * (r[1] - r[0]):
+            o = np.array([boxes[k][0], r[0], boxes[k][2], r[1]])  # the kept read stands for the whole row
+            bb = getattr(b, "bubble_xyxy", None)
+            cx, cy = (boxes[k][0] + boxes[k][2]) / 2, (r[0] + r[1]) / 2
+            if bb is not None and not (bb[0] <= cx <= bb[2] and bb[1] <= cy <= bb[3]):
+                import copy
+                # the dump paired the sliver with a balloon elsewhere on the page: adopt the box it really lies in
+                home = [ob.bubble_xyxy for ob in blocks if getattr(ob, "bubble_xyxy", None) is not None
+                        and ob.bubble_xyxy[0] <= cx <= ob.bubble_xyxy[2] and ob.bubble_xyxy[1] <= cy <= ob.bubble_xyxy[3]]
+                b = copy.copy(b)
+                b.bubble_xyxy = home[0] if home else None
+        out_b.append(b)
+        out_o.append(o)
+    return out_b, out_o, dropped
+
+
+def _strip_neighbour_echo(lines: list[str], src_text: str, obox, blocks, orig_boxes, me) -> tuple[list[str], str]:
+    """A merged OCR block that starts with a title which is ALSO its own block outside the box ('ECONOMY NEWS' header
+    above a news page): the translated line and the source words of that title have no counterpart inside this box, so
+    they are removed before the lines are mapped to the box's text groups (otherwise every line shifts one group down)."""
+    from modules.utils import block_cleanup as bcl
+
+    if len(lines) < 2:
+        return lines, src_text
+    x1, y1, x2, y2 = [float(v) for v in obox]
+    src_w = bcl.words(src_text)
+    for other, ob in zip(blocks, orig_boxes):
+        if other is me:
+            continue
+        cx, cy = (float(ob[0]) + float(ob[2])) / 2, (float(ob[1]) + float(ob[3])) / 2
+        if x1 <= cx <= x2 and y1 <= cy <= y2:
+            continue  # inside this box: not an outside echo
+        tw, sw = bcl.words(other.translation or ""), bcl.words(getattr(other, "text", "") or "")
+        if len(tw) >= 1 and len(lines) >= 2 and bcl.words(lines[0]) == tw:
+            lines = lines[1:]
+            if sw and src_w[:len(sw)] == sw:
+                drop = len(sw)
+                toks = src_text.split()
+                src_text = " ".join(toks[drop:]) if len(toks) > drop else src_text
+                src_w = bcl.words(src_text)
+    return lines, src_text
 
 
 def split_merged_blocks(blocks, orig_boxes, image, cleaned):
@@ -444,6 +530,10 @@ def split_merged_blocks(blocks, orig_boxes, image, cleaned):
             evenly_spaced = len(pitch) >= 2 and (pitch.max() - pitch.min()) <= 0.35 * float(np.median(pitch))
             if evenly_spaced or (len(groups) < 3 and not varied):  # a status window / list stays one block
                 groups = []
+            elif tst.estimate_tilt(tst.ink_mask_original(image, obox)[0])[0]:
+                # the lettering is TILTED as a whole (a slanted phone message): its rows overlap in the row projection, so
+                # 'groups' are artefacts (a watermark row under it became a group and got half the translation)
+                groups = []
         else:
             groups = []
         if os.environ.get("RENDER_DEBUG"):
@@ -452,9 +542,31 @@ def split_merged_blocks(blocks, orig_boxes, image, cleaned):
             out_b.append(blk)
             out_o.append(obox)
             continue
-        if len(lines) < len(groups):
+        src_text = getattr(blk, "text", "") or ""
+        align = os.environ.get("RENDER_SPLIT_ALIGN", "true").lower() == "true"
+        if align:
+            row_h = float(np.median([r[1] - r[0] for g in groups for r in g["rows"]]))
+            groups = [s for g in groups for s in (tst.split_blob_group(image, g) if g["box"][3] - g["box"][1] > 3.5 * row_h else [g])]
+        weights = tst.group_letter_counts(image, [g["box"] for g in groups]) if align else []
+        if align:
+            real = [k for k, w in enumerate(weights) if w >= 3]  # a bar edge / speck is not a text group
+            if len(real) <= 1:
+                out_b.append(blk)
+                out_o.append(obox)
+                continue
+            groups, weights = [groups[k] for k in real], [weights[k] for k in real]
+        lines, src_text = _strip_neighbour_echo(lines, src_text, obox, blocks, orig_boxes, blk)
+        segs = None
+        if len(lines) < len(groups) and align:
+            # fewer translated lines than visual groups: cut the paragraph between groups (letter counts + shared names)
+            src_parts = tst.split_words_by_weights(src_text, weights)
+            segs = tst.align_segments(lines, weights, src_parts if len(src_parts) == len(groups) else None)
+            if os.environ.get("RENDER_DEBUG"):
+                print(f"[split-align] weights={weights} segs={segs}", flush=True)
+        if segs is None and len(lines) < len(groups):
             groups = _merge_closest(groups, len(lines))
-        segs = [[ln] for ln in lines] if len(lines) == len(groups) else tst.allocate_lines(lines, [g["aspect"] for g in groups])
+        if segs is None:
+            segs = [[ln] for ln in lines] if len(lines) == len(groups) else tst.allocate_lines(lines, [g["aspect"] for g in groups])
         if not segs:
             out_b.append(blk)
             out_o.append(obox)
@@ -466,7 +578,8 @@ def split_merged_blocks(blocks, orig_boxes, image, cleaned):
             sub.bubble_xyxy = None
             sub.text_class = "text_free"
             sub.split_origin = True
-            one_row = len(g["rows"]) == 1  # a single text row: the pieces are menu items, not stacked lines
+            sub.split_tilt_ok = bool(g.get("blob"))  # its own 2D blob (a tilted banner): its tilt can be measured
+            one_row =len(g["rows"]) == 1  # a single text row: the pieces are menu items, not stacked lines
             sub.translation = " ".join(seg) if one_row else "\n".join(seg)
             sub.text = ""  # source text of a merged block cannot be split per group
             out_b.append(sub)
@@ -646,6 +759,11 @@ def prepare_balloon_blocks(blocks, orig_boxes, image, cleaned=None):
                 strays = _rim_fragments(blocks, g, boxes, cleaned)
             if strays:
                 main = max(range(len(g)), key=lambda k: len((blocks[g[k]].translation or "").split()))
+                ys = [(boxes[g[k]][1] + boxes[g[k]][3]) / 2 for k in [main] + list(strays)]
+                # a block lying BETWEEN the stray and the main text joins too, or the merged paragraph would be drawn
+                # over it (a re-boxed row read between a title row and the body)
+                strays = list(strays) + [k for k in range(len(g)) if k != main and k not in strays
+                                         and min(ys) < (boxes[g[k]][1] + boxes[g[k]][3]) / 2 < max(ys)]
                 idx = sorted([g[main]] + [g[k] for k in strays], key=lambda i: ((boxes[i][1] + boxes[i][3]) / 2, boxes[i][0]))
                 merge(idx, g[main])
                 if os.environ.get("RENDER_DEBUG"):
@@ -782,31 +900,106 @@ def bcl_key(text: str) -> str:
     return "".join(ch for ch in (text or "").casefold() if ch.isalnum())
 
 
+SPEECH_FONT_STYLES = ("normal", "thought")  # one font family per page for these (the speech pool)
+
+
+def _env_float(name: str, default: float) -> float:
+    try:
+        return float(os.environ.get(name, default))
+    except ValueError:
+        return default
+
+
+def demote_shouts(entries: list[tuple[str, bool, str, float]], page_w: int) -> list[str]:
+    """Style per block after damping the 'shout' tag (RENDER_SHOUT_DEMOTE, default true).
+
+    entries = [(style, in_balloon, source_text, source_cap_px)]. The translator tags many plain balloons 'shout' (a question,
+    a calm sentence), which then switch to a brush display font next to comic-font neighbours. A balloon keeps 'shout' only
+    when the source shows it: an exclamation mark AND lettering clearly bigger than the page's plain speech
+    (RENDER_SHOUT_CAP_RATIO x median, default 1.25) or, with no plain speech on the page, bigger than
+    RENDER_SHOUT_ABS_CAP x page width (default 0.058, ~46 px at 800 px). Free text (SFX over art) is never changed."""
+    styles = [s for s, _, _, _ in entries]
+    if os.environ.get("RENDER_SHOUT_DEMOTE", "true").lower() != "true":
+        return styles
+    ratio = _env_float("RENDER_SHOUT_CAP_RATIO", 1.25)
+    abs_cap = _env_float("RENDER_SHOUT_ABS_CAP", 0.058) * float(page_w)
+    speech = [c for s, b, _, c in entries if b and s in ("normal", "thought", "whisper") and c > 0]
+    ref = statistics.median(speech) if speech else None
+    for i, (s, in_balloon, src, cap) in enumerate(entries):
+        if s != "shout" or not in_balloon:
+            continue
+        big = cap >= (ratio * ref if ref else abs_cap)
+        if not ("!" in (src or "") and big):
+            styles[i] = "normal"
+    return styles
+
+
+def anchor_page_fonts(plans: list[dict]) -> int:
+    """One font family per style on a page (RENDER_PAGE_FONT_ANCHOR, default true): balloon text of the same voice
+    (normal + thought share the speech font, shouts share one shout font...) takes the family of the longest block,
+    so trait noise of a single block cannot switch a balloon to another typeface. Returns the number of changed plans."""
+    if os.environ.get("RENDER_PAGE_FONT_ANCHOR", "true").lower() != "true":
+        return 0
+    groups: dict[str, list[int]] = {}
+    for i, p in enumerate(plans):
+        if getattr(p["blk"], "text_class", "") != "text_bubble" or p["angle"] or p["list_like"]:
+            continue
+        key = "speech" if p["style"] in SPEECH_FONT_STYLES else p["style"]
+        if key in ("sfx", "sign", "phone", "title"):
+            continue
+        groups.setdefault(key, []).append(i)
+    changed = 0
+    for idx in groups.values():
+        lead = max(idx, key=lambda i: len(plans[i]["text"]))
+        for i in idx:
+            if plans[i]["font_rel"] != plans[lead]["font_rel"]:
+                plans[i].update(family=plans[lead]["family"], font_rel=plans[lead]["font_rel"])
+                plans[i]["text"] = fp.sanitize_for_font(plans[i]["text"], plans[lead]["font_rel"])
+                changed += 1
+    return changed
+
+
 def build_items(blocks, image, cleaned, orig_boxes, render_settings, alignment, target_code: str, _rescue: bool = False):
     """Returns list of TextItemProperties dicts (V2 layout). `_rescue` = internal re-run of blocks the safety net found
     unrendered (no merge / dedupe / split steps: they were what lost the text)."""
     import copy
+    from modules.translation import consistency
     from modules.utils import block_cleanup as bcl
 
     H, W = image.shape[:2]
-    line_spacing = max(float(render_settings.line_spacing), MIN_LINE_SPACING)
+    line_spacing =max(float(render_settings.line_spacing), MIN_LINE_SPACING)
     policy = casing_policy(render_settings.upper_case)
     plans = []
     deliberate: list = []  # boxes skipped on purpose (original lettering kept / kept as-is)
     net = bcl.safety_net_enabled() and not _rescue
     snapshot = [(copy.copy(b), [float(v) for v in o]) for b, o in zip(blocks, orig_boxes)] if net else []
+    if not _rescue and consistency.first_person_enabled():
+        fixes = consistency.first_person_fixes([getattr(b, "text", "") or "" for b in blocks], [b.translation or "" for b in blocks])
+        if fixes:
+            blocks = list(blocks)
+            for k, t in fixes.items():
+                if os.environ.get("RENDER_DEBUG"):
+                    print(f"[first-person] {blocks[k].translation!r} -> {t!r} (source subject 'I' dropped by OCR)", flush=True)
+                blocks[k] = copy.copy(blocks[k])
+                blocks[k].translation = t
     if not _rescue:
+        blocks, orig_boxes, slivers = drop_row_slivers(blocks, orig_boxes, image)
+        deliberate += slivers  # a dropped duplicate read is deliberate: the safety net must not draw it again
         blocks, orig_boxes = split_merged_blocks(blocks, orig_boxes, image, cleaned)
         blocks, orig_boxes = drop_split_duplicates(blocks, orig_boxes)
         blocks, orig_boxes = dedupe_duplicate_blocks(blocks, orig_boxes)
         blocks, orig_boxes = prepare_balloon_blocks(blocks, orig_boxes, image, cleaned)
-    for blk, obox in zip(blocks, orig_boxes):
+    tagged = [(getattr(b, "style", "") or "normal").lower() for b in blocks]
+    tagged = [s if s in VALID_STYLES else "normal" for s in tagged]
+    page_styles = demote_shouts([(s, b.text_class == "text_bubble" and b.bubble_xyxy is not None, getattr(b, "text", "") or "",
+                                  _source_cap(image, o) if (s in ("shout", "normal", "thought", "whisper") and (b.translation or "").strip()) else 0.0)
+                                 for s, b, o in zip(tagged, blocks, orig_boxes)], W)
+    for blk, obox, style in zip(blocks, orig_boxes, page_styles):
         raw = (blk.translation or "")
         if not raw.strip() or len(raw.strip()) == 1:
             continue
-        style = (getattr(blk, "style", "") or "normal").lower()
-        if style not in VALID_STYLES:
-            style = "normal"
+        if os.environ.get("RENDER_DEBUG") and style != (getattr(blk, "style", "") or "normal").lower():
+            print(f"[style] {blk.style} -> {style} at {[int(v) for v in obox]}", flush=True)
         if untouched_by_cleaner(image, cleaned, obox):
             # the cleaner left the original lettering in place (watermark / promo / logo kept on purpose):
             # a translation drawn on top would double the text, so keep the original
@@ -816,7 +1009,8 @@ def build_items(blocks, image, cleaned, orig_boxes, render_settings, alignment, 
             continue
         mask, off = page_glyph_mask(image, cleaned, obox)
         src_key = "".join((getattr(blk, "text", "") or "").casefold().split())
-        if src_key and src_key == "".join(raw.casefold().split()):
+        dots_only = not any(ch.isalnum() for ch in raw)  # '...' / '?!' balloons: the cleaner erased a few dots, redraw them
+        if src_key and src_key == "".join(raw.casefold().split()) and not dots_only:
             ox1, oy1, ox2, oy2 = [int(v) for v in obox]
             if int(mask.sum()) < 0.02 * max(1, (ox2 - ox1) * (oy2 - oy1)):
                 deliberate.append([float(v) for v in obox])
@@ -827,13 +1021,18 @@ def build_items(blocks, image, cleaned, orig_boxes, render_settings, alignment, 
             if row_h >= 8 and cap_h > 1.35 * row_h:  # glued glow/smear: a letter cannot be taller than its text row
                 cap_h = row_h * 0.92
             n_chars = len((getattr(blk, "text", "") or "").strip())
+            if not n_chars and getattr(blk, "split_origin", False):
+                n_chars = int(0.85 * len(raw.strip()))  # a piece of a merged block has no own source text: its share
             if n_chars >= 3:
                 # the English lettering has to fit its own box: ~0.84 cap^2 of area per character (glow/smear that
                 # glues letters together can otherwise report a "cap height" several times too large)
                 ox1_, oy1_, ox2_, oy2_ = [float(v) for v in obox]
                 bound = 1.15 * math.sqrt(max(1.0, (ox2_ - ox1_) * (oy2_ - oy1_)) / (0.84 * n_chars))
                 cap_h = min(cap_h, bound)
-        in_bubble = blk.text_class == "text_bubble" and blk.bubble_xyxy is not None
+        if dots_only and 0 < cap_h:
+            # dots are ~1/4 of a capital: a '...' balloon measured on its dots came out at 10 px (RENDER_DOTS_CAP_MIN, of W)
+            cap_h = max(cap_h * 4.5, _env_float("RENDER_DOTS_CAP_MIN", 0.025) * W)
+        in_bubble =blk.text_class == "text_bubble" and blk.bubble_xyxy is not None
         src_traits = fm.source_traits(mask) if cap_h >= 8 else None
         rel = fp.match_font(style, src_traits)
         family = family_for(rel) or family_for(FALLBACK_FONT) or render_settings.font_family
@@ -841,8 +1040,10 @@ def build_items(blocks, image, cleaned, orig_boxes, render_settings, alignment, 
         text = ts.normalize_spaces(casing_text(raw, getattr(blk, "text", ""), style, policy))
         text = fp.sanitize_for_font(text, rel)
         text_rgb, bg_rgb, flat = sample_colors(image, cleaned, obox, None)
-        colors = tst.analyze_colors(image, mask, off, bg_rgb) if cap_h >= 12 else \
+        colors = tst.analyze_colors(image, mask, off, bg_rgb) if (cap_h >= 12 and not dots_only) else \
             {"fill": None, "gradient": None, "outline": None, "glow": None}
+        if dots_only and text_rgb is not None:  # a few anti-aliased dot pixels read as grey: snap to black / white
+            text_rgb = (0, 0, 0) if _lum(text_rgb) < 128 else (255, 255, 255)
         angle, rect = (0.0, None)
         if not in_bubble or style in {"sign", "phone", "title", "sfx"}:
             angle, rect = tst.text_angle(mask) if cap_h >= 8 else (0.0, None)
@@ -855,7 +1056,7 @@ def build_items(blocks, image, cleaned, orig_boxes, render_settings, alignment, 
                 r_ang, _ = tst.text_angle(rim_t)
                 # a rectangle fit that finds ANOTHER tilt contradicts the projection estimate (mixed horizontal + tilted
                 # ink); pieces cut from a merged block are never re-tilted
-                if t_ang and t_rect is not None and (not r_ang or abs(r_ang - t_ang) <= 6.0) and not getattr(blk, "split_origin", False):
+                if t_ang and t_rect is not None and (not r_ang or abs(r_ang - t_ang) <= 6.0) and (not getattr(blk, "split_origin", False) or getattr(blk, "split_tilt_ok", False)):
                     angle = t_ang
                     rect = (t_rect[0] + rim_toff[0] - off[0], t_rect[1] + rim_toff[1] - off[1], t_rect[2], t_rect[3])
         region, is_bubble, inner, ioff = None, False, None, (0, 0)
@@ -864,15 +1065,38 @@ def build_items(blocks, image, cleaned, orig_boxes, render_settings, alignment, 
             cx, cy, long_len, short_len = rect
             cx, cy = cx + off[0], cy + off[1]
             # a tilted text box that sits in a drawn box / balloon must not be taller than the box itself (RENDER_TILT_FIT)
-            sh = 0.47 if (in_bubble and os.environ.get("RENDER_TILT_FIT", "true").lower() == "true") else 0.62
+            if (not in_bubble or style in {"sign", "title", "phone"}) and os.environ.get("RENDER_TILT_ONE_ROW", "true").lower() == "true":
+                rows_t = tst.deskewed_rows(mask, angle) if mask.any() else []
+                if len(rows_t) == 1 and rows_t[0] >= 8:
+                    # ONE tilted row on a nameplate: the translation stays one row of the same letter height (it was
+                    # wrapped into two rows at the inflated cap of the slanted letters and spilled off the plate)
+                    text = " ".join(text.split())
+                    cap_h = min(cap_h, 0.9 * rows_t[0])
+                    short_len = min(short_len, 1.5 * rows_t[0])
+                    long_len *= 0.88  # the row may not run past the ends of the plate (region = ink length + 2 percent)
+                elif len(rows_t) >= 2:
+                    # several tilted rows: the translation keeps about as many rows (a narrow 8-row column of a slanted
+                    # phone message ran off the panel); region height ~ source rows + half a row
+                    short_len = min(short_len, (len(rows_t) + 0.5) * 1.35 * float(np.median(rows_t)) / 1.24)
+            boxed = in_bubble or getattr(blk, "split_tilt_ok", False)  # a tilted banner cut from a merged block is a box too
+            if getattr(blk, "split_tilt_ok", False):
+                # the blob includes the banner frame, which runs off the page: the text line stays inside the page
+                long_len = min(long_len, 2 * min(cx, W - cx) / 0.58 * 0.5, 0.9 * W / 1.16)
+            sh = 0.47 if (boxed and os.environ.get("RENDER_TILT_FIT", "true").lower() == "true") else 0.62
             region = (int(cx - long_len * 0.58), int(cy - short_len * sh), int(cx + long_len * 0.58), int(cy + short_len * sh))
         elif in_bubble:
             region, inner, ioff = bubble_interior_ex(cleaned, blk)
             is_bubble = region is not None
         if "\n" in text and blk.text_class != "text_bubble" and (getattr(blk, "text", "") or ""):
             rim_m, _ = tst.ink_mask_original(image, obox)
-            if len(tst.row_runs(rim_m)) == 1:  # one text row in the source: the translation is one row too
+            n_rows = len(tst.deskewed_rows(rim_m, angle)) if angle else len(tst.row_runs(rim_m))  # tilted rows overlap
+            if n_rows == 1:  # one text row in the source: the translation is one row too
                 text = " ".join(text.split())
+        if ("\n" in text and in_bubble and style in {"normal", "thought", "whisper", "shout"}
+                and os.environ.get("RENDER_BALLOON_REWRAP", "true").lower() == "true"):
+            # line breaks the translator copied from the source rows (or a joined stray) are not a list: a speech balloon
+            # is re-wrapped as one centred paragraph (a 3-row reply was set left-aligned as a 'list', pinned to the rim)
+            text = " ".join(text.split())
         list_like = ("\n" in text) and (style in {"phone", "sign"} or text.count("\n") >= 2)
         if region is None and not list_like:
             region = panel_region(cleaned, obox, W, H) if style in {"sign", "phone", "narration", "title"} else None
@@ -929,7 +1153,8 @@ def build_items(blocks, image, cleaned, orig_boxes, render_settings, alignment, 
                 lefts, mids = [e[0] for e in ext], [(e[0] + e[1]) / 2 for e in ext]
                 span = max(e[1] for e in ext) - min(e[0] for e in ext)
                 list_center = (max(lefts) - min(lefts)) > 0.12 * span and (max(mids) - min(mids)) < 0.06 * span
-            if int(rim_mask.sum()) >= 40:
+            if int(rim_mask.sum()) >= 40 and not (angle and os.environ.get("RENDER_TILT_LIST", "true").lower() == "true"):
+                # (a TILTED list keeps the rotated text box: the axis-aligned ink box of slanted rows is a huge square)
                 ink = ink_box(rim_mask, rim_off, obox)
                 iw, ih = ink[2] - ink[0], ink[3] - ink[1]
                 # a list never grows past the panel text column: original ink + a small margin
@@ -939,6 +1164,10 @@ def build_items(blocks, image, cleaned, orig_boxes, render_settings, alignment, 
                           bubble=is_bubble, colors=(text_rgb, bg_rgb, flat), analysis=colors, angle=angle,
                           cap_h=cap_h, list_like=list_like, obox=[int(v) for v in obox], region_kind=("interior" if is_bubble else "other"), src_traits=src_traits, inner=inner, inner_off=ioff,
                           n_src_lines=n_src_lines))
+
+    anchored = anchor_page_fonts(plans)
+    if anchored and os.environ.get("RENDER_DEBUG"):
+        print(f"[font-anchor] {anchored} block(s) moved to the page font of their style", flush=True)
 
     # balloon groups: blocks sharing one balloon (free text lying inside a balloon counts) get ONE font family and a
     # source cap-height compressed toward the balloon median (RENDER_BALLOON_UNIFY=false restores per-block sizing)
@@ -981,19 +1210,27 @@ def build_items(blocks, image, cleaned, orig_boxes, render_settings, alignment, 
     if os.environ.get("RENDER_STRICT_FIT", "true").lower() == "true":
         # crowded panel / UI blocks (touching another block, or cut from a merged OCR block): each translation must stay
         # inside its OWN original box (shrink only, no growth, no pushing into neighbours)
+        sign_strict = os.environ.get("RENDER_SIGN_STRICT", "true").lower() == "true"
         for i, p in enumerate(plans):
-            if p["bubble"] or p["style"] not in {"sign", "phone", "narration"}:
+            if p["bubble"] or p["style"] not in {"sign", "phone", "narration", "title"}:
                 continue
             ob = p["obox"]
             touching = any(j != i and not plans[j]["bubble"] and ob[0] - 10 < plans[j]["obox"][2] and plans[j]["obox"][0] < ob[2] + 10
                            and ob[1] - 10 < plans[j]["obox"][3] and plans[j]["obox"][1] < ob[3] + 10 for j in range(len(plans)))
-            if touching or getattr(p["blk"], "split_origin", False):
+            # lettering printed on a plate / paper / poster in the art (RENDER_SIGN_STRICT): the translation stays on the
+            # footprint of the original text instead of spilling over the plate edge onto the panel
+            in_art = sign_strict and p["style"] in {"sign", "title"} and not p["list_like"]
+            if p["style"] == "title" and not in_art:
+                continue
+            if touching or getattr(p["blk"], "split_origin", False) or in_art:
                 p["strict_fit"] = True
                 p["region0"] = p["region"]
                 if not p["angle"]:
                     bw, bh = ob[2] - ob[0], ob[3] - ob[1]
-                    p["region"] = (int(max(0, ob[0] - 0.03 * bw)), int(max(0, ob[1] - 0.03 * bh)),
-                                   int(min(W, ob[2] + 0.03 * bw)), int(min(H, ob[3] + 0.03 * bh)))
+                    # a piece cut from a merged block hugs its ink: give it the line gap above/below (RENDER_SPLIT_PAD_Y)
+                    py = _env_float("RENDER_SPLIT_PAD_Y", 0.12) if getattr(p["blk"], "split_origin", False) else 0.03
+                    p["region"] = (int(max(0, ob[0] - 0.03 * bw)), int(max(0, ob[1] - py * bh)),
+                                   int(min(W, ob[2] + 0.03 * bw)), int(min(H, ob[3] + py * bh)))
                 if os.environ.get("RENDER_DEBUG"):
                     print(f"[strict-fit] block {ob} fits its own box", flush=True)
 
@@ -1010,10 +1247,12 @@ def build_items(blocks, image, cleaned, orig_boxes, render_settings, alignment, 
                 return plan["text"], size, dw, dh
         return None
 
-    def fit_once(plan, region, max_size):
+    def fit_once(plan, region, max_size, no_hyphen: bool = False):
         if plan["list_like"] and plan["src_centers"] and len(plan["src_centers"]) == plan["text"].count("\n") + 1:
             got = fit_list(plan, region, max_size)
-            if got is not None:
+            # one row per entry is for status windows; a message whose rows would end far below the source size
+            # (a zoomed, slanted phone text) wraps its rows instead (RENDER_LIST_MIN_KEEP of the source size)
+            if got is not None and not (plan.get("target") and got[1] < _env_float("RENDER_LIST_MIN_KEEP", 0.6) * plan["target"]):
                 return got
         x1, y1, x2, y2 = region
         measure = make_measure(plan["family"], line_spacing)
@@ -1021,9 +1260,11 @@ def build_items(blocks, image, cleaned, orig_boxes, render_settings, alignment, 
         bw, bh = x2 - x1, y2 - y1
         mx = max_size
         out = size = dw = dh = None
+        plain_ok = 0.9 * float(plan.get("target") or 0.0)
         for _ in range(12):
             out, size, w, h, over = ts.fit_text(plan["text"], measure, bw, bh, max_size=mx,
-                                                min_size=render_settings.min_font_size, floor=FLOOR_SIZE, pad=pad)
+                                                min_size=render_settings.min_font_size, floor=FLOOR_SIZE, pad=pad,
+                                                plain_ok=plain_ok, hyphen_pref=0.0 if no_hyphen else None)
             dw, dh = doc_size(out, plan["family"], size, line_spacing, alignment, render_settings.direction)
             if (dw <= bw and dh <= bh) or size <= FLOOR_SIZE:
                 break
@@ -1060,6 +1301,19 @@ def build_items(blocks, image, cleaned, orig_boxes, render_settings, alignment, 
                     best, plan["fit_region"] = cand, wide
                     if best[1] >= cap:
                         break
+        if plan["bubble"] and "-\n" in best[0] and HYPHEN_KEEP > 0:
+            # a word cut by a hyphen ('BAŞVUR-/MUŞTUM'): rewrap unbroken, in the same or a wider part of the balloon, and keep
+            # that layout when it costs at most (1 - RENDER_HYPHEN_KEEP) of the size (default 0.75)
+            plain_best = None
+            ref = min(best[1], target) if target else best[1]  # the hyphen often only bought growth beyond the source size
+            for fw, fh in ((1.0, 1.0), (1.2, 1.1), (1.4, 1.2), (1.6, 1.3)):
+                wide = region if (fw, fh) == (1.0, 1.0) else widen(region, fw, W, H, fh)
+                cand = fit_once(plan, wide, cap, no_hyphen=True)
+                if ("-\n" not in cand[0] and cand[1] >= HYPHEN_KEEP * ref and (plain_best is None or cand[1] > plain_best[0][1])
+                        and lines_inside(plan, cand[0], cand[1], wide, line_spacing)):
+                    plain_best = (cand, wide)
+            if plain_best is not None:
+                best, plan["fit_region"] = plain_best
         if target and best[1] < TARGET_MIN_KEEP * target:
             # the detected region is too small for the translation (free text, signs, captions, holograms and
             # balloons whose interior could not be measured): grow around the ORIGINAL text box instead of
@@ -1142,6 +1396,21 @@ def build_items(blocks, image, cleaned, orig_boxes, render_settings, alignment, 
 
     balloon_raise()
 
+    def guard_rewrap(plan, probe, out, size, frac):
+        """Before shrinking a block whose lines poke out of a pointed / round balloon (hexagon, ellipse ends): try a
+        narrower, taller text column at (almost) the same size (RENDER_GUARD_REWRAP, default true). Returns
+        ((text, size, w, h), region) or None."""
+        if os.environ.get("RENDER_GUARD_REWRAP", "true").lower() != "true" or plan["angle"] or plan["list_like"]:
+            return None
+        cuts = out.count("-\n")  # never trade the shrink for more words cut by a hyphen
+        for fw, fh in ((0.88, 1.12), (0.76, 1.25), (0.66, 1.4)):
+            reg2 = widen(plan["fit_region"], fw, W, H, fh)
+            cand = fit_once(plan, reg2, size, no_hyphen=cuts == 0)
+            if (cand[1] >= size - 1 and cand[0].count("-\n") <= cuts
+                    and lines_inside(probe, cand[0], cand[1], reg2, line_spacing, frac)):
+                return cand, reg2
+        return None
+
     # last guard: never let a laid-out line cross the balloon / panel border (shrink until inside or at the floor)
     def guard_fit(hard: bool = False):
         """hard=True (RENDER_HARD_GUARD): every balloon block, not only members of a multi-block balloon, must keep every
@@ -1157,8 +1426,13 @@ def build_items(blocks, image, cleaned, orig_boxes, render_settings, alignment, 
                 probe, floor = dict(plan, inner=plan["guard_inner"], inner_off=plan["guard_off"]), max(FLOOR_SIZE, int(0.7 * size))
             if hard and probe["inner"] is not None and plan["bubble"] and not plan["angle"]:
                 plan["strict"] = probe["strict"] = True
+            frac = 0.97 if probe.get("strict") else 0.9
             while (probe["inner"] is not None and size > floor and guard < (30 if hard else 14)
-                   and not lines_inside(probe, out, size, plan["fit_region"], line_spacing, 0.97 if probe.get("strict") else 0.9)):
+                   and not lines_inside(probe, out, size, plan["fit_region"], line_spacing, frac)):
+                alt = guard_rewrap(plan, probe, out, size, frac)
+                if alt is not None:
+                    fits[i], plan["fit_region"] = alt
+                    break
                 fits[i] = fit_once(plan, plan["fit_region"], size - 1)
                 out, size = fits[i][0], fits[i][1]
                 guard += 1
@@ -1178,9 +1452,11 @@ def build_items(blocks, image, cleaned, orig_boxes, render_settings, alignment, 
         """Balloon text that ended unreadably small although the English lettering was big: the measured interior is a
         narrow sliver (hologram, textured balloon). The original text box stood on safe ground: retry on it, kept inside
         the balloon box (RENDER_TINY_PX, default 14 at 800 px width; 0 disables)."""
+        retried = set()
         for i, plan in enumerate(plans):
             target = plan.get("target") or 0.0
-            if not (TINY_PX and target and plan["bubble"] and fits[i][1] < TINY_PX * W / 800.0 and fits[i][1] < TINY_KEEP * target):
+            small = SMALL_KEEP > 0 and fits[i][1] < SMALL_KEEP * target  # e.g. a lobe whose interior rect a leftover glyph cut down
+            if not (TINY_PX and target and plan["bubble"] and (fits[i][1] < TINY_PX * W / 800.0 or small) and fits[i][1] < TINY_KEEP * target):
                 continue
             ox1, oy1, ox2, oy2 = [float(v) for v in plan["obox"]]
             bb = getattr(plan["blk"], "bubble_xyxy", None)
@@ -1191,11 +1467,31 @@ def build_items(blocks, image, cleaned, orig_boxes, render_settings, alignment, 
             region = (int(ox1), int(oy1), int(ox2), int(oy2))
             if region[2] - region[0] <= 40 or region[3] - region[1] <= 20:
                 continue
+            tiny = fits[i][1] < TINY_PX * W / 800.0
+            if not tiny and plan["inner"] is not None:
+                # the 'small' retry only where the original text box lies inside the measured balloon (a two-lobe balloon
+                # whose interior rect a leftover glyph cut down), never on art that merely got a balloon box
+                inn, (ix, iy) = plan["inner"], plan["inner_off"]
+                sub = inn[max(0, region[1] - iy):max(0, region[3] - iy), max(0, region[0] - ix):max(0, region[2] - ix)]
+                area = max(1, (region[2] - region[0]) * (region[3] - region[1]))
+                if float(sub.sum()) / area < 0.85:
+                    continue
             cand = fit_once(plan, region, int(math.ceil(target * TARGET_MAX_GROW)))
             if cand[1] > fits[i][1]:
                 fits[i], plan["fit_region"], plan["inner"] = cand, region, None  # inner was the unreliable part
+                retried.add(i)
                 if os.environ.get("RENDER_DEBUG"):
                     print(f"[tiny-retry] block {plan['obox']}: size -> {cand[1]}", flush=True)
+        for g in balloon_groups:  # neighbours that the shrunken member had capped may grow back to the balloon band
+            if not retried.intersection(g):
+                continue
+            lim = int(math.ceil(min(fits[k][1] for k in g) * (1.0 + bl.band())))
+            for j in g:
+                if j in retried or fits[j][1] >= lim:
+                    continue
+                cand = fit_once(plans[j], plans[j]["fit_region"], lim)
+                if cand[1] > fits[j][1] and lines_inside(plans[j], cand[0], cand[1], plans[j]["fit_region"], line_spacing, 0.93):
+                    fits[j] = cand
 
     tiny_retry()
 
@@ -1231,6 +1527,19 @@ def build_items(blocks, image, cleaned, orig_boxes, render_settings, alignment, 
                 rgb = tuple(fill)
             ocol = ana["outline"]
             owidth = max(owidth, float(min(4, max(1, round(size * 0.07)))))
+        in_art = (not plan["bubble"] and plan["style"] in {"sign", "title"} and ana["outline"] is None
+                  and os.environ.get("RENDER_SIGN_COLOR", "true").lower() == "true")
+        if in_art:
+            # printed lettering on a plate / paper (RENDER_SIGN_COLOR): keep the printed colour and NO added outline or
+            # halo when it already contrasts with the plate under it (the plate colour is measured on the cleaned page
+            # under the ink, not the box median that includes the wall around the plate)
+            plate = _plate_color(cleaned, plan["obox"])
+            stops = [tuple(c) for c in (grad["colors"] if grad else [fill])]
+            if plate is not None and all(abs(_lum(c) - _lum(plate)) >= 40 for c in stops):
+                owidth, glow = 0.0, None
+                ana = dict(ana, glow=None)
+                if grad is None:
+                    rgb = tuple(fill)
         if ana["glow"] is not None:
             glow = QColor(*ana["glow"])
         font_color = QColor(*rgb)

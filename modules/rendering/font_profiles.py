@@ -179,12 +179,19 @@ def speech_pool() -> list[str]:
     return curated + rest
 
 
+def thought_uses_speech_pool() -> bool:
+    """Thought balloons are set in the speech font (FONT_THOUGHT_SPEECH_POOL, default true): the thin Chinacat family
+    read as a different, light typeface next to the speech balloons of the same character; a slanted source still gets
+    the synthetic oblique."""
+    return os.environ.get("FONT_THOUGHT_SPEECH_POOL", "true").lower() == "true"
+
+
 def ranked_candidates(style: str) -> list[str]:
     style = (style or "normal").lower()
     user = _user_style_map().get(style)
     if user is not None:
         return [rel for rel in user if is_usable(rel)]
-    if style == "normal":
+    if style == "normal" or (style == "thought" and thought_uses_speech_pool()):
         pool = speech_pool()
         if pool:
             return pool
@@ -210,11 +217,12 @@ def match_font(style: str, src: dict | None, max_candidates: int = 4, rank_penal
     # heavy slanted display fonts are only for SHOUTS; slanted ordinary speech keeps an upright font of the
     # right weight and gets a synthetic oblique (see wants_synthetic_italic)
     if abs(src.get("slant", 0.0)) > 0.18 and (style or "normal").lower() == "shout":
-        for rel in ranked_candidates("shout") + ranked_candidates("sfx"):
+        # only the shout list: the slanted SFX script fonts (DREAMER_ADDICT...) are unreadable in a balloon
+        for rel in ranked_candidates("shout"):
             if rel not in pool and (traits_of(rel) or {}).get("slant", 0) > 0.15:
                 pool.append(rel)
                 break
-    in_speech_pool = (style or "normal").lower() == "normal" and cands[0].startswith(SPEECH_FOLDER)
+    in_speech_pool = (style or "normal").lower() in ("normal", "thought") and cands[0].startswith(SPEECH_FOLDER)
     if in_speech_pool:
         # the pool is already curated for readability: pure trait distance, anchor wins unless clearly worse
         dists = {rel: fm.trait_distance(src, traits_of(rel)) for rel in pool}
@@ -229,15 +237,24 @@ def match_font(style: str, src: dict | None, max_candidates: int = 4, rank_penal
 
 
 SYNTHETIC_ITALIC_STYLES = {"normal", "thought", "narration", "whisper", "handwriting", "sign", "phone"}
-SYNTHETIC_ITALIC_MIN_SLANT = 0.12  # tan(angle) ~ 7 degrees; Qt's synthetic oblique is ~ 8-12 degrees
+# tan(angle) ~ 10 degrees. Upright comic lettering measures 0.04-0.16 (the estimator has a per-series bias, e.g. ~0.10
+# on one series), real italic 0.30-0.48: 0.12 turned upright balloons italic. Override: FONT_ITALIC_MIN_SLANT.
+SYNTHETIC_ITALIC_MIN_SLANT = 0.17
+
+
+def _italic_min_slant() -> float:
+    try:
+        return float(os.environ.get("FONT_ITALIC_MIN_SLANT", SYNTHETIC_ITALIC_MIN_SLANT))
+    except ValueError:
+        return SYNTHETIC_ITALIC_MIN_SLANT
 
 
 def wants_synthetic_italic(style: str, src: dict | None, rel: str | None = None) -> bool:
-    """True when the source lettering leans (tan > 0.12) but the chosen font is upright and the style is not a
-    shout/SFX (those pick a genuinely slanted display font): the renderer then sets the font italic, which Qt
+    """True when the source lettering leans (tan > FONT_ITALIC_MIN_SLANT) but the chosen font is upright and the style
+    is not a shout/SFX (those pick a genuinely slanted display font): the renderer then sets the font italic, which Qt
     synthesises as a light oblique so the stroke weight stays that of the matched font."""
     if not src or src.get("height", 0) < 8 or (style or "normal").lower() not in SYNTHETIC_ITALIC_STYLES:
         return False
-    if src.get("slant", 0.0) < SYNTHETIC_ITALIC_MIN_SLANT:
+    if src.get("slant", 0.0) < _italic_min_slant():
         return False
     return abs((traits_of(rel) or {}).get("slant", 0.0)) < 0.1 if rel else True

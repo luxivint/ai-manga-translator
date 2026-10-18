@@ -196,13 +196,28 @@ def balanced_lines(text: str, width: Callable[[str], float], max_w: float,
     return out
 
 
+def hyphen_pref_default() -> float:
+    """RENDER_HYPHEN_PREF (default 0.8): an unbroken layout wins unless it needs a font smaller than this share of the
+    hyphenated one. Lower values trade size for fewer hyphens (0.7 set a 13-letter word at 2/3 size: too small)."""
+    try:
+        return float(os.environ.get("RENDER_HYPHEN_PREF", "0.8"))
+    except ValueError:
+        return 0.8
+
+
 def fit_text(text: str, measure: Callable[[int], tuple], box_w: float, box_h: float, *,
-             max_size: int, min_size: int, floor: int = 9, pad: float = 0.0, hyphen_pref: float = 0.8):
+             max_size: int, min_size: int, floor: int = 9, pad: float = 0.0, hyphen_pref: float | None = None,
+             plain_ok: float = 0.0):
     """Hyphenation is a last resort: a layout without it wins unless it needs a
-    font smaller than hyphen_pref * the hyphenated size."""
+    font smaller than hyphen_pref * the hyphenated size. `plain_ok` (pt): an unbroken layout at or above this size always
+    wins (the caller passes ~90 percent of the source-derived size: a hyphen may not buy growth beyond the source)."""
+    if hyphen_pref is None:
+        hyphen_pref = hyphen_pref_default()
     if "\n" in text.strip():
         return _fit_paragraphs(text, measure, box_w, box_h, max_size, floor, pad)
     plain = _fit(text, measure, box_w, box_h, max_size, min_size, floor, pad, False)
+    if not plain[4] and plain_ok and plain[1] >= plain_ok:
+        return plain
     hyph = _fit(text, measure, box_w, box_h, max_size, min_size, floor, pad, True)
     if len(text.split()) == 1:
         # a single-word balloon ('MERHABA.') reads better whole at a somewhat smaller size than cut as 'MER-/HABA.'
@@ -217,6 +232,17 @@ def _fit_paragraphs(text, measure, box_w, box_h, max_size, floor, pad):
     wrapped only when it is wider than the box. Same return contract as _fit."""
     paras = [p.strip() for p in text.split("\n") if p.strip()]
     avail_w, avail_h = max(1.0, box_w - 2 * pad), max(1.0, box_h - 2 * pad)
+    # first keep every source line on ONE row as long as that costs at most RENDER_LIST_NOWRAP_KEEP (default 0.7) of the
+    # size: a two-line document entry re-wrapped into four rows reads as different text
+    keep = float(os.environ.get("RENDER_LIST_NOWRAP_KEEP", "0.7"))
+    for size in range(int(max_size), max(int(floor), int(keep * max_size)) - 1, -1):
+        if keep <= 0:
+            break
+        width, line_h = measure(size)
+        w = max(width(p) for p in paras)
+        h = line_h * len(paras)
+        if w <= avail_w + 1e-6 and h <= avail_h + 1e-6:
+            return "\n".join(paras), size, w + 2 * pad, h + 2 * pad, False
     best = None
     for hyphenate in (False, True):
         for size in range(int(max_size), int(floor) - 1, -1):

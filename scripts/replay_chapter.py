@@ -632,7 +632,8 @@ def _cmd_fit(a):
                   untranslated=sum(1 for b in blocks if getattr(b, "text_class", "") == "text_bubble" and len((b.text or "").split()) >= 2
                            and not (b.translation or "").strip() and not getattr(b, "is_ad", False) and not lb.watermark_match(b)), render_miss=logtxt.count("[render-miss]"),
                   near_outline=0, overflow=pd["overflow"], spread=pd["size_spread"], overlap=pd["overlap"],
-                  tiny=pd["tiny"], band=_page_band(state), min_px=round(min([d["font_size"] * 800.0 / W for d in state] or [0]), 1))
+                  tiny=pd["tiny"], band=_page_band(state), fontmix=_page_fontmix(state), hyphen=_page_hyphens(state),
+                  min_px=round(min([d["font_size"] * 800.0 / W for d in state] or [0]), 1))
         qa["detail"] = " | ".join([ln.strip()[:110] for ln in logtxt.splitlines() if ln.startswith("[render-miss]")] + ([pd["detail"][:160]] if pd["detail"] else []))
         if qa["band"]:
             qa["detail"] += " | band=" + ",".join(f"{d['font_size']}@{int(d['position'][1])}" for d in state
@@ -683,13 +684,28 @@ def _cmd_fit(a):
     (out / "fit_result.json").write_text(json.dumps(dict(result=res, worst=[(r[0], r[1], r[2], list(r[3])) for r in rows]), indent=1), encoding="utf-8")
 
 
-QA_COLS = ["untranslated", "render_miss", "near_outline", "overflow", "spread", "overlap", "tiny", "band"]
+QA_COLS = ["untranslated", "render_miss", "near_outline", "overflow", "spread", "overlap", "tiny", "band", "fontmix", "hyphen"]
 
 
 def _page_band(state, ratio: float = 1.6) -> int:
     """1 when the plain speech balloons of a page differ in font size by more than `ratio` (consistency across balloons)."""
     s = [d["font_size"] for d in state if d["debug"].get("bub") and d["debug"].get("style") in ("normal", "thought", "whisper")]
     return int(len(s) >= 2 and max(s) / max(1, min(s)) > ratio)
+
+
+def _page_fontmix(state) -> int:
+    """Extra font families among the balloon text of one voice on a page (plain speech = normal / thought / whisper;
+    shouts counted on their own; 0 = one family per voice)."""
+    out = 0
+    for voice in (("normal", "thought", "whisper"), ("shout",)):
+        fams = {d["font_family"] for d in state if d["debug"].get("bub") and d["debug"].get("style") in voice}
+        out += max(0, len(fams) - 1)
+    return out
+
+
+def _page_hyphens(state) -> int:
+    """Balloon words cut by a hyphen at a line end."""
+    return sum(d["text"].count("-\n") for d in state if d["debug"].get("bub"))
 
 
 def _print_qa(qa_rows: list[dict], out: Path) -> None:

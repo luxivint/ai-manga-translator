@@ -11,6 +11,7 @@ Everything works on the difference between the original page and the cleaned pag
 from __future__ import annotations
 
 import math
+import os
 
 import cv2
 import numpy as np
@@ -194,6 +195,21 @@ def text_angle(mask: np.ndarray, min_aspect: float = 1.8, max_abs: float = 38.0)
     if short_len <= 0 or long_len / short_len < min_aspect or abs(ang) > max_abs or abs(ang) < 2.5:
         return 0.0, (cx, cy, long_len, short_len)
     return float(ang), (cx, cy, long_len, short_len)
+
+
+def deskewed_rows(mask: np.ndarray, angle: float) -> list[int]:
+    """Heights of the text rows of a tilted lettering mask after rotating it level (angle deg clockwise, as text_angle)."""
+    if not mask.any():
+        return []
+    h, w = mask.shape
+    d = int(math.ceil(math.hypot(h, w)))
+    canvas = np.zeros((d, d), np.uint8)
+    y0, x0 = (d - h) // 2, (d - w) // 2
+    canvas[y0:y0 + h, x0:x0 + w] = mask.astype(np.uint8) * 255
+    rot = cv2.getRotationMatrix2D((d / 2, d / 2), angle, 1.0)
+    level = cv2.warpAffine(canvas, rot, (d, d), flags=cv2.INTER_NEAREST) > 0
+    hs = [b - a for a, b in row_runs(level, min_height=4)]
+    return [x for x in hs if x >= 0.4 * max(hs)] if hs else []  # specks / underline remnants are not rows
 
 
 def estimate_tilt(mask: np.ndarray, max_abs: float = 30.0, min_gain: float = 1.35, min_abs: float = 3.0):
@@ -502,6 +518,145 @@ def allocate_lines(lines: list[str], weights: list[float]) -> list[list[str]]:
     return segs
 
 
+def _anchor_key(word: str) -> str:
+    """Comparable form of a word for source/translation anchoring: lower case, cut at an apostrophe (Turkish suffix:
+    GPU'LAR -> gpu), letters/digits only."""
+    w = word.casefold().replace("’", "'").strip("'\".,!?:;…()")
+    if "'" in w:
+        w = w.split("'")[0]
+    return "".join(ch for ch in w if ch.isalnum())
+
+
+def align_segments(lines: list[str], weights: list[float], sources: list[str] | None = None) -> list[list[str]] | None:
+    """Split translated `lines` into len(weights) consecutive segments, one per source text group (top to bottom).
+
+    Used when a merged OCR block has more visual groups than translated lines (a headline, a reporter line and a banner
+    translated as one paragraph). Cut points are chosen by dynamic programming over word boundaries:
+      * each segment's share of the characters should match its group's share of `weights` (letters in the group),
+      * a cut at a translated line break is free, after sentence punctuation cheap, mid-sentence expensive,
+      * 'anchor' words that the source and the translation share (names, codes: YUSEONG, LEE, GPU) and that occur in
+        exactly one group's source text (`sources`) pull their translation word into that group.
+    Returns [[line, ...] per group] or None (fewer words than groups)."""
+    n = len(weights)
+    toks: list[tuple[str, bool]] = []  # (word, ends a translated line)
+    for ln in lines:
+        ws = ln.split()
+        toks += [(w, k == len(ws) - 1) for k, w in enumerate(ws)]
+    T = len(toks)
+    if n == 0 or T < n:
+        return None
+    total_w = float(sum(weights)) or 1.0
+    clen = [len(w) + 1 for w, _ in toks]
+    pre = [0.0]
+    for c in clen:
+        pre.append(pre[-1] + c)
+    total_c = pre[-1] or 1.0
+    owner: dict[int, int] = {}
+    if sources and len(sources) == n:
+        src_keys = [{_anchor_key(w) for w in s.split()} for s in sources]
+        for j, (w, _) in enumerate(toks):
+            k = _anchor_key(w)
+            if len(k) < 2 or not any(ch.isalpha() for ch in k):
+                continue
+            hits = [g for g in range(n) if any(k == s or (len(k) >= 3 and len(s) >= 3 and (s.startswith(k) or k.startswith(s)))
+                                               for s in src_keys[g])]
+            if len(hits) == 1 and sum(1 for w2, _ in toks if _anchor_key(w2) == k) == 1:
+                owner[j] = hits[0]
+
+    def cut_cost(j: int) -> float:  # cut after token j-1
+        w, eol = toks[j - 1]
+        if eol:
+            return 0.0
+        if w in ("/", "&", "-", "–") or toks[j][0] in ("/", "&", "-", "–"):
+            return 6.0  # 'Bilişim / Bilim' is one item
+        if w.endswith(("...", "?", "!", ".", "…")):
+            return 0.15
+        if w.endswith((",", ":", ";")):
+            return 0.4
+        return 1.0
+
+    INF = float("inf")
+    best = [[INF] * (T + 1) for _ in range(n + 1)]
+    back = [[0] * (T + 1) for _ in range(n + 1)]
+    best[0][0] = 0.0
+    for g in range(1, n + 1):
+        target = weights[g - 1] / total_w
+        for j in range(g, T - (n - g) + 1):
+            tail = cut_cost(j) if j < T else 0.0
+            for i in range(g - 1, j):
+                if best[g - 1][i] == INF:
+                    continue
+                share = (pre[j] - pre[i]) / total_c
+                miss = sum(1 for t in range(i, j) if t in owner and owner[t] != g - 1)
+                c = best[g - 1][i] + 25.0 * (share - target) ** 2 + tail + 2.0 * miss
+                if c < best[g][j]:
+                    best[g][j], back[g][j] = c, i
+    if best[n][T] == INF:
+        return None
+    ends, j = [], T
+    for g in range(n, 0, -1):
+        ends.append(j)
+        j = back[g][j]
+    ends.reverse()
+    out, start = [], 0
+    for e in ends:
+        seg, cur = [], []
+        for w, eol in toks[start:e]:
+            cur.append(w)
+            if eol:
+                seg.append(" ".join(cur))
+                cur = []
+        if cur:
+            seg.append(" ".join(cur))
+        out.append(seg)
+        start = e
+    return out
+
+
+def split_blob_group(orig: np.ndarray, group: dict, min_frac: float = 0.03) -> list[dict]:
+    """A text group whose rows overlap vertically (headline, byline and a TILTED banner side by side: their row
+    projections merge) split into its separate 2D ink blobs, top to bottom. Returns [group] when it is one blob."""
+    m, (ox, oy) = ink_mask_local(orig, group["box"])
+    if not m.any():
+        return [group]
+    m = cv2.dilate(m.astype(np.uint8), np.ones((5, 5), np.uint8))
+    n, lab, st, _ = cv2.connectedComponentsWithStats(m, connectivity=8)
+    big = [i for i in range(1, n) if st[i, cv2.CC_STAT_AREA] >= min_frac * m.size]
+    if len(big) < 2:
+        return [group]
+    out = []
+    for i in sorted(big, key=lambda k: (st[k, cv2.CC_STAT_TOP], st[k, cv2.CC_STAT_LEFT])):
+        x, y, w, h = (int(st[i, c]) for c in (cv2.CC_STAT_LEFT, cv2.CC_STAT_TOP, cv2.CC_STAT_WIDTH, cv2.CC_STAT_HEIGHT))
+        runs = row_runs(lab[y:y + h, x:x + w] == i, min_height=5) or [(0, h)]
+        out.append({"box": (ox + x, oy + y, ox + x + w, oy + y + h),
+                    "rows": [(y + a, y + b, float(w)) for a, b in runs],
+                    "aspect": float(sum(w / max(1.0, b - a) for a, b in runs)), "blob": True})
+    return out
+
+
+def group_letter_counts(orig: np.ndarray, boxes) -> list[float]:
+    """Approximate number of letters per group box: connected components of the Otsu minority class (the lettering
+    covers less area than its backdrop). Size- and tilt-independent, unlike the row aspect, so a tilted banner is not
+    under-weighted."""
+    H, W = orig.shape[:2]
+    out = []
+    for b in boxes:
+        x1, y1, x2, y2 = [int(v) for v in b]
+        x1, y1, x2, y2 = max(0, x1), max(0, y1), min(W, x2), min(H, y2)
+        if x2 - x1 < 4 or y2 - y1 < 4:
+            out.append(1.0)
+            continue
+        lum = cv2.cvtColor(np.ascontiguousarray(orig[y1:y2, x1:x2]), cv2.COLOR_RGB2LAB)[..., 0]
+        _, th = cv2.threshold(lum, 0, 1, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+        ink = th.astype(bool)
+        if ink.mean() > 0.5:
+            ink = ~ink
+        h = y2 - y1
+        _, _, comps = components(ink, min_area=max(6, int((0.05 * min(h, 60)) ** 2)))
+        out.append(float(max(1, len(comps))))
+    return out
+
+
 def median_letter_height(mask: np.ndarray) -> float:
     """Median component height (robust against one huge headline in a merged block)."""
     _, st, comps = components(mask, min_area=20)
@@ -538,7 +693,14 @@ def text_groups(orig: np.ndarray, xyxy, gap_ratio: float = 0.8) -> list[dict]:
     h, w = mask.shape
     width_on = mask.sum(axis=1)
     rule_rows = width_on >= 0.8 * w
-    rule_rows = cv2.morphologyEx(rule_rows.astype(np.uint8)[:, None], cv2.MORPH_OPEN, np.ones((1, 1), np.uint8))[:, 0].astype(bool)
+    max_rule = int(os.environ.get("RENDER_RULE_MAX_PX", "7"))
+    if max_rule > 0 and rule_rows.any():
+        # a rule is a THIN full-width line; a text row whose letters fill the width (menu bar 'NEWS HOME ECONOMY ...')
+        # is a tall run of 'full' rows and stays text (it was erased as a rule and its line moved to the next group)
+        edges = np.diff(np.concatenate([[0], rule_rows.astype(int), [0]]))
+        for a, b in zip(np.nonzero(edges == 1)[0], np.nonzero(edges == -1)[0]):
+            if b - a > max_rule:
+                rule_rows[a:b] = False
     clean = mask.copy()
     clean[rule_rows] = False
     runs = row_runs(clean, min_height=5)
@@ -552,10 +714,14 @@ def text_groups(orig: np.ndarray, xyxy, gap_ratio: float = 0.8) -> list[dict]:
     # a rule between two runs is a hard separator
     rule_idx = np.nonzero(rule_rows)[0]
     groups: list[list[tuple]] = [[rows[0]]]
+    size_ratio = float(os.environ.get("RENDER_GROUP_SIZE_RATIO", "1.7"))
     for prev, cur in zip(rows, rows[1:]):
         gap = cur[0] - prev[1]
         hard = bool(((rule_idx > prev[1] - 2) & (rule_idx < cur[0] + 2)).any())
-        if hard or gap > gap_ratio * min(prev[1] - prev[0], cur[1] - cur[0]):
+        h_prev, h_cur = prev[1] - prev[0], cur[1] - cur[0]
+        # a clear jump in row height (headline -> small byline -> tilted banner) starts a new group even without a gap
+        jump = size_ratio > 0 and max(h_prev, h_cur) > size_ratio * max(1, min(h_prev, h_cur))
+        if hard or jump or gap > gap_ratio * min(h_prev, h_cur):
             groups.append([cur])
         else:
             groups[-1].append(cur)

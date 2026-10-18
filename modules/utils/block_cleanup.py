@@ -284,6 +284,45 @@ def split_piece_duplicates(translations, boxes, is_piece, max_dy: float = 320.0)
     return drop
 
 
+# ---------------------------------------------------------------------------- OCR slivers of one text row
+def sliver_guard_enabled() -> bool:
+    return _flag("RENDER_SLIVER_GUARD")
+
+
+def row_slivers(boxes, rows, ratio: float = 0.55) -> list[int]:
+    """Indices of 'sliver' blocks to drop: a block whose box is much thinner than the ink row it sits in
+    (height < `ratio` x row height) is a partial OCR read of that row ('USING SEMICONDUCTOR)' read from the top half of
+    'YUSEONG SEMICONDUCTOR)'). When another block (sliver or full) already reads the same row (same row, horizontal
+    overlap >= 50 percent), the sliver is a duplicate with no own source line and is dropped; the first block of a row
+    is always kept, so no row loses its text.
+
+    boxes = [[x1, y1, x2, y2]]; rows = [(row_y1, row_y2) | None] per block (the ink row around the box centre)."""
+    n = len(boxes)
+
+    def sliver(i):
+        r = rows[i]
+        return r is not None and (boxes[i][3] - boxes[i][1]) < ratio * max(1.0, r[1] - r[0])
+
+    def same_row(i, j):
+        ri, rj = rows[i], rows[j]
+        if ri is None or rj is None:
+            return False
+        oy = min(ri[1], rj[1]) - max(ri[0], rj[0])
+        if oy < 0.6 * min(ri[1] - ri[0], rj[1] - rj[0]):
+            return False
+        ox = min(boxes[i][2], boxes[j][2]) - max(boxes[i][0], boxes[j][0])
+        return ox >= 0.5 * min(boxes[i][2] - boxes[i][0], boxes[j][2] - boxes[j][0])
+
+    drop: list[int] = []
+    for i in range(n):
+        if not sliver(i):
+            continue
+        # a full-height block of the same row, or an earlier sliver of it, already reads this row
+        if any(j != i and j not in drop and same_row(i, j) and (not sliver(j) or j < i) for j in range(n)):
+            drop.append(i)
+    return drop
+
+
 # ---------------------------------------------------------------------------- render safety net
 def safety_net_enabled() -> bool:
     return _flag("RENDER_SAFETY_NET")

@@ -231,3 +231,82 @@ def guard_page(label, blocks, retry: Callable[[], None], target_lang: str = "Tur
     if after:
         print(f"[translate-check] page {label} suspicious: {'; '.join(after[:4])}", flush=True)
     return after
+
+
+# ---------------------------------------------------------------------------- dropped 'I' (OCR) -> 3rd person verb
+# Comic lettering draws the pronoun 'I' as a single stroke that OCR often drops: 'WANT TO FIND THE GOLD', "DIDN'T DO
+# MUCH". The translator then reads a subject-less clause and conjugates for 'he' ('bulmak istiyor', 'yapmadı').
+# Questions are left alone ('WILL YOU...?' inverts), and the verb must be followed by no subject pronoun.
+_I_VERBS = {"want", "wanted", "will", "would", "didnt", "dont", "cant", "couldnt", "wont", "wasnt", "need", "hope",
+            "think", "knew", "felt", "was", "am", "m"}
+_PRONOUNS = {"you", "he", "she", "it", "they", "we", "i", "there", "this", "that"}
+_CONJ = {"and", "but", "so", "then", "or"}
+_TR_KEEP = {"şimdi", "kendi", "hadi", "haydi", "gibi", "dedi", "demek"}  # never conjugate these
+
+
+def first_person_enabled() -> bool:
+    return os.environ.get("RENDER_FIRST_PERSON_FIX", "true").strip().lower() not in ("false", "0", "no", "off")
+
+
+def _en_words(src: str) -> list[str]:
+    return [re.sub(r"[^a-z]", "", w.lower().replace("’", "'")) for w in (src or "").split() if re.sub(r"[^a-z]", "", w.lower())]
+
+
+def _subjectless_i(src: str) -> bool:
+    """True when the English clause starts with a verb that (with the pronoun 'I' dropped) needs a first-person subject."""
+    s = (src or "").strip()
+    if not s or "?" in s:
+        return False
+    w = _en_words(s)
+    while w and w[0] in _CONJ:
+        w = w[1:]
+    if not w or w[0] not in _I_VERBS:
+        return False
+    return not (len(w) > 1 and w[1] in _PRONOUNS - {"it", "this", "that"})
+
+
+def _tr_upper(s: str) -> str:
+    return s.replace("i", "İ").replace("ı", "I").upper()
+
+
+def to_first_person(word: str) -> str | None:
+    """Turkish 3rd-person singular verb form -> 1st person singular ('istiyor' -> 'istiyorum', 'geçirecek' ->
+    'geçireceğim', 'yapmadı' -> 'yapmadım'); None when the word is not such a form."""
+    m = re.match(r"^(.*?)([.!…,]*)$", word)
+    core, tail = m.group(1), m.group(2)
+    upper = core.upper() == core and any(ch.isalpha() for ch in core)
+    low = core.replace("İ", "i").replace("I", "ı").lower()
+    if len(low) < 4 or low in _TR_KEEP:
+        return None
+    if low.endswith("yor"):
+        new = low + "um"
+    elif low.endswith(("ecek", "acak")):
+        new = low[:-1] + "ğ" + ("im" if low.endswith("ecek") else "ım")
+    elif low.endswith(("madı", "medi", "mıştı", "mişti")) or (len(low) >= 5 and low[-2:] in ("dı", "di", "du", "dü", "tı", "ti", "tu", "tü")):
+        new = low + "m"
+    else:
+        return None
+    return (_tr_upper(new) if upper else new) + tail
+
+
+def first_person_fixes(sources: list[str], translations: list[str]) -> dict[int, str]:
+    """{block index: corrected translation} for sentences whose English subject 'I' was dropped by OCR.
+
+    A sentence may run over several blocks (no . ! at the end of a block's source): the verb is fixed in the block
+    where the sentence ends, which is where Turkish puts it."""
+    out: dict[int, str] = {}
+    n = len(sources)
+    k = 0
+    while k < n:
+        start = k
+        while k < n - 1 and not re.search(r"[.!?…]\s*$", (sources[k] or "").strip()):
+            k += 1  # the sentence continues in the next block
+        if _subjectless_i(sources[start]) and "?" not in (sources[k] or ""):
+            tr = (out.get(k) or translations[k] or "").rstrip()
+            words = tr.split()
+            if words:
+                new = to_first_person(words[-1])
+                if new and new != words[-1]:
+                    out[k] = " ".join(words[:-1] + [new])
+        k += 1
+    return out
