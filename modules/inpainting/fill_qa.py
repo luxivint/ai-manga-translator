@@ -124,7 +124,8 @@ def component_stats(orig: np.ndarray, out: np.ndarray, comp: np.ndarray, others:
     step = 0.0
     if band_in.sum() >= 10 and band_out.sum() >= 10:
         step = float(np.linalg.norm(np.median(lo[band_in], axis=0) - np.median(li[band_out], axis=0)))
-    return dict(area=int(comp.sum()), fill_p=fill_p, ring_p=ring_p, blot=blot, ring_blot=ring_blot, fill_l=fill_l, ring_l=ring_l, luma_ratio=fill_l / ring_l,
+    ring_spread = float(np.percentile(li[..., 0][ring], 95) - np.percentile(li[..., 0][ring], 5))
+    return dict(area=int(comp.sum()), ring_spread=ring_spread, fill_p=fill_p, ring_p=ring_p, blot=blot, ring_blot=ring_blot, fill_l=fill_l, ring_l=ring_l, luma_ratio=fill_l / ring_l,
                 fill_c=fill_c, ring_c=ring_c, chroma_ratio=fill_c / ring_c, step=step)
 
 
@@ -258,6 +259,8 @@ def calm_fill(orig: np.ndarray, out: np.ndarray, comp: np.ndarray, others: np.nd
             scored.append((_boundary_step(c_, orig, hole) + 0.6 * d[:, 0].mean() + 0.3 * d[:, 1:].mean(), n_, c_))
     scored.append((_boundary_step(lp_rgb, orig, hole), "lama_lp", lp_rgb))
     _, name, _best = min(scored, key=lambda t: t[0])
+    if name == "lama_lp" and os.environ.get("CLEAN_FILL_QA_LAMA_LP", "true").strip().lower() in ("false", "0", "no", "off"):
+        return None
     best = _membrane_fix(_best, orig, hole, ~cand_hole)
     lc = _lab(np.clip(best, 0, 255).astype(np.uint8))
     new = lo.copy()
@@ -275,6 +278,24 @@ def calm_fill(orig: np.ndarray, out: np.ndarray, comp: np.ndarray, others: np.nd
     if kind != "speck":
         alpha *= 1.0 - strong.astype(np.float32) * 0.9
     return _from_lab(lo * (1 - alpha[..., None]) + new * alpha[..., None]), name
+
+
+def fill_matches_ring(before: np.ndarray, crop: np.ndarray, comp: np.ndarray, others: np.ndarray | None) -> bool:
+    """A calm fill must look like the paper / panel right around the hole: the share of filled pixels whose luma is more
+    than 10 L away from the ring's median may exceed the ring's own share by at most CLEAN_FILL_QA_RING_MATCH (0.2).
+    Blurring left-over ink or a dark neighbour into the hole (grey haze, dark speckled box) fails; a flat calm fill of a
+    noisy LaMa patch in a flat box passes."""
+    c8 = comp.astype(np.uint8)
+    ring = (cv2.dilate(c8, _ell(21)) > 0) & ~(cv2.dilate(c8, _ell(5)) > 0)
+    if others is not None:
+        ring &= ~others
+    if ring.sum() < 50:
+        return True
+    lr = _lab(before)[..., 0][ring]
+    med = float(np.median(lr))
+    ring_off = float((np.abs(lr - med) > 10.0).mean())
+    fill_off = float((np.abs(_lab(crop)[..., 0][comp] - med) > 10.0).mean())
+    return fill_off <= ring_off + _f("CLEAN_FILL_QA_RING_MATCH", 0.2)
 
 
 def _groups(m: np.ndarray):
@@ -337,6 +358,70 @@ def _run_labels(comp: np.ndarray, lab: np.ndarray, modes: np.ndarray, hole: np.n
     return out
 
 
+def ring_is_gradient(lab: np.ndarray, ring: np.ndarray, comp: np.ndarray, modes: np.ndarray) -> bool:
+    """True when the flat-looking ring is really a smooth gradient (shaded balloon / translucent panel): a quadratic
+    surface explains the ring luma clearly better than the flat colours do and it changes by more than a few L units
+    across the filled area. Snapping such a fill to flat colours paints flat bands / rectangles (CLEAN_FLAT_GRADIENT_GUARD)."""
+    if os.environ.get("CLEAN_FLAT_GRADIENT_GUARD", "true").strip().lower() in ("false", "0", "no", "off"):
+        return False
+    ys, xs = np.nonzero(ring)
+    if len(ys) < 150:
+        return False
+    L = lab[..., 0][ring].astype(np.float64)
+    H, W = ring.shape
+    sx, sy = max(1.0, W / 2.0), max(1.0, H / 2.0)
+
+    def design(y, x):
+        u, v = x / sx - 1.0, y / sy - 1.0
+        return np.column_stack([np.ones_like(u), u, v, u * u, v * v, u * v])
+    coef = np.linalg.lstsq(design(ys.astype(np.float64), xs.astype(np.float64)), L, rcond=None)[0]
+    fit_res = float(np.median(np.abs(L - design(ys.astype(np.float64), xs.astype(np.float64)) @ coef)))
+    mode_res = float(np.median(np.min(np.abs(L[:, None] - modes[None, :, 0].astype(np.float64)), axis=1)))
+    cy, cx = np.nonzero(comp)
+    if len(cy) == 0:
+        return False
+    surf = design(cy.astype(np.float64), cx.astype(np.float64)) @ coef
+    span = float(np.percentile(surf, 95) - np.percentile(surf, 5))
+    return span >= _f("CLEAN_FLAT_GRADIENT_SPAN", 4.0) and fit_res < 0.6 * mode_res
+
+
+def _local_snap_weight(ring: np.ndarray, ringlab: np.ndarray, reg: np.ndarray, j: np.ndarray, run: np.ndarray,
+                       n_modes: int, ring_raw: np.ndarray | None = None, strong: np.ndarray | None = None) -> np.ndarray:
+    """Per `reg` pixel snap weight 0..1 from the ring NEAR that pixel: the local ring must be explained by the flat colours
+    (no speckle / hair / art texture right there) and, unless both ends of the pixel's run agree on the colour, mostly of
+    the colour the pixel snaps to. A whole-ring flatness vote otherwise paints white blobs over a textured corner.
+    CLEAN_FLAT_LOCAL=false restores the old all-or-nothing snap."""
+    if os.environ.get("CLEAN_FLAT_LOCAL", "true").strip().lower() in ("false", "0", "no", "off"):
+        return np.ones(int(reg.sum()), np.float32)
+    rf = ring.astype(np.float32)
+
+    def local(ind: np.ndarray) -> np.ndarray:
+        best = np.full(ring.shape, np.nan, np.float32)
+        for sg in (12.0, 36.0):
+            den = cv2.GaussianBlur(rf, (0, 0), sg)
+            num = cv2.GaussianBlur(ind.astype(np.float32), (0, 0), sg)
+            val = num / np.maximum(den, 1e-6)
+            take = np.isnan(best) & (den > 0.02)
+            best[take] = val[take]
+        return np.nan_to_num(best, nan=0.0)
+    expl = local(ring & (ringlab >= 0))[reg]
+    w = np.clip((expl - 0.8) / 0.12, 0.0, 1.0)  # sparse speckle / dither leaves 10-20 % unexplained
+    pur = np.zeros(int(reg.sum()), np.float32)
+    for m in range(n_modes):
+        sel = j == m
+        if sel.any():
+            pur[sel] = local(ring & (ringlab == m))[reg][sel]
+    w = np.where(run, w, w * np.clip((pur - 0.45) / 0.3, 0.0, 1.0))
+    if ring_raw is not None and strong is not None and ring_raw.any():
+        # dense structure all around (stipple / hatching / hair) is dropped from `ring` as 'edges': judge it on the raw ring
+        rr = ring_raw.astype(np.float32)
+        den = cv2.GaussianBlur(rr, (0, 0), 12.0)
+        tex = cv2.GaussianBlur((ring_raw & strong).astype(np.float32), (0, 0), 12.0) / np.maximum(den, 1e-6)
+        tex = np.where(den > 0.02, tex, 0.0)[reg]
+        w = w * np.clip((0.75 - tex) / 0.2, 0.0, 1.0)
+    return w.astype(np.float32)
+
+
 def flat_snap(cleaned: np.ndarray, mask: np.ndarray, skip: np.ndarray | None = None) -> tuple[np.ndarray, dict]:
     """Ghost removal: a balloon / flat panel is one flat colour, a LaMa fill inside it must be too. When the ring around a
     filled group is flat (<= 3 colours explain >= CLEAN_FLAT_COVER of it) every filled pixel within CLEAN_FLAT_TOL (Lab
@@ -354,11 +439,16 @@ def flat_snap(cleaned: np.ndarray, mask: np.ndarray, skip: np.ndarray | None = N
             c8 = comp.astype(np.uint8)
             ring = (cv2.dilate(c8, _ell(31)) > 0) & ~(cv2.dilate(c8, _ell(5)) > 0) & ~others
             lab = _lab(cleaned[y0:y1, x0:x1])
-            ring &= ~_strong_edges(lab[..., 0])
+            ring_raw = ring.copy()
+            strong = _strong_edges(lab[..., 0])
+            ring &= ~strong
             res = flat_modes(lab, ring)
             if res is None or res[1] < cover:
                 continue
             modes, _cov = res
+            if ring_is_gradient(lab, ring, comp, modes):
+                rep["gradient"] = rep.get("gradient", 0) + 1
+                continue  # LaMa follows the gradient; flat colours would paint bands
             rgb = np.array([_from_lab(m_.reshape(1, 1, 3).astype(np.float32))[0, 0] for m_ in modes], np.float32)
             # LaMa's feathered edge ends a few px outside the mask: the halo (small deviations only) is snapped as well
             reg = cv2.dilate(c8, _ell(2 * int(_f("CLEAN_FLAT_HALO", 8)) + 1)) > 0
@@ -390,9 +480,14 @@ def flat_snap(cleaned: np.ndarray, mask: np.ndarray, skip: np.ndarray | None = N
             sel = np.where(comp[reg], dself <= 4.0 * tol, dself <= tol)  # line art / outline pixels far from every flat colour stay
             if not sel.any():
                 continue
+            wt = _local_snap_weight(ring, ringlab, reg, j, rj >= 0, len(modes), ring_raw, strong)
+            sel &= wt > 0
+            if not sel.any():
+                continue
             crop = out[y0:y1, x0:x1]
             vals = crop[reg].astype(np.float32)
-            vals[sel] = rgb[j[sel]]
+            w_ = wt[sel][:, None]
+            vals[sel] = vals[sel] * (1.0 - w_) + rgb[j[sel]] * w_
             crop[reg] = np.clip(vals, 0, 255).astype(np.uint8)
             rep["groups"] += 1
             rep["snapped"] += int(sel.sum())
@@ -419,11 +514,18 @@ def qa_pass(image: np.ndarray, cleaned: np.ndarray, mask: np.ndarray, skip: np.n
             if not kind:
                 continue
             rep["bad"] += 1
+            spread_max = _f("CLEAN_FILL_QA_MAX_RING_SPREAD", 0.0)  # 0 = off
+            if spread_max > 0 and kind != "chroma" and st["ring_spread"] > spread_max:
+                rep["structured"] = rep.get("structured", 0) + 1
+                continue
             # ring pixels come from the cleaned page (identical outside the mask, residual leftovers already gone)
             res = calm_fill(cleaned[y0:y1, x0:x1], cleaned[y0:y1, x0:x1], comp, others, kind, st)
             if res is None:
                 continue
             crop, name = res
+            if kind != "chroma" and not fill_matches_ring(cleaned[y0:y1, x0:x1], crop, comp, others):
+                rep["off_ring"] = rep.get("off_ring", 0) + 1
+                continue  # the calm fill is a grey haze / dark smear the surround does not have: keep LaMa
             new_st = component_stats(image[y0:y1, x0:x1], crop, comp, others)
             if new_st is not None and new_st["luma_ratio"] > st["luma_ratio"] * 0.9 \
                     and new_st["chroma_ratio"] > st["chroma_ratio"] * 0.9:

@@ -296,7 +296,10 @@ def residual_pass(lb, image: np.ndarray, cleaned: np.ndarray, first_mask: np.nda
             rep["passes"] += 1
         if outline.enabled() and protected_raw is not None:
             # glyph pieces glued to a balloon outline: erase them, then redraw the outline along its fitted curve
-            keep, bands, n = outline.glyph_pieces(cur, done, exclude, protected_raw)
+            boxes = None
+            if os.environ.get("CLEAN_OUTLINE_IN_BOX", "true").strip().lower() not in ("false", "0", "no", "off"):
+                boxes = translated_boxes(blocks, h, w, pad=int(_f("CLEAN_OUTLINE_BOX_PAD", 12)), max_frac=1.0)
+            keep, bands, n = outline.glyph_pieces(cur, done, exclude, protected_raw, boxes=boxes)
             if n:
                 add = cv2.dilate(keep, _ell(2 * int(_f("CLEAN_RESIDUAL_GROW", 5)) + 1))
                 add = cv2.bitwise_or(add, outline.gap_mask(add.shape, keep, bands))
@@ -344,3 +347,91 @@ def residual_pass(lb, image: np.ndarray, cleaned: np.ndarray, first_mask: np.nda
     except Exception as exc:  # best effort
         rep["error"] = str(exc)
         return cleaned, rep
+
+
+def translated_regions(blocks, h: int, w: int, shrink: float = 0.08, free_pad: int = 24) -> np.ndarray:
+    """Where translated source text may legitimately be erased: the balloon (bubble box shrunk by `shrink` per side, so
+    an SFX sitting on the balloon's rim is outside) or the padded box of a free-text block. Ads count as translated."""
+    out = np.zeros((h, w), np.uint8)
+    for blk in blocks or []:
+        tr = (getattr(blk, "translation", "") or "").strip()
+        if len(tr) <= 1 and not getattr(blk, "is_ad", False):
+            continue
+        bub = getattr(blk, "bubble_xyxy", None)
+        x1, y1, x2, y2 = [int(v) for v in getattr(blk, "xyxy", (0, 0, 0, 0))]
+        out[max(0, y1 - free_pad):min(h, y2 + free_pad), max(0, x1 - free_pad):min(w, x2 + free_pad)] = 255
+        if bub is not None:
+            bx1, by1, bx2, by2 = [int(v) for v in bub]
+            dx, dy = int((bx2 - bx1) * shrink), int((by2 - by1) * shrink)
+            out[max(0, by1 + dy):min(h, by2 - dy), max(0, bx1 + dx):min(w, bx2 - dx)] = 255
+    return out
+
+
+def partial_words(fine: np.ndarray, image: np.ndarray, cleaned: np.ndarray, allowed: np.ndarray,
+                  max_inside: float | None = None) -> list:
+    """Text-like words of the ORIGINAL page (segmenter pixel mask `fine`, letters grouped) that cleaning changed only
+    partly although they lie (almost) outside every translated region: an untranslated SFX / sign half-erased because a
+    neighbouring mask or pass reached it. Returns [(bbox, footprint bool full-page mask, changed share)]."""
+    max_inside = _f("CLEAN_SFX_MAX_INSIDE", 0.3) if max_inside is None else max_inside
+    lo_frac, hi_frac = 0.03, _f("CLEAN_SFX_MAX_CHANGED", 0.97)
+    h, w = fine.shape[:2]
+    labo = cv2.cvtColor(image, cv2.COLOR_RGB2LAB)
+    labc = cv2.cvtColor(np.ascontiguousarray(cleaned), cv2.COLOR_RGB2LAB)
+    changed = np.linalg.norm(labc.astype(np.float32) - labo.astype(np.float32), axis=2) > 20
+    labf = labo.astype(np.float32)
+    n, lab, st, _ = cv2.connectedComponentsWithStats(cv2.dilate((fine > 0).astype(np.uint8), _ell(5)), connectivity=8)
+    out = []
+    for i in range(1, n):
+        x, y, cw, ch, _a = [int(v) for v in st[i]]
+        blob = (lab[y:y + ch, x:x + cw] == i) & (fine[y:y + ch, x:x + cw] > 0)
+        # the letters themselves: blob pixels clearly unlike the background ring around the blob
+        y0, y1, x0, x1 = max(0, y - 12), min(h, y + ch + 12), max(0, x - 12), min(w, x + cw + 12)
+        full = np.zeros((y1 - y0, x1 - x0), np.uint8)
+        full[y - y0:y - y0 + ch, x - x0:x - x0 + cw] = blob
+        ring = (cv2.dilate(full, _ell(23)) > 0) & (full == 0)
+        if ring.sum() < 20:
+            continue
+        bg = np.median(labf[y0:y1, x0:x1][ring], axis=0)
+        ink = blob & (np.linalg.norm(labf[y:y + ch, x:x + cw] - bg, axis=2) > 40)
+        # one segmenter blob can hold an SFX AND the balloon text next to it: judge each ink word on its own
+        nw, wlab = cv2.connectedComponents(cv2.dilate(ink.astype(np.uint8), _ell(9)) & blob.astype(np.uint8))
+        for k in range(1, nw):
+            word = ink & (wlab == k)
+            if int(word.sum()) < 40 or not changed[y:y + ch, x:x + cw][word].any():
+                continue
+            if float((allowed[y:y + ch, x:x + cw][word] > 0).mean()) > max_inside:
+                continue
+            ch_frac = float(changed[y:y + ch, x:x + cw][word].mean())
+            n_ch = int(changed[y:y + ch, x:x + cw][word].sum())
+            if ch_frac > hi_frac or (ch_frac < lo_frac and n_ch < 40):  # a nick of >= 40 px counts too
+                continue
+            foot = np.zeros((h, w), bool)
+            foot[y:y + ch, x:x + cw] = word
+            wy, wx = np.nonzero(word)
+            out.append(((x + int(wx.min()), y + int(wy.min()), int(np.ptp(wx)) + 1, int(np.ptp(wy)) + 1), foot, ch_frac))
+    return out
+
+
+def revert_partial_sfx(lb, image: np.ndarray, cleaned: np.ndarray, blocks, keep_erased: np.ndarray | None = None
+                       ) -> tuple[np.ndarray, int]:
+    """Half-erased untranslated words (SFX like 'HAHAHA', 'Phew~' next to a translated balloon) are put back whole: the
+    renderer draws nothing there, so the original lettering (and the outline under it) is the only clean result.
+    `keep_erased` = regions erased on purpose (whole watermarks / ads). Knob: CLEAN_SFX_REVERT (true)."""
+    if os.environ.get("CLEAN_SFX_REVERT", "true").strip().lower() in ("false", "0", "no", "off"):
+        return cleaned, 0
+    h, w = cleaned.shape[:2]
+    allowed = translated_regions(blocks, h, w)
+    if keep_erased is not None:
+        allowed = cv2.bitwise_or(allowed, (keep_erased > 0).astype(np.uint8) * 255)
+    _, fine = lb._tiled_segment(lb._get_segmenter(), image, _f("CLEAN_SFX_CONF", 0.1))
+    words = partial_words(fine, image, cleaned, allowed)
+    if not words:
+        return cleaned, 0
+    out = cleaned.copy()
+    for (x, y, cw, ch), foot, _f_ in words:
+        # the word, its anti-aliased rim and the outline / art pixels the erase took with it, never inside a translated region
+        zone = cv2.dilate(foot.astype(np.uint8), _ell(15)) > 0
+        zone &= allowed == 0
+        out[zone] = image[zone]
+        print(f"  [clean-sfx] half-erased untranslated word restored box={x},{y},{x + cw},{y + ch}", flush=True)
+    return out, len(words)

@@ -45,6 +45,16 @@ def _load_entries(log: Path) -> dict:
     return by_page
 
 
+def learn_plates(lb, args, input_dir: Path, names: list, by_page: dict, crops: dict | None = None) -> list:
+    """Same chapter-level plate learning as the live batch (all pages + their dumped blocks) before cleaning."""
+    from modules.utils import watermark as wl
+    pages = []
+    for n in names:
+        image = rc.read_page(Path(input_dir) / n, crops)
+        pages.append((image, rc.build_blocks(lb, args, image, by_page.get(n, []))))
+    return wl.learn_plates(pages, candidates=lb.plate_candidates)
+
+
 def clean_page(lb, args, path: Path, ents: list[dict], idx: int = 0, crops: dict | None = None):
     """The live _stage_clean on a recut page (blocks rebuilt from the dump). Returns (image, cleaned, mask, blocks)."""
     image = rc.read_page(path, crops)  # applies the live vision/banner crop so dump boxes line up
@@ -76,6 +86,7 @@ def cmd_clean(a):
     if a.pages:
         want = {f"recut-{int(x):05d}.png" for x in a.pages.split(",")}
         names = [n for n in names if n in want]
+    learn_plates(lb, args, Path(a.input), sorted(p.name for p in Path(a.input).glob("recut-*.png")), by_page, crops)
     out = Path(a.out)
     out.mkdir(parents=True, exist_ok=True)
     rows = []

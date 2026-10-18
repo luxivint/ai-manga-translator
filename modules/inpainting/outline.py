@@ -166,12 +166,63 @@ def _reaches_border(xy: np.ndarray, shape, margin: int = 12) -> bool:
     return False
 
 
+def stroke_fraction(core: np.ndarray) -> float:
+    """Share of `core` (bool) pixels in thin elongated pieces (hatching, speed lines, spikes of a burst balloon). Letters
+    are compact / bold; a group made of such strokes is drawn art, not a glyph."""
+    n, lab, st, _ = cv2.connectedComponentsWithStats(core.astype(np.uint8), connectivity=8)
+    tot = int(core.sum())
+    if tot == 0:
+        return 0.0
+    thin = 0
+    for i in range(1, n):
+        if st[i, cv2.CC_STAT_AREA] < 6:
+            continue
+        ys, xs = np.nonzero(lab[st[i, 1]:st[i, 1] + st[i, 3], st[i, 0]:st[i, 0] + st[i, 2]] == i)
+        (_c, (rw, rh), _a) = cv2.minAreaRect(np.column_stack([xs, ys]).astype(np.float32))
+        lo, sh = max(rw, rh), min(rw, rh)
+        if lo >= 15 and sh <= 5 and sh <= 0.25 * lo:
+            thin += int(st[i, cv2.CC_STAT_AREA])
+    return thin / tot
+
+
+def is_clean_line(fit: dict, ink: np.ndarray, busy: np.ndarray, min_light: float = 0.8,
+                  outline_px: np.ndarray | None = None) -> bool:
+    """The fitted curve is a real outline only when, away from the letters (`busy`), it is a single thin stroke with
+    paper on BOTH sides. A burst balloon's spike ring, hatching or an outline drawn over art fails: redrawing a smooth
+    arc there paints a streak, so the letters there are left to the other passes."""
+    xy = fit["xy"]
+    if len(xy) < 8:
+        return False
+    d = np.gradient(xy, axis=0)
+    nrm = np.column_stack([-d[:, 1], d[:, 0]]) / np.maximum(np.hypot(d[:, 0], d[:, 1]), 1e-6)[:, None]
+    hh, ww = ink.shape
+    far = cv2.distanceTransform((~busy).astype(np.uint8), cv2.DIST_L2, 3) if busy.any() else np.full(ink.shape, 99.0, np.float32)
+    ix = np.clip(np.round(xy[:, 0]).astype(int), 0, ww - 1)
+    iy = np.clip(np.round(xy[:, 1]).astype(int), 0, hh - 1)
+    use = far[iy, ix] > 12
+    if use.sum() < 12:
+        return True  # nothing visible beside the letters to judge by: keep the old behaviour
+    light = []
+    for off in (fit["width"] / 2.0 + 4.0, fit["width"] / 2.0 + 9.0):
+        for sgn in (1.0, -1.0):
+            p = xy[use] + sgn * off * nrm[use]
+            px = np.clip(np.round(p[:, 0]).astype(int), 0, ww - 1)
+            py = np.clip(np.round(p[:, 1]).astype(int), 0, hh - 1)
+            light.append(~ink[py, px])
+    light = np.array(light)  # (4, n)
+    if outline_px is not None and outline_px[iy[use], ix[use]].mean() < 0.7:
+        return False  # the curve does not follow the protected balloon outline (fitted to a letter / art)
+    return bool(light.mean(axis=1).min() >= min_light)
+
+
 def glyph_pieces(cleaned: np.ndarray, done: np.ndarray, exclude: np.ndarray, protected: np.ndarray | None,
-                 debug: list | None = None) -> tuple[np.ndarray, list, int]:
+                 debug: list | None = None, boxes: np.ndarray | None = None) -> tuple[np.ndarray, list, int]:
     """Glyph leftovers glued to a balloon outline. `protected` = bubble outline protection mask. Returns (keep uint8
     mask of the glyph pixels to erase, bands [dict(xy=full-page centre line, width, color)] to redraw, piece count).
     A piece is accepted like a fringe fragment (letter sized, close to the cleaned area `done`, flat surrounding) but it
-    may touch the outline: the outline is the fitted curve, only ink off that curve counts as glyph."""
+    may touch the outline: the outline is the fitted curve, only ink off that curve counts as glyph.
+    `boxes` (uint8, translated text boxes): when given, a piece must lie mostly inside one (CLEAN_OUTLINE_BOX_MIN, 0.5):
+    ink off a fitted curve elsewhere is the outline's own wobble, a burst balloon's spikes or an untranslated SFX."""
     h, w = cleaned.shape[:2]
     keep = np.zeros((h, w), np.uint8)
     bands: list = []
@@ -236,6 +287,12 @@ def glyph_pieces(cleaned: np.ndarray, done: np.ndarray, exclude: np.ndarray, pro
         if not arcs:
             why((x0 + wx0, y0 + wy0), 'nofit')
             continue
+        if os.environ.get("CLEAN_OUTLINE_LINE_CHECK", "true").strip().lower() not in ("false", "0", "no", "off"):
+            pw = cv2.dilate(prot[wy0:wy1, wx0:wx1].astype(np.uint8), _ell(7)) > 0
+            arcs = [a for a in arcs if is_clean_line(a, wink, kc, outline_px=pw)]
+            if not arcs:
+                why((x0 + wx0, y0 + wy0), 'not-a-line')
+                continue
         wink_d = cv2.dilate(wink.astype(np.uint8), _ell(5)) > 0
         pieces = np.zeros(wink.shape, bool)
         for _attempt in range(2):
@@ -308,6 +365,12 @@ def glyph_pieces(cleaned: np.ndarray, done: np.ndarray, exclude: np.ndarray, pro
             gcore[y0 + wy0:y0 + wy0 + shp[0], x0 + wx0:x0 + wx0 + shp[1]] = core
             if exclude[gcore].mean() > 0.3:
                 continue
+            if boxes is not None and (boxes[gcore] > 0).mean() < _f("CLEAN_OUTLINE_BOX_MIN", 0.5):
+                why(at, 'outside-box')
+                continue
+            if stroke_fraction(core) >= _f("CLEAN_OUTLINE_STROKE_FRAC", 0.6):
+                why(at, 'strokes')
+                continue
             rp = 12
             by0, by1 = max(0, gy - rp), min(shp[0], gy + gh + rp)
             bx0, bx1 = max(0, gx - rp), min(shp[1], gx + gw + rp)
@@ -328,11 +391,16 @@ def glyph_pieces(cleaned: np.ndarray, done: np.ndarray, exclude: np.ndarray, pro
             wk = keep[y0:y1, x0:x1][wy0:wy1, wx0:wx1] > 0
             near_acc = cv2.dilate(wk.astype(np.uint8), _ell(25)) > 0
             keep[y0 + wy0:y0 + wy1, x0 + wx0:x0 + wx1][kc & ~band & near_acc] = 255
+            dtw = cv2.distanceTransform(wink.astype(np.uint8), cv2.DIST_L2, 3)
             for fit in arcs:
-                ix = np.clip(np.round(fit["pts"][:, 0]).astype(int) + wx0, 0, sw - 1)
-                iy = np.clip(np.round(fit["pts"][:, 1]).astype(int) + wy0, 0, sh - 1)
-                color = np.median(sub[iy, ix].reshape(-1, 3), axis=0)
-                bands.append(dict(xy=fit["xy"] + np.array([x0 + wx0, y0 + wy0], np.float64), width=fit["width"], color=color))
+                px_, py_ = np.round(fit["pts"][:, 0]).astype(int), np.round(fit["pts"][:, 1]).astype(int)
+                ix = np.clip(px_ + wx0, 0, sw - 1)
+                iy = np.clip(py_ + wy0, 0, sh - 1)
+                # the outline's own colour: its darker core, not the anti-aliased rim (a grey redraw reads as a gap)
+                color = np.percentile(sub[iy, ix].reshape(-1, 3).astype(np.float32), 30, axis=0)
+                stroke = 2.0 * float(np.median(dtw[np.clip(py_, 0, wink.shape[0] - 1), np.clip(px_, 0, wink.shape[1] - 1)]))
+                width = float(np.clip(stroke, 2.0, fit["width"])) if stroke > 0 else max(2.0, fit["width"] - 1.0)
+                bands.append(dict(xy=fit["xy"] + np.array([x0 + wx0, y0 + wy0], np.float64), width=width, color=color))
             count += took
     return keep, bands, count
 
@@ -356,7 +424,8 @@ def redraw(img: np.ndarray, zone: np.ndarray, bands: list) -> np.ndarray:
     out = img.astype(np.float32)
     region = cv2.dilate((zone > 0).astype(np.uint8), _ell(5)) > 0
     for b in bands:
-        alpha = _draw(img.shape, b["xy"], max(2.0, b["width"] - 1.0), aa=True).astype(np.float32) / 255.0
+        alpha = _draw(img.shape, b["xy"], max(2.0, b["width"]), aa=True).astype(np.float32) / 255.0
         alpha *= region
         out = out * (1 - alpha[..., None]) + np.asarray(b["color"], np.float32) * alpha[..., None]
     return np.clip(out, 0, 255).astype(np.uint8)
+
