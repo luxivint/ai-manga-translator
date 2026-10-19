@@ -78,6 +78,31 @@ def upload_directory(local_dir: Path, prefix: str, config=None) -> dict:
     return manifest
 
 
+def upload_file(path: Path, key: str, config=None) -> dict:
+    target = _storage_root() / normalize_key(key)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(path, target)
+    return {"key": normalize_key(key), "url": "", "bytes": path.stat().st_size}
+
+
+def list_objects(prefix: str, config=None) -> dict[str, int]:
+    source = _prefix_dir(prefix)
+    if not source.exists():
+        return {}
+    return {normalize_key(prefix, p.relative_to(source).as_posix()): p.stat().st_size
+            for p in source.rglob("*") if p.is_file()}
+
+
+def delete_keys(keys: list[str], config=None) -> int:
+    deleted = 0
+    for key in keys:
+        target = _storage_root() / normalize_key(key)
+        if target.is_file():
+            target.unlink()
+            deleted += 1
+    return deleted
+
+
 def delete_prefix(prefix: str, config=None) -> int:
     target = _prefix_dir(prefix)
     if not target.exists():

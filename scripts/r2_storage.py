@@ -177,6 +177,31 @@ def download_prefix(prefix: str, local_dir: Path, config: R2Config | None = None
     return sorted(downloaded, key=_num_key)
 
 
+def list_objects(prefix: str, config: R2Config | None = None) -> dict[str, int]:
+    """{key: size} of every object under the chapter folder (used to verify uploads)."""
+    config = config or R2Config.from_env()
+    s3 = client(config)
+    prefix = normalize_key(prefix)
+    if not prefix:
+        raise ValueError("R2 folder prefix must not be empty")
+    prefix += "/"  # Chapter 2 must never include chapters 20-29.
+    objects: dict[str, int] = {}
+    for page in s3.get_paginator("list_objects_v2").paginate(Bucket=config.bucket, Prefix=prefix):
+        for item in page.get("Contents", []):
+            objects[item["Key"]] = int(item.get("Size") or 0)
+    return objects
+
+
+def delete_keys(keys: list[str], config: R2Config | None = None) -> int:
+    config = config or R2Config.from_env()
+    s3 = client(config)
+    keys = [normalize_key(key) for key in keys if normalize_key(key)]
+    for start in range(0, len(keys), 1000):
+        batch = [{"Key": key} for key in keys[start:start + 1000]]
+        s3.delete_objects(Bucket=config.bucket, Delete={"Objects": batch, "Quiet": True})
+    return len(keys)
+
+
 def delete_prefix(prefix: str, config: R2Config | None = None) -> int:
     config = config or R2Config.from_env()
     s3 = client(config)

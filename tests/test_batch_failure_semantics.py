@@ -219,7 +219,9 @@ class MainPublishGateTests(unittest.TestCase):
             mock.patch.object(lb, "prepare_seo_upload_dir", lambda *a: Path(tmp)),
             mock.patch.object(lb, "delete_prefix", m["delete_prefix"]),
             mock.patch.object(lb, "upload_directory", m["upload_directory"]),
-            mock.patch.dict(os.environ, {"OPENAI_API_KEY": "k", "BATCH_PIPELINE": "true"}),
+            mock.patch.object(lb, "list_objects", lambda prefix: {}),
+            # upload verification has its own tests (test_upload_verify.py)
+            mock.patch.dict(os.environ, {"OPENAI_API_KEY": "k", "BATCH_PIPELINE": "true", "R2_VERIFY_UPLOAD": "false"}),
         ]
         out = io.StringIO()
         with contextlib.ExitStack() as stack:
@@ -242,7 +244,8 @@ class MainPublishGateTests(unittest.TestCase):
         code, m, _lines, _tmp = self.run_main(0)
         self.assertEqual(code, 0)
         m["upload_directory"].assert_called_once()
-        self.assertEqual([c.args[0] for c in m["delete_prefix"].call_args_list], ["translated/m/c", "raw/m/c"])
+        # the published translated folder is overwritten in place, never emptied before the upload
+        self.assertEqual([c.args[0] for c in m["delete_prefix"].call_args_list], ["raw/m/c"])
 
     def test_degraded_but_tolerated_batch_uploads_but_keeps_raw(self):
         code, m, lines, _tmp = self.run_main(0, degraded=["7.jpg"])

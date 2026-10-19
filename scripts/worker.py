@@ -19,6 +19,7 @@ import json
 from batch_process import run_batch_process, batch_progress, WarmRunner, env_fingerprint
 
 from r2_storage import R2Config, client, delete_prefix, load_env, normalize_key, public_url
+import upload_verify
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -111,6 +112,11 @@ def probe_quota(conn):
 
 class QuotaWaitError(RuntimeError):
     pass
+
+
+class PublishVerificationError(RuntimeError):
+    """Pages are recorded but public page URLs are broken. A blind retry cannot fix this (raw may already be
+    deleted), so the job goes to FAILED for an operator instead of DONE."""
 
 
 def claim_job(conn):
@@ -543,6 +549,39 @@ def invalidate_web_cache(manga_slug: str):
         print(f"cache_invalidate_warn: {exc}", flush=True)
 
 
+def published_page_urls(conn, chapter_id: str) -> list[str]:
+    """Public URLs exactly as the web reader builds them (R2_PUBLIC_BASE_URL + r2Key, else imageUrl)."""
+    base = (os.environ.get("LINK_CHECK_PUBLIC_BASE_URL") or os.environ.get("R2_PUBLIC_BASE_URL") or "").strip().rstrip("/")
+    with conn.cursor() as cur:
+        cur.execute('SELECT "r2Key", "imageUrl" FROM "ChapterPage" WHERE "chapterId" = %s ORDER BY "pageIndex"',
+                    [chapter_id])
+        rows = cur.fetchall()
+    return [f"{base}/{row['r2Key'].lstrip('/')}" if base and row.get("r2Key") else (row.get("imageUrl") or "")
+            for row in rows]
+
+
+def verify_published_pages(conn, chapter: dict, check=upload_verify.check_urls):
+    """HEAD every published page; definitive failures (404, HTML, empty file) raise PublishVerificationError.
+    Network-only problems are logged, not failed: the daily link check re-tests them."""
+    if not upload_verify.publish_verify_enabled():
+        return
+    urls = published_page_urls(conn, chapter["id"])
+    if not urls:
+        raise PublishVerificationError("Yayın doğrulaması: bölüm için hiç sayfa kaydedilmedi")
+    if not all(url.startswith("http") for url in urls):
+        print("publish_verify_skip: R2_PUBLIC_BASE_URL missing, page URLs cannot be checked", flush=True)
+        return
+    problems = check(urls)
+    broken = [p for p in problems if p["reason"] != "network"]
+    if len(problems) > len(broken):
+        print(f"publish_verify_warn: {len(problems) - len(broken)} pages unreachable (network)", flush=True)
+    if broken:
+        sample = "; ".join(f"{p['status'] or p['reason']} {p['url'].rsplit('/', 1)[-1]}" for p in broken[:5])
+        raise PublishVerificationError(
+            f"Yayın doğrulaması başarısız (müdahale gerekli): {len(broken)}/{len(urls)} sayfa kırık: {sample}")
+    print(f"publish_verified: {len(urls)} pages", flush=True)
+
+
 LOCAL_BATCH_VALIDATION_EXIT = 3  # keep in sync with local_batch.EXIT_VALIDATION_FAILED
 
 _WARM: WarmRunner | None = None
@@ -704,6 +743,7 @@ def process_translate_job(conn, job):
             update_worker_heartbeat(conn)
         raw_prefix, output_prefix = translate_chapter(chapter, delete_raw, job["id"], tick=tick)
         record_translated_assets(conn, chapter, output_prefix, raw_prefix, delete_raw)
+        verify_published_pages(conn, chapter)
         heartbeat(conn, job["id"])
         set_job(conn, job["id"], progress=int(index / total * 95))
     return total
@@ -733,6 +773,9 @@ def run_once(conn) -> bool:
     except CancelledJob as exc:
         print(f"job cancelled {job['id']}: {exc}", flush=True)
         set_job(conn, job["id"], status="CANCELLED", error=str(exc))
+    except PublishVerificationError as exc:
+        print(f"job needs attention {job['id']}: {exc}", flush=True)
+        set_job(conn, job["id"], status="FAILED", error=str(exc))
     except Exception as exc:
         print(f"job failed {job['id']}: {exc}", flush=True)
         mark_failed_or_retry(conn, job["id"], str(exc))

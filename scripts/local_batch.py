@@ -77,7 +77,9 @@ from modules.utils import gateway
 from modules.utils import watermark as watermark_lib
 from modules.utils.gateway import AdaptiveLimiter, GatewayError, OCRFailedError
 from modules.utils.openai_endpoint import get_openai_chat_completions_url, get_openai_model
-from scripts.storage import delete_prefix, download_prefix, normalize_key, upload_directory
+from scripts.storage import (delete_keys, delete_prefix, download_prefix, list_objects, normalize_key,
+                             upload_directory, upload_file)
+from scripts import upload_verify
 from scripts.safe_recut import prepare as prepare_safe_recut
 
 
@@ -3191,11 +3193,23 @@ def run_batch(args, app, recut_work: Path) -> int:
         out_prefix = args.r2_output_prefix or translated_prefix(args.r2_input_prefix)
         upload_dir = prepare_seo_upload_dir(output_dir, out_prefix, chapter_work)
         print(f"R2 upload: {upload_dir} -> {out_prefix}", flush=True)
-        deleted_output = delete_prefix(out_prefix)
-        if deleted_output:
-            print(f"R2 old translated deleted: {deleted_output} objects", flush=True)
+        # Overwrite in place (same SEO names) instead of emptying the folder first: the published chapter keeps
+        # working while pages upload, and a failed upload can no longer leave it pointing at deleted images.
         manifest = upload_directory(upload_dir, out_prefix)
         print(f"R2 uploaded: {manifest['count']} images", flush=True)
+        if upload_verify.upload_verify_enabled():
+            missing = upload_verify.verify_and_repair(upload_dir, out_prefix, list_objects, upload_file)
+            if missing:
+                app.quit()
+                print(f"R2 raw KEPT: upload verification failed for {len(missing)} pages", flush=True)
+                print(f"FAILED: R2 upload verification failed, {len(missing)} pages missing after re-upload "
+                      f"{missing[:5]}; raw pages kept", flush=True)
+                return EXIT_VALIDATION_FAILED
+            print(f"R2 verified: {manifest['count']} images present", flush=True)
+        stale = upload_verify.stale_objects(upload_verify.expected_objects(upload_dir, out_prefix),
+                                            list_objects(out_prefix))
+        if stale:
+            print(f"R2 old translated deleted: {delete_keys(stale)} objects", flush=True)
         degraded_pages = getattr(args, "degraded_pages", None) or []
         if args.r2_delete_input and degraded_pages:
             print(f"R2 raw KEPT: {len(degraded_pages)} pages are not fully translated {degraded_pages[:20]}", flush=True)

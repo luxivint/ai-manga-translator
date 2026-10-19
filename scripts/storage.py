@@ -15,8 +15,9 @@ from .r2_storage import normalize_key
 _BACKEND = os.environ.get("STORAGE_BACKEND", "r2").strip().lower()
 
 if _BACKEND == "local":
-    from .local_storage import delete_prefix, download_prefix, upload_directory
+    from .local_storage import delete_keys, delete_prefix, download_prefix, list_objects, upload_directory, upload_file
 else:
-    from .r2_storage import delete_prefix, download_prefix, upload_directory
+    from .r2_storage import delete_keys, delete_prefix, download_prefix, list_objects, upload_directory, upload_file
 
-__all__ = ["delete_prefix", "download_prefix", "upload_directory", "normalize_key"]
+__all__ = ["delete_keys", "delete_prefix", "download_prefix", "list_objects", "upload_directory", "upload_file",
+           "normalize_key"]
