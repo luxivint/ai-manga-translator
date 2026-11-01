@@ -24,7 +24,10 @@ başlangıç, bitiş ve örnekler yine incelenebilir.
 - Model hazırlığı, reklam taraması ve görsel çözme.
 - Sayfa detection, font modeli/özellikleri, OCR, boş OCR kurtarma ve OCR tekrarları.
 - Çeviri istekleri, çeviri değerlendirmesi ve yeniden deneme beklemesi.
-- Filigran öğrenimi, aday taraması, şablon oluşturma/eşleme.
+- OCR'nin zaten bulduğu filigran kutularında yerel bölge maskesi ve düz renk dolgu.
+  Bölüm çapında aday tarama, şablon öğrenme/eşleme kaldırıldı. Eski `WATERMARK_PLATES`
+  ve `WATERMARK_PLATE_MINE` ayarları artık bu işlemleri etkinleştiremez. OCR'nin okumadığı
+  filigranlar için ek tarama yapılmaz; bu işaretler görselde kalabilir.
 - Segmenter hazırlığı/çıkarımı, maske çıkarma/iyileştirme, CV2 dolgu ve alan geri yükleme.
 - Yazı yerleşimi, çizim, dosya kodlama/kayıt, boyut kontrolü ve damga.
 - API kapasite sırası, devre kesici beklemesi, her HTTP girişimi, durum kodu ve yeniden deneme beklemesi.

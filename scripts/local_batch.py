@@ -373,10 +373,6 @@ def _get_segmenter():
     return _SEGMENTER
 
 
-
-
-
-
 def loaded_models() -> list[str]:
     """Only the initial mask segmenter and optional local detector can be held."""
     from modules.detection.factory import DetectionEngineFactory
@@ -656,41 +652,13 @@ def watermark_rule(blk, page_w: int, page_h: int) -> str | None:
     return watermark_match(blk)
 
 
-@trace.traced("watermark.candidate_scan")
-def plate_candidates(image: np.ndarray) -> list:
-    """OCR-free scan-group tag candidates for watermark.learn_plates: text-like segmenter components (low confidence,
-    the tags are small / translucent); the learner keeps only those that repeat over the chapter at the page edge."""
-    seg, _fine = _tiled_segment(_get_segmenter(), image, float(os.environ.get("WATERMARK_PLATE_SEG_CONF", "0.1")))
-    n, _lab, st, _ = cv2.connectedComponentsWithStats((seg > 0).astype(np.uint8), connectivity=8)
-    return [(int(st[i][0]), int(st[i][1]), int(st[i][0] + st[i][2]), int(st[i][1] + st[i][3])) for i in range(1, n)]
-
-
-_PLATE_MEMO = threading.local()
-
-
-@trace.traced("watermark.page_mask")
-def chapter_plate_mask(image: np.ndarray) -> np.ndarray:
-    """Known scan-group plates of this chapter found on the page (modules/utils/watermark.learn_plates), memoised per
-    page object (asked by the mask, the flat fill and the post passes)."""
-    memo = getattr(_PLATE_MEMO, "last", None)
-    if memo is not None and memo[0] is image and memo[1] == id(watermark_lib._CHAPTER_PLATES):
-        return memo[2].copy()
-    try:
-        m = watermark_lib.plate_mask(image)
-    except Exception as exc:  # plates are an extra, never break cleaning
-        print(f"  [watermark] plate match skipped: {exc}", flush=True)
-        m = np.zeros(image.shape[:2], np.uint8)
-    _PLATE_MEMO.last = (image, id(watermark_lib._CHAPTER_PLATES), m)
-    return m.copy()
-
-
+@trace.traced("watermark.ocr_regions")
 def watermark_clear_mask(image: np.ndarray, blocks) -> np.ndarray:
-    """Union of whole-watermark regions to erase under WATERMARK_POLICY=clean (empty mask under 'keep')."""
+    """Local masks for watermark/ad boxes already found by OCR; no detector or chapter search."""
     h, w = image.shape[:2]
     out = np.zeros((h, w), np.uint8)
     if watermark_policy() != "clean":
         return out
-    out |= chapter_plate_mask(image)
     ratio = float(os.environ.get("AD_MIN_AREA_RATIO", "0.015"))
     pad = int(os.environ.get("WATERMARK_PAD", "12"))
     for blk in blocks or []:
@@ -778,13 +746,6 @@ def build_segmenter_mask(image: np.ndarray, blocks=None, require_translation: bo
             text_boxes[max(0, y1 - tb_pad):min(h, y2 + tb_pad), max(0, x1 - tb_pad):min(w, x2 + tb_pad)] = 255
             if not getattr(blk, "is_ad", False):
                 target_boxes.append((x1, y1, x2, y2))
-        plates = chapter_plate_mask(image)
-        if plates.any():
-            if clean_wm:
-                wm_clear |= plates  # chapter plates OCR did not read on this page (logo + tag, learned footprint)
-                print(f"  [clean] watermark plate erased px={int((plates > 0).sum())}", flush=True)
-            else:
-                wm_exclude |= plates
         if not has_target:
             return wm_clear  # nothing to clean: the (GPU) segmenter is not needed at all
         seg, fine = _tiled_segment(_get_segmenter(), image, conf)
@@ -1969,7 +1930,6 @@ def crop_has_ad_evidence(blocks, y1: int, y2: int, page_w: int, page_h: int) -> 
     return False
 
 
-
 @trace.traced("detection.regions", page_arg="path")
 def detect_page_blocks(path,image,settings,args,*,source=None,crop_box=None):
     """Reuse only exact matching first-pass geometry, then construct normal TextBlocks."""
@@ -2391,8 +2351,6 @@ def _dump_clean_debug(path: Path, image: np.ndarray, mask: np.ndarray) -> None:
         print(f"  [clean-dump] failed: {exc}", flush=True)
 
 
-
-
 @trace.traced("page.clean", task_page=True)
 def _stage_clean(task: tuple) -> tuple:
     """Phase-3a: initial mask, selected fill backend, optional postprocessing."""
@@ -2770,10 +2728,6 @@ def process_all_batched(images: list[Path], output_dir: Path, args: argparse.Nam
         print(f"\n[BATCH] Faz 2/3  translate atlandi (metin bulunamadi)", flush=True)
 
     # ── Faz 3a: Parallel clean (with safe fallback) ──────────────────────────
-    try:  # scan-group plates repeated over the chapter (also on pages where OCR did not read them)
-        watermark_lib.learn_plates([(img, bl) for _p, img, bl in page_results], candidates=plate_candidates)
-    except Exception as exc:
-        print(f"  [watermark] plate learning skipped: {exc}", flush=True)
     w3 = _dynamic_workers(base_workers)
     print(f"\n[BATCH] Faz 3/3  clean+render+save  {w3} worker", flush=True)
     t3 = time.perf_counter()
