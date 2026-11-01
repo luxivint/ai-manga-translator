@@ -1,3 +1,5 @@
+
+from modules.utils import stage_trace as trace
 import numpy as np
 import os
 import re
@@ -15,6 +17,7 @@ class OCRProcessor:
         self.source_lang = None
         self.source_lang_english = None
 
+    @trace.traced("ocr.initialize")
     def initialize(self, main_page: Any, source_lang: str) -> None:
         self.main_page = main_page
         self.settings = main_page.settings_page
@@ -22,6 +25,7 @@ class OCRProcessor:
         self.source_lang_english = source_lang
         self.ocr_key = self.settings.get_tool_selection('ocr')
 
+    @trace.traced("ocr.recognize")
     def process(self, img: np.ndarray, blk_list: list[TextBlock]) -> list[TextBlock]:
         self._set_source_language(blk_list)
         engine = OCRFactory.create_engine(self.settings, self.source_lang_english, self.ocr_key)

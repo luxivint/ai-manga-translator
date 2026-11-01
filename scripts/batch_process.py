@@ -13,18 +13,55 @@ def stop_tree(process):
     process.wait(timeout=10)
 
 
+class LogActivity:
+    """Read only newly appended bytes; heartbeat-only output cannot reset the stall clock."""
+    def __init__(self, path, forward_timing=False):
+        self.forward_timing = forward_timing
+        self.path = Path(path)
+        self.offset = 0
+        self.pending = b''
+        self.activity = 0
+
+    def size(self):
+        try:
+            with self.path.open('rb') as stream:
+                if self.path.stat().st_size < self.offset:
+                    self.offset = 0
+                    self.pending = b''
+                stream.seek(self.offset)
+                data = stream.read()
+                self.offset = stream.tell()
+        except OSError:
+            return self.activity
+        lines = (self.pending + data).split(b'\n')
+        self.pending = lines.pop()
+        for line in lines:
+            if self.forward_timing and line.startswith((b'[TIME]', b'[TIME LIVE]', b'[TIME SUMMARY]', b'[TIME STAGE]', b'[TRACE]', b'[TRACE WARNING]')):
+                try: print(line.decode('utf-8', errors='replace').rstrip('\r'), flush=True)
+                except (OSError, ValueError): pass
+            if line.strip() and not line.startswith(b'[TIME LIVE]'):
+                self.activity += len(line) + 1
+        # Most output flushes complete lines; cap pathological partial lines without keeping unbounded RAM.
+        if len(self.pending) > 65536:
+            if not self.pending.startswith(b'[TIME LIVE]'):self.activity += len(self.pending)
+            self.pending = b''
+        return self.activity
+
+
 def run_batch_process(command, cwd, env, log_path, tick=None, stall_seconds=600):
     path = Path(log_path); path.parent.mkdir(parents=True, exist_ok=True)
     with path.open('wb') as output:
         process = subprocess.Popen(command, cwd=cwd, env=env, stdout=output, stderr=subprocess.STDOUT)
+        activity = LogActivity(path, forward_timing=True)
         previous = -1; last_activity = time.monotonic()
         try:
             while True:
                 try:
                     code = process.wait(timeout=5)
+                    activity.size()
                     break
                 except subprocess.TimeoutExpired:
-                    size = path.stat().st_size
+                    size = activity.size()
                     if size != previous:
                         previous = size; last_activity = time.monotonic()
                     if tick: tick()
@@ -68,7 +105,8 @@ WARM_RUNNER = Path(__file__).resolve().parent / 'warm_runner.py'
 # Differ per chapter by design; everything else in the environment is part of the child's identity.
 PER_JOB_ENV = ('PIPELINE_JOB_ID', 'TRANSLATION_MANGA_ID', 'TRANSLATION_CHAPTER_ID', 'TRANSLATION_CHAPTER_NUMBER',
                'TRANSLATION_MANGA_SLUG', 'TRANSLATION_RAW_PREFIX', 'TRANSLATION_OUTPUT_PREFIX',
-               'OPENAI_USAGE_OPERATION', 'TRANSLATION_SOURCE_FILE')
+               'OPENAI_USAGE_OPERATION', 'TRANSLATION_SOURCE_FILE',
+               'PIPELINE_TRACE_PARENT_RUN', 'PIPELINE_TRACE_PARENT_SPAN')
 
 
 def env_fingerprint(env, dotenv_path=None):
@@ -207,6 +245,7 @@ class WarmRunner:
 
     # -- one job ---------------------------------------------------------------------------------------------
     def run(self, command, cwd, env, log_path, tick=None, stall_seconds=600, fingerprint=None):
+        activity = LogActivity(log_path, forward_timing=True)
         path = Path(log_path)
         path.parent.mkdir(parents=True, exist_ok=True)
         fingerprint = fingerprint if fingerprint is not None else env_fingerprint(env)
@@ -224,7 +263,7 @@ class WarmRunner:
                     event = events.get(timeout=self.poll)
                 except queue.Empty:
                     try:
-                        size = path.stat().st_size
+                        size = activity.size()
                     except OSError:
                         size = 0
                     if size != previous:
@@ -250,6 +289,7 @@ class WarmRunner:
                     self._release(process)
                     raise subprocess.CalledProcessError(code or -1, command, output=_tail(path))
                 if event.get('event') == 'done':
+                    activity.size()
                     break
         except subprocess.CalledProcessError:
             raise

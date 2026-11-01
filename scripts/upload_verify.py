@@ -10,6 +10,8 @@ No package-relative imports: worker.py imports this as a top-level module, local
 
 from __future__ import annotations
 
+from modules.utils import stage_trace as trace
+
 import os
 import urllib.error
 import urllib.request
@@ -56,6 +58,7 @@ def stale_objects(expected: dict[str, int], listed: dict[str, int]) -> list[str]
     return sorted(k for k in listed if k not in expected and Path(k).suffix.lower() in IMAGE_EXTS)
 
 
+@trace.traced("storage.verify_and_repair")
 def verify_and_repair(upload_dir: Path, prefix: str, list_objects: Callable[[str], dict[str, int]],
                       upload_file: Callable[[Path, str], object], retries: int = 1, log=print) -> list[str]:
     """Returns the keys still missing after `retries` re-upload rounds ([] = upload verified)."""
@@ -78,6 +81,7 @@ def verify_and_repair(upload_dir: Path, prefix: str, list_objects: Callable[[str
     return missing
 
 
+@trace.traced("publication.head", console=False)
 def head_url(url: str, timeout: float = 10.0) -> tuple[int, str, int | None]:
     """(status, content-type, content-length); status 0 = network error/timeout."""
     request = urllib.request.Request(url, method="HEAD", headers={"User-Agent": USER_AGENT})
@@ -104,6 +108,7 @@ def classify(status: int, content_type: str, length: int | None) -> str | None:
     return None
 
 
+@trace.traced("publication.check_urls")
 def check_urls(urls: list[str], head=head_url, concurrency: int = 8) -> list[dict]:
     """HEAD every URL (one retry for inconclusive results); returns only the problem pages."""
     def check(url: str) -> dict:
@@ -115,5 +120,5 @@ def check_urls(urls: list[str], head=head_url, concurrency: int = 8) -> list[dic
         return {"url": url, "status": status, "reason": reason}
 
     with ThreadPoolExecutor(max_workers=max(1, concurrency)) as pool:
-        results = list(pool.map(check, urls))
+        results = list(trace.map_in_context(pool, check, urls))
     return [r for r in results if r["reason"]]

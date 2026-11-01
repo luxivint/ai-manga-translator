@@ -30,3 +30,6 @@ send2trash>=2.1.0
 --extra-index-url https://download.pytorch.org/whl/cpu
 torch>=2.2.0
 ultralytics>=8.3.0
+
+# Lightweight per-job resource samples.
+psutil>=5.9.8

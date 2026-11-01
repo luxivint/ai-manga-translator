@@ -28,6 +28,9 @@ import traceback
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+from modules.utils import stage_trace as trace
 SCRIPTS = ROOT / "scripts"
 
 _MODULES: dict[str, object] = {}
@@ -83,6 +86,10 @@ class Redirect:
         os.dup2(self.fd, 1)
         os.dup2(self.fd, 2)
         _std_handles(self.fd)
+        # Job files have the same UTF-8 encoding on Windows and Linux.
+        for stream in (sys.stdout, sys.stderr):
+            if hasattr(stream, "reconfigure"):
+                stream.reconfigure(encoding="utf-8", errors="replace")
         return self
 
     def __exit__(self, *exc):
@@ -139,22 +146,26 @@ def run_job(req: dict, idle_out: int, idle_err: int) -> int:
     os.chdir(req["cwd"])
     sys.argv = [str(script), *req["args"]]
     with Redirect(req["log"], idle_out, idle_err):
-        try:
-            module = load_script(script)
-            if hasattr(module, "reset_job_state"):
-                module.reset_job_state()
-            code = module.main()
-        except SystemExit as exc:
-            if exc.code is None:
-                code = 0
-            elif isinstance(exc.code, int):
-                code = exc.code
-            else:
-                print(exc.code, file=sys.stderr)
+        with trace.job("pipeline.runner"):
+            try:
+                with trace.span("startup.module_imports"):
+                    module = load_script(script)
+                if hasattr(module, "reset_job_state"):
+                    with trace.span("startup.reset"):
+                        module.reset_job_state()
+                code = module.main()
+            except SystemExit as exc:
+                if exc.code is None:
+                    code = 0
+                elif isinstance(exc.code, int):
+                    code = exc.code
+                else:
+                    print(exc.code, file=sys.stderr)
+                    code = 1
+            except BaseException:
+                traceback.print_exc()
                 code = 1
-        except BaseException:
-            traceback.print_exc()
-            code = 1
+            trace.set_exit_code(code)
         _flush_std()
     return int(code or 0)
 

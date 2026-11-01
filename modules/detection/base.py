@@ -1,3 +1,5 @@
+
+from modules.utils import stage_trace as trace
 from abc import ABC, abstractmethod
 import numpy as np
 from typing import Optional
@@ -41,6 +43,7 @@ class DetectionEngine(ABC):
         """
         pass
         
+    @trace.traced("detection.build_blocks")
     def create_text_blocks(
         self, 
         image: np.ndarray, 
@@ -77,8 +80,10 @@ class DetectionEngine(ABC):
         font_attrs_per_box: list[dict] = [{}] * len(text_boxes)
         if crops:
             try:
-                font_engine = FontEngineFactory.create_engine(self.settings)
-                batch_results = font_engine.process_batch(crops)
+                with trace.span("font.ensure"):
+                    font_engine = FontEngineFactory.create_engine(self.settings)
+                with trace.span("font.infer"):
+                    batch_results = font_engine.process_batch(crops)
                 for crop_pos, txt_idx in enumerate(crop_indices):
                     font_attrs_per_box[txt_idx] = batch_results[crop_pos]
             except Exception as e:

@@ -1,6 +1,8 @@
 """Remote comic region detection; deliberately never falls back to local inference."""
 from __future__ import annotations
 
+from modules.utils import stage_trace as trace
+
 import base64
 from concurrent.futures import ThreadPoolExecutor
 import hashlib
@@ -105,6 +107,7 @@ class APIDetection(DetectionEngine):
         # This may still run the separate font model; RT-DETR is never loaded here.
         return self.create_text_blocks(image, texts, bubbles)
 
+    @trace.traced("detection.scan")
     def _detect_single_image(self, image):
         if image.ndim != 3 or image.shape[2] != 3 or image.dtype != np.uint8:
             raise ValueError('Detection API expects a uint8 RGB image')
@@ -132,7 +135,7 @@ class APIDetection(DetectionEngine):
         if len(starts)>1 and self.concurrency>1:
             # Submit only coordinates; image views/encoding are made in running workers.
             with ThreadPoolExecutor(max_workers=min(self.concurrency,len(starts))) as pool:
-                consume(pool.map(request,starts))
+                consume(trace.map_in_context(pool,request,starts))
         else:
             consume(map(request,starts))
         return deduplicate(bubbles),deduplicate(texts)
@@ -204,6 +207,7 @@ class APIDetection(DetectionEngine):
         except (ValueError,TypeError,KeyError,IndexError,AttributeError) as exc:
             raise DetectionAPIError('Invalid detection response: '+str(exc)) from None
 
+    @trace.traced("detection.tile")
     def _request_tile(self, image):
         pil=Image.fromarray(image);original=pil.size
         pil.thumbnail((self.config['max_side'],self.config['max_side']),Image.Resampling.LANCZOS)

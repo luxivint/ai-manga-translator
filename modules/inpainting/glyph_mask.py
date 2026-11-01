@@ -4,6 +4,9 @@ import cv2
 import numpy as np
 
 
+from modules.utils import stage_trace as trace
+
+@trace.traced("mask.refine_free_text")
 def refine_free_text(image, mask, blocks):
     result = mask.copy(); changed = 0
     for block in blocks or []:

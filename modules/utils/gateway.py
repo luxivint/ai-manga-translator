@@ -14,6 +14,8 @@ HTTP 4xx (except 429) is not transient: the response is returned for the caller 
 """
 from __future__ import annotations
 
+from modules.utils import stage_trace as trace
+
 import json
 import re
 from pathlib import Path
@@ -122,6 +124,7 @@ class CircuitBreaker:
         with self._lock:
             return self._clock() < self._open_until
 
+    @trace.traced("api.breaker_wait", console=False)
     def wait_if_open(self) -> float:
         waited = 0.0
         while True:
@@ -193,10 +196,11 @@ class AdaptiveLimiter:
 
     @contextlib.contextmanager
     def slot(self):
-        with self._cond:
-            while self._active >= self.allowed():
-                self._cond.wait(timeout=self._poll)
-            self._active += 1
+        with trace.span("api.capacity_wait"):
+            with self._cond:
+                while self._active >= self.allowed():
+                    self._cond.wait(timeout=self._poll)
+                self._active += 1
         try:
             yield
         finally:
@@ -278,6 +282,7 @@ def cache_discard() -> None:
             gateway_cache.drop(key)
 
 
+@trace.traced("api.call", fields=("kind",))
 def resilient_post(url: str, *, headers: dict, data, timeout: float, kind: str = "api",
                    limiter: AdaptiveLimiter | None = None, breaker: CircuitBreaker | None = None,
                    backoffs: tuple[float, ...] | None = None, post=None, sleep=None, rand=None,
@@ -331,7 +336,9 @@ def _resilient_post(url: str, *, headers: dict, data, timeout: float, kind: str 
         resp = None
         try:
             with (limiter.slot() if limiter is not None else contextlib.nullcontext()):
-                resp = post(url, headers=headers, data=data, timeout=timeout)
+                with trace.span("api.http", kind=kind, attempt=attempt) as request_span:
+                    resp = post(url, headers=headers, data=data, timeout=timeout)
+                    request_span.meta["http_status"] = resp.status_code
         except (requests.Timeout, requests.ConnectionError) as exc:
             problem = f"{type(exc).__name__}: {_short(str(exc), 400)}"
         else:
@@ -356,5 +363,6 @@ def _resilient_post(url: str, *, headers: dict, data, timeout: float, kind: str 
         print(f"  [gateway] {kind} attempt {attempt}/{attempts} failed: {problem}; "
               f"retry in {delay:.1f}s", flush=True)
         if not breaker.is_open():  # an open breaker already imposes its (longer) cool-down on the next try
-            sleep(delay)
+            with trace.span("api.retry_wait", kind=kind, attempt=attempt):
+                sleep(delay)
     raise GatewayError(f"{kind} failed after {attempts} attempts: {last}")

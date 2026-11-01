@@ -4,6 +4,8 @@
 the whole banner, not just the glyphs, so CV2 fills a clean area instead of smudging half a logo."""
 from __future__ import annotations
 
+from modules.utils import stage_trace as trace
+
 import os
 import re
 import warnings
@@ -117,6 +119,7 @@ def region_mask(image: np.ndarray, box, pad: int | None = None, tol: float | Non
     return mask
 
 
+@trace.traced("clean.watermark_flat_fill")
 def flat_fill(original: np.ndarray, cleaned: np.ndarray, wm_mask: np.ndarray, max_dev: float = 24.0,
               min_frac: float | None = None) -> np.ndarray:
     """Where the erased area is surrounded by an (almost) flat colour (e.g. a black banner page) paint it with that
@@ -200,6 +203,7 @@ def _drop_edge_runs(m: np.ndarray) -> np.ndarray:
     return m
 
 
+@trace.traced("watermark.template_build")
 def _build_model(pages: list, grays: list, pi: int, box: tuple, thr: float, min_hits: int) -> dict | None:
     """Template = the plate crop `box` of page `pi`; matched on every page; footprint = what stays the same across the
     occurrences (logo, tag, arrow) inside a window around the template."""
@@ -281,6 +285,7 @@ def edge_candidate(box: tuple, W: int, edge: int = 60) -> bool:
     return 60 <= bw <= 0.6 * W and 14 <= bh <= 90 and (x1 <= edge or x2 >= W - edge)
 
 
+@trace.traced("watermark.learn")
 def learn_plates(pages: list, candidates=None) -> list:
     """pages = [(image RGB, blocks)]. Seeds = boxes OCR read as a watermark, plus OCR-free candidates
     `candidates(image) -> [box]` (text-like strips at the page edge, WATERMARK_PLATE_MINE) that must then really repeat
@@ -349,6 +354,7 @@ def _to_page_edge(one: np.ndarray, reach: int) -> None:
         one[rows, x1:] = 255
 
 
+@trace.traced("watermark.template_match")
 def plate_mask(image: np.ndarray, models: list | None = None) -> np.ndarray:
     """Full-page uint8 mask (255) of every known chapter plate on this page (learned footprint, else the padded match
     united with the plate hull)."""

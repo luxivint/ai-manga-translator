@@ -72,6 +72,8 @@ from modules.utils.language_utils import get_language_code, get_layout_direction
 from modules.utils.textblock import sort_blk_list
 from modules.utils.translator_utils import MODEL_MAP, format_translations
 from modules.utils import gateway
+from modules.utils import stage_trace as trace
+
 from modules.utils import watermark as watermark_lib
 from modules.utils.gateway import AdaptiveLimiter, GatewayError, OCRFailedError
 from modules.utils.openai_endpoint import get_openai_chat_completions_url, get_openai_model
@@ -134,6 +136,7 @@ def image_quality() -> int:
         return 95
 
 
+@trace.traced("render.encode_image")
 def save_image_for_format(image: Image.Image, out_path: Path) -> None:
     suffix = out_path.suffix.lower()
     if suffix == ".webp":
@@ -191,6 +194,7 @@ def find_stamp_position(base_rgb: np.ndarray, stamp_w: int, stamp_h: int, full_w
     return best[1], best[2]
 
 
+@trace.traced("render.stamp", page_arg="source_path")
 def apply_page_stamp(out_path: Path, source_path: Path, args: argparse.Namespace, fallback_page: int = 1) -> bool:
     global _STAMP_WARNING_PRINTED
     page_number = page_number_from_path(source_path, fallback_page)
@@ -340,6 +344,7 @@ _MODEL_LOCK = threading.Lock()
 _SEG_GPU_SEM = threading.Semaphore(max(1, int(os.environ.get("SEG_GPU_CONCURRENCY", "1"))))
 
 
+@trace.traced("model.segmenter.ensure")
 def _get_segmenter():
     """ogkalu comic-text-segmenter (YOLOv8) — pixel-level metin maskesi. Thread-safe lazy init.
 
@@ -429,6 +434,7 @@ def _seg_predict(segmenter, crop, **kw):
         return _SEGMENTER_CPU.predict(crop, device="cpu", **kw)
 
 
+@trace.traced("mask.glyphs")
 def _tight_glyph_mask(image: np.ndarray, seg: np.ndarray, close_k: int, dilate_k: int, fine: np.ndarray | None = None, text_boxes: np.ndarray | None = None) -> np.ndarray:
     """Glyph-hugging mask: inside each YOLO text component keep only pixels whose
     Lab colour differs from the surrounding background (median of an outer ring),
@@ -589,6 +595,7 @@ def _legacy_otsu_mask(image, seg, close_k, dilate_k):
     return mask
 
 
+@trace.traced("mask.segmenter.inference")
 def _tiled_segment(segmenter, image: np.ndarray, conf: float) -> tuple[np.ndarray, np.ndarray]:
     """Run the text segmenter on overlapping tiles at native resolution (a tall
     800x5000 page downscaled to imgsz=1024 loses end letters) and union the masks.
@@ -649,6 +656,7 @@ def watermark_rule(blk, page_w: int, page_h: int) -> str | None:
     return watermark_match(blk)
 
 
+@trace.traced("watermark.candidate_scan")
 def plate_candidates(image: np.ndarray) -> list:
     """OCR-free scan-group tag candidates for watermark.learn_plates: text-like segmenter components (low confidence,
     the tags are small / translucent); the learner keeps only those that repeat over the chapter at the page edge."""
@@ -660,6 +668,7 @@ def plate_candidates(image: np.ndarray) -> list:
 _PLATE_MEMO = threading.local()
 
 
+@trace.traced("watermark.page_mask")
 def chapter_plate_mask(image: np.ndarray) -> np.ndarray:
     """Known scan-group plates of this chapter found on the page (modules/utils/watermark.learn_plates), memoised per
     page object (asked by the mask, the flat fill and the post passes)."""
@@ -691,6 +700,7 @@ def watermark_clear_mask(image: np.ndarray, blocks) -> np.ndarray:
     return out
 
 
+@trace.traced("mask.prepare_core")
 def build_segmenter_mask(image: np.ndarray, blocks=None, require_translation: bool = False) -> np.ndarray:
     """Pixel-perfect metin maskesi: YOLOv8 segmentasyonu + balon-içi Otsu (izole
     işaretleri toplar, balon kenarına değmez) + closing/dilation.
@@ -830,6 +840,7 @@ def build_segmenter_mask(image: np.ndarray, blocks=None, require_translation: bo
 _build_segmenter_mask_impl = build_segmenter_mask
 
 
+@trace.traced("mask.prepare")
 def build_segmenter_mask(image: np.ndarray, blocks=None, require_translation: bool = False) -> np.ndarray:
     mask = _build_segmenter_mask_impl(image, blocks, require_translation)
     if parse_bool(os.environ.get("CLEAN_CV2_REFINE_MASK", "true")):
@@ -845,6 +856,7 @@ def build_segmenter_mask(image: np.ndarray, blocks=None, require_translation: bo
     return mask
 
 
+@trace.traced("clean.cv2_fill")
 def clean_selected(image: np.ndarray, mask: np.ndarray, config=None) -> np.ndarray:
     """CV2-only fill. No neural inpainter, retries or post-clean scans."""
     from modules.inpainting.opencv_clean import clean
@@ -964,6 +976,7 @@ def clean_white_bubble_ghosts(image: np.ndarray, blocks, args: argparse.Namespac
     return result
 
 
+@trace.traced("ocr.recover_empty")
 def recover_empty_bubble_text_with_gpt(image: np.ndarray, blocks, args: argparse.Namespace) -> None:
     if os.environ.get("GPT_OCR_EMPTY_BUBBLES", "false").lower() != "true":
         return
@@ -1040,6 +1053,7 @@ def recover_empty_bubble_text_with_gpt(image: np.ndarray, blocks, args: argparse
             block.text = value
 
 
+@trace.traced("clean.restore_untranslated")
 def restore_untranslated_regions(original: np.ndarray, cleaned: np.ndarray, blocks) -> np.ndarray:
     if os.environ.get("RESTORE_UNTRANSLATED_REGIONS", "true").lower() != "true":
         return cleaned
@@ -1768,6 +1782,7 @@ def clear_light_bubble_text_render_regions(image: np.ndarray, blocks, original: 
     return restore_protected_pixels(source, result, outline_protect)
 
 
+@trace.traced("render.layout")
 def build_text_items_state(blocks, image: np.ndarray, cleaned: np.ndarray, args: argparse.Namespace, main: LocalMain):
     """Shared render stage: layout translated blocks. Returns (cleaned, text_items_state).
 
@@ -1854,6 +1869,7 @@ def build_text_items_state(blocks, image: np.ndarray, cleaned: np.ndarray, args:
     return cleaned, text_items_state
 
 
+@trace.traced("ocr.split_recovery")
 def split_merged_blocks_ocr(image: np.ndarray, blocks, ocr):
     """OCR blocks that merged several separate texts (board menu + titles + username) -> one block per text group."""
     from modules.utils.merged_blocks import split_merged_ocr_blocks
@@ -1864,12 +1880,13 @@ def split_merged_blocks_ocr(image: np.ndarray, blocks, ocr):
         skip=lambda b: bool(watermark_rule(b, w, h)) or bool(_AD_URL_RE.search(getattr(b, "text", "") or "")))
 
 
+@trace.traced("page.legacy", page_arg="path")
 def process_image(path: Path, output_dir: Path, args: argparse.Namespace) -> Path:
     settings = LocalSettings(args)
     main = LocalMain(settings, args.source_lang, args.target_lang)
     device = "cuda" if args.gpu else "cpu"
 
-    image = imk.read_image(str(path))
+    image = trace.call("image.decode", imk.read_image, str(path))
     print(f"[1/6] detect: {path.name}", flush=True)
     blocks = detect_page_blocks(path,image,settings,args)
     if not blocks:
@@ -1953,6 +1970,7 @@ def crop_has_ad_evidence(blocks, y1: int, y2: int, page_w: int, page_h: int) -> 
 
 
 
+@trace.traced("detection.regions", page_arg="path")
 def detect_page_blocks(path,image,settings,args,*,source=None,crop_box=None):
     """Reuse only exact matching first-pass geometry, then construct normal TextBlocks."""
     detector=TextBlockDetector(settings)
@@ -1969,13 +1987,14 @@ def detect_page_blocks(path,image,settings,args,*,source=None,crop_box=None):
     return detector.detect(image)
 
 
+@trace.traced("page.detect_ocr", task_page=True)
 def _stage_detect_ocr(task: tuple) -> tuple:
     gateway.raise_if_quota()
     """Phase-1 worker: detect + OCR for one page (thread-safe, fresh instances per call)."""
     idx, path, args, crop = task
     settings = LocalSettings(args)
     main = LocalMain(settings, args.source_lang, args.target_lang)
-    image = imk.read_image(str(path))
+    image = trace.call("image.decode", imk.read_image, str(path))
     source_image = image
     def _detect_ocr(img,crop_box=None):
         found = detect_page_blocks(path,img,settings,args,source=source_image,crop_box=crop_box)
@@ -2077,6 +2096,7 @@ def edge_page_indices(n: int) -> list[int]:
     return sorted(set(range(min(head, n))) | set(range(max(0, n - tail), n)))
 
 
+@trace.traced("ads.banner_scan")
 def detect_banner_strips(pending: list, vision_ad_pages: set) -> dict:
     """OCR-free promo banner strips on the edge pages -> {page index: (rows from top, rows from bottom)}.
     A page right before/after a fully-ad page also gets the thin (non-strict) strip that ad page leaves behind."""
@@ -2102,6 +2122,7 @@ def detect_banner_strips(pending: list, vision_ad_pages: set) -> dict:
     return found
 
 
+@trace.traced("ads.vision")
 def detect_ad_regions(pending: list, args: argparse.Namespace) -> dict:
     """İlk N + son N sayfayı GPT-Vision'a sorarak reklam BÖLGELERİNİ bul.
     Detection/OCR'dan bağımsız (görsel reklamları da yakalar). Her sayfa için
@@ -2187,6 +2208,7 @@ def detect_ad_regions(pending: list, args: argparse.Namespace) -> dict:
     return regions
 
 
+@trace.traced("translation.batch")
 def _batch_translate_all(page_results: list, args: argparse.Namespace) -> None:
     """Phase-2: translate all pages together in as few GPT requests as possible.
 
@@ -2230,6 +2252,7 @@ def _batch_translate_all(page_results: list, args: argparse.Namespace) -> None:
         batches = [keys[i : i + batch_size] for i in range(0, len(keys), batch_size)]
     results: dict[str, tuple[str, str]] = {}
 
+    @trace.traced("translation.request")
     def _call_batch_translate(batch_dict: dict[str, str], extra: str = "") -> dict[str, tuple[str, str]]:
         """One GPT call for a batch -> {key: (text, style)}. Raises on API/JSON failure."""
         images, hint = None, extra
@@ -2280,7 +2303,7 @@ def _batch_translate_all(page_results: list, args: argparse.Namespace) -> None:
                       f"tüm batch tekrar istenecek", flush=True)
             if attempt < max_attempts:
                 print(f"  batch {bi+1}: {retry_delay:.0f}sn sonra tekrar denenecek", flush=True)
-                time.sleep(retry_delay)
+                trace.call("translation.retry_wait", time.sleep, retry_delay)
         got.update(best)
         return got
 
@@ -2302,7 +2325,7 @@ def _batch_translate_all(page_results: list, args: argparse.Namespace) -> None:
         saved_max_tokens = engine.max_tokens  # translate_keyed temporarily raises it; undo any drift
         try:
             with ThreadPoolExecutor(max_workers=concurrency) as tpool:
-                for part in tpool.map(_translate_gated, list(enumerate(batches))):
+                for part in trace.map_in_context(tpool, _translate_gated, list(enumerate(batches))):
                     results.update(part)
         finally:
             engine.max_tokens = saved_max_tokens
@@ -2370,6 +2393,7 @@ def _dump_clean_debug(path: Path, image: np.ndarray, mask: np.ndarray) -> None:
 
 
 
+@trace.traced("page.clean", task_page=True)
 def _stage_clean(task: tuple) -> tuple:
     """Phase-3a: initial mask, selected fill backend, optional postprocessing."""
     idx, path, image, blocks, args = task
@@ -2393,6 +2417,7 @@ def _stage_clean(task: tuple) -> tuple:
     return idx, path, image, blocks, cleaned
 
 
+@trace.traced("page.render_save", page_arg="path")
 def _do_render_and_save(
     idx: int,
     n_total: int,
@@ -2420,10 +2445,11 @@ def _do_render_and_save(
         return out_path
 
     cleaned, text_items_state = build_text_items_state(blocks, image, cleaned, args, main)
-    debug_dump_items(path.name, text_items_state)
+    with trace.span("render.draw"):
+        debug_dump_items(path.name, text_items_state)
 
-    renderer = ImageSaveRenderer(cleaned)
-    renderer.add_state_to_image({"text_items_state": text_items_state})
+        renderer = ImageSaveRenderer(cleaned)
+        renderer.add_state_to_image({"text_items_state": text_items_state})
     output_dir.mkdir(parents=True, exist_ok=True)
     print(f"  [{idx+1}/{n_total}] save: {out_path.name}", flush=True)
     saved_paths = save_rendered_output(renderer, out_path)
@@ -2437,6 +2463,7 @@ def _already_done(path: Path, output_dir: Path, args: argparse.Namespace) -> boo
     return (output_dir / f"{path.stem}{args.suffix}{output_ext}").exists()
 
 
+@trace.traced("render.passthrough", page_arg="path")
 def _save_passthrough(path: Path, output_dir: Path, args: argparse.Namespace) -> Path:
     """Copy source image to output without processing (error fallback)."""
     output_ext = path.suffix if args.output_format == "source" else f".{args.output_format.lstrip('.')}"
@@ -2477,6 +2504,7 @@ def _dynamic_workers(base: int) -> int:
         return base
 
 
+@trace.traced("translation.quality")
 def _rate_translation_quality(page_results: list, args: argparse.Namespace) -> float:
     """
     Sample up to QUALITY_SCORE_SAMPLE block pairs, send to GPT for 1-5 rating.
@@ -2572,6 +2600,7 @@ def enforce_page_failures(what: str, names: list, total: int) -> None:
           f"(within OCR_MAX_FAIL_RATIO={limit}); raw pages will be kept", flush=True)
 
 
+@trace.traced("ocr.page_retries")
 def rerun_failed_ocr(phase1: list, tasks: list, run=None, cooldown: float | None = None, sleep=None) -> tuple[list, list]:
     """After phase 1: wait for the gateway to calm down, then re-run the OCR-failed pages ONE AT A TIME.
     Returns (updated phase1, names of pages that are still failed)."""
@@ -2631,6 +2660,7 @@ def unresolved_translation_pages(page_results: list, source_lang: str) -> list[s
     return names
 
 
+@trace.traced("batch.run")
 def process_all_batched(images: list[Path], output_dir: Path, args: argparse.Namespace) -> int:
     """
     3-phase batch pipeline:
@@ -2662,24 +2692,25 @@ def process_all_batched(images: list[Path], output_dir: Path, args: argparse.Nam
 
 
     # ── Model warm-up: thread'ler başlamadan önce modeli main thread'de indir ──
-    print("[BATCH] Model warm-up...", flush=True)
-    try:
-        _warmup_settings = LocalSettings(args)
-        from modules.detection.factory import DetectionEngineFactory
-        _warm_engine=DetectionEngineFactory.create_engine(_warmup_settings,args.detector)
-        if not getattr(_warm_engine,'reuse_identity',None):
-            TextBlockDetector(_warmup_settings).detect(imk.read_image(str(pending[0])))
-        else:
-            print('[BATCH] API detector ready; skipping remote warm-up request',flush=True)
-        for _eng in DetectionEngineFactory._engines.values():
-            if getattr(_eng,'reuse_identity',None):
-                print('[BATCH] detector device: remote API',flush=True)
-                continue
-            _prov = getattr(getattr(_eng, "session", None), "get_providers", lambda: ["?"])()
-            print(f"[BATCH] detector device: {'cuda' if _prov[0] == 'CUDAExecutionProvider' else 'cpu'} ({_prov[0]})", flush=True)
-        print("[BATCH] Model hazır.", flush=True)
-    except Exception as _warmup_exc:
-        print(f"[BATCH] Warm-up uyarı: {_warmup_exc}", flush=True)
+    with trace.span("startup.warmup"):
+        print("[BATCH] Model warm-up...", flush=True)
+        try:
+            _warmup_settings = LocalSettings(args)
+            from modules.detection.factory import DetectionEngineFactory
+            _warm_engine=DetectionEngineFactory.create_engine(_warmup_settings,args.detector)
+            if not getattr(_warm_engine,'reuse_identity',None):
+                TextBlockDetector(_warmup_settings).detect(trace.call("image.decode", imk.read_image, str(pending[0])))
+            else:
+                print('[BATCH] API detector ready; skipping remote warm-up request',flush=True)
+            for _eng in DetectionEngineFactory._engines.values():
+                if getattr(_eng,'reuse_identity',None):
+                    print('[BATCH] detector device: remote API',flush=True)
+                    continue
+                _prov = getattr(getattr(_eng, "session", None), "get_providers", lambda: ["?"])()
+                print(f"[BATCH] detector device: {'cuda' if _prov[0] == 'CUDAExecutionProvider' else 'cpu'} ({_prov[0]})", flush=True)
+            print("[BATCH] Model hazır.", flush=True)
+        except Exception as _warmup_exc:
+            print(f"[BATCH] Warm-up uyarı: {_warmup_exc}", flush=True)
 
     # ── GPT-Vision: ilk/son N sayfada reklam bölgelerini bul (üst%/alt%) ─────
     gateway.raise_if_quota()
@@ -2698,7 +2729,7 @@ def process_all_batched(images: list[Path], output_dir: Path, args: argparse.Nam
                      (*ad_regions.get(i, (0, 0)), *banner_strips[i]) if i in banner_strips else ad_regions.get(i))
                     for i, p in enumerate(pending)]
     with ThreadPoolExecutor(max_workers=w1) as pool:
-        phase1 = list(pool.map(_stage_detect_ocr, phase1_tasks))
+        phase1 = list(trace.map_in_context(pool, _stage_detect_ocr, phase1_tasks))
     gateway.raise_if_quota()
     phase1, ocr_failed_pages = rerun_failed_ocr(phase1, phase1_tasks)
     # Fail BEFORE spending translate/clean time on a result that must not be published.
@@ -2747,7 +2778,7 @@ def process_all_batched(images: list[Path], output_dir: Path, args: argparse.Nam
     print(f"\n[BATCH] Faz 3/3  clean+render+save  {w3} worker", flush=True)
     t3 = time.perf_counter()
     with ThreadPoolExecutor(max_workers=w3) as pool:
-        clean_results = list(pool.map(
+        clean_results = list(trace.map_in_context(pool,
             _stage_clean_safe,
             [(i, p, img, bl, args) for i, (p, img, bl) in enumerate(page_results)],
         ))
@@ -2795,6 +2826,7 @@ def process_all_batched(images: list[Path], output_dir: Path, args: argparse.Nam
     return failed
 
 
+@trace.traced("render.verify")
 def verify_output_dims(saved_paths: list, image: np.ndarray) -> None:
     """Çıktı boyutu (parçalar toplamı) işlenen sayfa görseliyle birebir aynı olmalı;
     sessiz kırpılma/kesilme (ör. alt kısmın kaybolması) hata olarak yakalanır."""
@@ -2809,6 +2841,7 @@ def verify_output_dims(saved_paths: list, image: np.ndarray) -> None:
         raise ValueError(f"output size {width}x{total_h} != page size {exp_w}x{exp_h}")
 
 
+@trace.traced("render.write_array")
 def _write_array(path: Path, array: np.ndarray) -> None:
     """Write a page array; webp/jpg use IMAGE_QUALITY (imk.write_image would use Pillow's default 80)."""
     if path.suffix.lower() in {".webp", ".jpg", ".jpeg"}:
@@ -2817,6 +2850,7 @@ def _write_array(path: Path, array: np.ndarray) -> None:
         imk.write_image(str(path), array)
 
 
+@trace.traced("render.encode_save")
 def save_rendered_output(renderer: ImageSaveRenderer, out_path: Path) -> list[Path]:
     final_rgb = renderer.render_to_image()
     max_dimension = int(os.environ.get("WEBP_MAX_DIMENSION", "16000"))
@@ -2887,6 +2921,7 @@ def seo_upload_name(prefix: str, page_number: int, extension: str) -> str:
     )
 
 
+@trace.traced("storage.prepare_upload")
 def prepare_seo_upload_dir(output_dir: Path, out_prefix: str, work_dir: Path) -> Path:
     seo_dir = work_dir / "seo-upload"
     if seo_dir.exists():
@@ -2956,6 +2991,7 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
+@trace.traced_job("pipeline.job", exit_code=True)
 def main() -> int:
     args = parse_args()
     from runtime_config import configure_cleaner
@@ -2973,6 +3009,7 @@ def main() -> int:
         return run_batch(args, app, Path(work))
 
 
+@trace.traced("pipeline.run")
 def run_batch(args, app, recut_work: Path) -> int:
     args.recut_detection_context = None
     if gateway.quota_remaining():

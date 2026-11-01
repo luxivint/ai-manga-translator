@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+
 import atexit
 import os
 import re
@@ -19,10 +20,15 @@ import json
 from batch_process import run_batch_process, batch_progress, WarmRunner, env_fingerprint
 
 from r2_storage import R2Config, client, delete_prefix, load_env, normalize_key, public_url
+if str(Path(__file__).resolve().parents[1]) not in sys.path:
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import upload_verify
 
 
 ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+from modules.utils import stage_trace as trace
 IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".webp", ".bmp", ".tif", ".tiff"}
 WORKER_ID = os.environ.get("WORKER_INSTANCE_ID", "translator")
 DRAIN_FILE = os.environ.get("WORKER_DRAIN_FILE", "")
@@ -419,6 +425,7 @@ def single_chapter(conn, chapter_id: str):
         return row
 
 
+@trace.traced("publication.cleanup_raw")
 def cleanup_raw(conn, chapter_id: str):
     chapter = single_chapter(conn, chapter_id)
     prefix = prefix_from_key(chapter["raw_key"])
@@ -450,6 +457,7 @@ def seo_alt(manga_slug: str, number, page_index: int) -> str:
     )
 
 
+@trace.traced("publication.database")
 def record_translated_assets(conn, chapter: dict, output_prefix: str, raw_prefix: str, delete_raw: bool):
     images = list_images(output_prefix)
     if not images:
@@ -527,6 +535,7 @@ def record_translated_assets(conn, chapter: dict, output_prefix: str, raw_prefix
     invalidate_web_cache(chapter.get("manga_slug") or "")
 
 
+@trace.traced("publication.invalidate_cache")
 def invalidate_web_cache(manga_slug: str):
     url = (os.environ.get("WEB_INTERNAL_URL") or "").rstrip("/")
     key = os.environ.get("INTERNAL_API_KEY") or ""
@@ -560,6 +569,7 @@ def published_page_urls(conn, chapter_id: str) -> list[str]:
             for row in rows]
 
 
+@trace.traced("publication.verify")
 def verify_published_pages(conn, chapter: dict, check=upload_verify.check_urls):
     """HEAD every published page; definitive failures (404, HTML, empty file) raise PublishVerificationError.
     Network-only problems are logged, not failed: the daily link check re-tests them."""
@@ -613,9 +623,11 @@ def warm_runner() -> WarmRunner | None:
     return _WARM
 
 
+@trace.traced("worker.child_wait")
 def run_translation_command(command: list, env: dict, job_id: str, tick=None):
     """Run one chapter command (local_batch.py ...): in the warm child when WORKER_INPROCESS=true, else as its own
     subprocess. Both write the job log, call tick() every 5 s, stop on stall/cancel and raise CalledProcessError."""
+    trace.parent_env(env)
     log = ROOT / "work/job-logs" / f"{job_id}.log"
     stall = int(os.environ.get("TRANSLATION_STALL_SECONDS", "600"))
     warm = warm_runner()
@@ -624,6 +636,7 @@ def run_translation_command(command: list, env: dict, job_id: str, tick=None):
     return warm.run(command, ROOT, env, log, tick, stall_seconds=stall, fingerprint=env_fingerprint(env, ROOT / ".env"))
 
 
+@trace.traced("worker.translate_chapter")
 def translate_chapter(chapter: dict, delete_raw: bool, job_id: str, tick=None):
     raw_prefix = prefix_from_key(chapter["raw_key"])
     output_prefix = translated_prefix(raw_prefix)
@@ -704,6 +717,7 @@ def enqueue_chapter_jobs(conn, chapters: list, priority: int, payload: dict) -> 
     return created
 
 
+@trace.traced_job("worker.translation_job", job_arg="job")
 def process_translate_job(conn, job):
     # TRANSLATE_PROJECT â†’ chapter'larÄ± ayrÄ± job'lara bÃ¶l, worker'lar paralel alsÄ±n
     if job["job_type"] == "TRANSLATE_PROJECT":

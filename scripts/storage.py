@@ -21,3 +21,11 @@ else:
 
 __all__ = ["delete_keys", "delete_prefix", "download_prefix", "list_objects", "upload_directory", "upload_file",
            "normalize_key"]
+
+from modules.utils import stage_trace as trace
+download_prefix = trace.traced("storage.download")(download_prefix)
+upload_directory = trace.traced("storage.upload")(upload_directory)
+upload_file = trace.traced("storage.upload_file")(upload_file)
+list_objects = trace.traced("storage.list")(list_objects)
+delete_prefix = trace.traced("storage.delete_prefix")(delete_prefix)
+delete_keys = trace.traced("storage.delete_keys")(delete_keys)
