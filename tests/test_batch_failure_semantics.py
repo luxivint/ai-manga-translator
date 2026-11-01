@@ -156,7 +156,6 @@ class ProcessAllBatchedFailureTests(unittest.TestCase):
         patches = [
             mock.patch.object(lb, "LocalSettings", mock.MagicMock()),
             mock.patch.object(lb, "LocalMain", mock.MagicMock()),
-            mock.patch.object(lb, "_prewarm_cleaners", lambda: None),
             mock.patch.object(lb, "TextBlockDetector", mock.MagicMock()),
             mock.patch.object(lb.imk, "read_image", lambda p: None),
             mock.patch.object(lb, "detect_ad_regions", lambda pending, a: {}),

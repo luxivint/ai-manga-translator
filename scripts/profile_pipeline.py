@@ -45,14 +45,14 @@ def _wrap(mod, name: str, label: str | None = None):
 
 
 def install_spans(lb):
-    for n in ("build_segmenter_mask", "block_inpaint", "clean_postprocess", "restore_untranslated_regions",
+    for n in ("build_segmenter_mask", "clean_selected", "restore_untranslated_regions",
               "watermark_clear_mask", "_tiled_segment", "build_text_items_state", "_write_array",
               "fill_easy_light_text_regions", "clear_light_free_text_render_regions",
               "clear_light_bubble_text_render_regions", "clean_white_bubble_ghosts", "_tight_glyph_mask",
               "_seg_predict"):
         _wrap(lb, n)
-    from modules.inpainting import residual, fill_qa, outline, patch_match
-    for mod in (residual, fill_qa, outline, patch_match):
+    from modules.inpainting import opencv_clean, glyph_mask
+    for mod in (opencv_clean, glyph_mask):
         for n in dir(mod):
             if n.startswith("__"):
                 continue

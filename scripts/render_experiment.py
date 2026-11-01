@@ -46,7 +46,7 @@ def make_args():
 
 
 def acquire(args, only: str = "") -> None:
-    """OCR (9router grid OCR) + GPT translate + LaMa clean, cached."""
+    """OCR (9router grid OCR) + GPT translate + CV2 clean, cached."""
     RT.mkdir(exist_ok=True)
     CLEAN_DIR.mkdir(exist_ok=True)
     MASK_DIR.mkdir(exist_ok=True)
@@ -100,7 +100,7 @@ def acquire(args, only: str = "") -> None:
         if not cp.exists():
             config = lb.Config(hd_strategy="Resize", hd_strategy_resize_limit=2048)
             mask = lb.build_segmenter_mask(image, blocks)
-            cleaned = image.copy() if mask.sum() == 0 else lb.block_inpaint(image, mask, config)
+            cleaned = image.copy() if mask.sum() == 0 else lb.clean_selected(image, mask, config)
             cleaned = lb.restore_untranslated_regions(image, cleaned, blocks)
             imk.write_image(str(cp), cleaned)
             imk.write_image(str(MASK_DIR / (p.stem + ".png")), mask)

@@ -6,7 +6,7 @@ Inputs
     '--- DEBUG BLOCKS after-clean-translate ---' followed by one line per block)
 
 The local detector (RT-DETR, GPU) is re-run per page (cached), the dumped OCR text / translation is matched back to the
-detector blocks by box IoU, and the REAL clean (segmenter + LaMa) and render (render_v2 through
+detector blocks by box IoU, and the REAL clean (segmenter + CV2) and render (render_v2 through
 local_batch.build_text_items_state) code paths are executed. Nothing here touches 9router/OpenAI: every socket connect is
 blocked while the tool runs.
 
@@ -307,7 +307,7 @@ def replay_page(lb, args, main, path: Path, ents: list[dict], out_png: Path, hoo
     if mask.sum() == 0:
         cleaned = image.copy()
     else:
-        cleaned = lb.block_inpaint(image, mask, config)
+        cleaned = lb.clean_selected(image, mask, config)
         cleaned = watermark_lib.flat_fill(image, cleaned, lb.watermark_clear_mask(image, blocks))
     cleaned = lb.restore_untranslated_regions(image, cleaned, blocks)
     cleaned, state = lb.build_text_items_state(blocks, image, cleaned, args, main)
@@ -348,7 +348,7 @@ def _clean_page(lb, image, blocks):
     if mask.sum() == 0:
         cleaned = image.copy()
     else:
-        cleaned = lb.block_inpaint(image, mask, config)
+        cleaned = lb.clean_selected(image, mask, config)
         cleaned = watermark_lib.flat_fill(image, cleaned, lb.watermark_clear_mask(image, blocks))
     return lb.restore_untranslated_regions(image, cleaned, blocks)
 

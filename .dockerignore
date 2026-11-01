@@ -26,3 +26,10 @@ logs
 *.log
 *.zip
 FONT KLASÖR
+
+# Offline test and diagnostic tools are not runtime image inputs.
+tests
+scripts/*experiment*
+scripts/profile_*
+scripts/replay_*
+artifacts

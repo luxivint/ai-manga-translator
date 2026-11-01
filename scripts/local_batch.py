@@ -60,9 +60,7 @@ from app.ui.canvas.text.text_item_properties import TextItemProperties
 from app.ui.canvas.text_item import OutlineInfo, OutlineType
 from modules.detection.processor import TextBlockDetector
 from modules.inpainting.schema import Config
-from modules.inpainting import fill_qa, patch_match
 from modules.inpainting.mask import constrain_mask_to_allowed_regions
-from modules.inpainting.lama import LaMa
 from modules.utils import compute_device
 from modules.ocr.processor import OCRProcessor
 from modules.rendering.render import get_best_render_area, is_vertical_block, pyside_word_wrap
@@ -331,13 +329,12 @@ class LocalMain:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Temizleme reçetesi: YOLOv8 metin segmentasyonu + balon-içi Otsu + block-aware LaMa
+# Temizleme reçetesi: İlk metin maskesi + dar kontur maskesi + CV2 dolgu
 # ─────────────────────────────────────────────────────────────────────────────
 _SEGMENTER = None
 _SEGMENTER_CPU = None  # lazy CPU copy, only used after a CUDA OOM
 _SEG_DEVICE = "cpu"
 _SEG_HALF = False
-_LAMA = None
 _MODEL_LOCK = threading.Lock()
 # ultralytics predict() is NOT thread-safe on one model (concurrent calls corrupt masks) -> 1.
 _SEG_GPU_SEM = threading.Semaphore(max(1, int(os.environ.get("SEG_GPU_CONCURRENCY", "1"))))
@@ -371,60 +368,29 @@ def _get_segmenter():
     return _SEGMENTER
 
 
-def _get_lama():
-    global _LAMA
-    if _LAMA is None:
-        with _MODEL_LOCK:
-            if _LAMA is None:
-                # LAMA_DEVICE=auto|cuda|cpu (auto = ORT CUDA provider varsa cuda)
-                dev = compute_device.env_device("LAMA_DEVICE", compute_device.ort_cuda_available())
-                _LAMA = LaMa(device=dev, backend="onnx")
-                print(f"[clean] LaMa device: {getattr(_LAMA, 'session_device', 'cpu')}", flush=True)
-    return _LAMA
 
 
-def _prewarm_cleaners() -> None:
-    """GPU only: building the LaMa ORT session takes ~20 s, so load YOLO + LaMa in a
-    background thread while detect/OCR/translate run (CLEAN_PREWARM=false disables).
-    CPU-only setups are left untouched."""
-    if os.environ.get("CLEAN_PREWARM", "true").lower() != "true":
-        return
-    if not (compute_device.env_device("SEG_DEVICE", compute_device.torch_cuda_available()) == "cuda"
-            or compute_device.env_device("LAMA_DEVICE", compute_device.ort_cuda_available()) == "cuda"):
-        return
-
-    def _run():
-        try:
-            _get_segmenter()
-            _get_lama()
-        except Exception as exc:  # the real call will raise again with context
-            print(f"[clean] prewarm failed: {exc}", flush=True)
-
-    threading.Thread(target=_run, daemon=True, name="clean-prewarm").start()
 
 
 def loaded_models() -> list[str]:
-    """Names of the cleaning/detection models currently held in this process."""
+    """Only the initial mask segmenter and optional local detector can be held."""
     from modules.detection.factory import DetectionEngineFactory
-    held = [n for n, v in (("segmenter", _SEGMENTER), ("segmenter-cpu", _SEGMENTER_CPU), ("lama", _LAMA)) if v is not None]
+    held = [n for n,v in (("segmenter",_SEGMENTER),("segmenter-cpu",_SEGMENTER_CPU)) if v is not None]
     return held + [f"detector:{k}" for k in DetectionEngineFactory._engines]
 
 
 def unload_models() -> list[str]:
-    """Release LaMa sessions, both YOLO segmenters and the detector engines, then give torch's cached CUDA blocks
-    back (warm worker idle unload). The next job loads them again. Must not run while a job is running."""
-    global _SEGMENTER, _SEGMENTER_CPU, _LAMA
+    global _SEGMENTER, _SEGMENTER_CPU
+    import gc
     from modules.detection.factory import DetectionEngineFactory
-    from modules.inpainting.lama import release_gpu_memory
     with _MODEL_LOCK:
-        released = loaded_models()
-        lama, _LAMA = _LAMA, None
-        _SEGMENTER = _SEGMENTER_CPU = None
+        released=loaded_models()
+        _SEGMENTER=_SEGMENTER_CPU=None
         DetectionEngineFactory._engines.clear()
-        if lama is not None and hasattr(lama, "close"):
-            lama.close()
-        del lama
-    release_gpu_memory()
+    gc.collect()
+    torch_module=sys.modules.get("torch")
+    if torch_module is not None and torch_module.cuda.is_available() and torch_module.cuda.is_initialized():
+        torch_module.cuda.empty_cache()
     return released
 
 
@@ -866,6 +832,11 @@ _build_segmenter_mask_impl = build_segmenter_mask
 
 def build_segmenter_mask(image: np.ndarray, blocks=None, require_translation: bool = False) -> np.ndarray:
     mask = _build_segmenter_mask_impl(image, blocks, require_translation)
+    if parse_bool(os.environ.get("CLEAN_CV2_REFINE_MASK", "true")):
+        from modules.inpainting.glyph_mask import refine_free_text
+        mask, refined = refine_free_text(image, mask, blocks)
+        if refined:
+            print(f"  [clean-mask] outlined free-text regions refined={refined}", flush=True)
     try:
         from modules.rendering import orig_mask
         orig_mask.remember(image, mask)
@@ -874,64 +845,16 @@ def build_segmenter_mask(image: np.ndarray, blocks=None, require_translation: bo
     return mask
 
 
-def block_inpaint(image: np.ndarray, mask: np.ndarray, config) -> np.ndarray:
-    """Block-aware full-res LaMa: her metin bölgesini 1.7x bağlamla kırpıp ayrı
-    inpaint eder (tüm sayfayı küçültmeden → keskin sonuç)."""
-    h, w = image.shape[:2]
-    lama = _get_lama()
-    result = image.copy()
-    n, labels = cv2.connectedComponents((mask > 0).astype(np.uint8))
-    jobs = []
-    for lbl in range(1, n):
-        ys, xs = np.where(labels == lbl)
-        if len(ys) < 10:
-            continue
-        y1, y2, x1, x2 = ys.min(), ys.max(), xs.min(), xs.max()
-        bw, bh = x2 - x1, y2 - y1
-        mx, my = int(bw * 0.35) + 12, int(bh * 0.35) + 12
-        cy1, cx1 = max(0, y1 - my), max(0, x1 - mx)
-        cy2, cx2 = min(h, y2 + my), min(w, x2 + mx)
-        crop = image[cy1:cy2, cx1:cx2].copy()
-        cmask = mask[cy1:cy2, cx1:cx2].copy()
-        if cmask.sum() == 0:
-            continue
-        jobs.append((cy1, cy2, cx1, cx2, crop, cmask))
-
-    def fill(job):
-        # depends only on the ORIGINAL crop + mask, so the crops of one page can run concurrently
-        crop, cmask = job[4], job[5]
-        out = imk.convert_scale_abs(lama(crop, cmask, config))
-        cm = cmask > 0
-        if os.environ.get("CLEAN_LAMA_BLEND", "true").lower() == "true":
-            if os.environ.get("CLEAN_LAMA_COLOR_MATCH", "false").lower() == "true":
-                # Dolgunun kenar bandı ile dışındaki orijinal halka arasındaki ton farkı
-                ring = (cv2.dilate(cm.astype(np.uint8), cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (15, 15))) > 0) & ~cm
-                band = cm & ~(cv2.erode(cm.astype(np.uint8), cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9, 9))) > 0)
-                if ring.sum() >= 30 and band.sum() >= 30:
-                    off = np.median(crop[ring].astype(np.float32), axis=0) - np.median(out[band].astype(np.float32), axis=0)
-                    out = np.clip(out.astype(np.float32) + np.clip(off, -40, 40), 0, 255).astype(np.uint8)
-            # Düz parlak iç yüzeylerde (balon/kutu/gökyüzü) ton + doku eşleme: LaMa'nın pürüzsüz/ton kaymış
-            # dolgusu kâğıt greniyle uyuşmayan gri dikdörtgen bırakır (CLEAN_PATCH_MATCH=false ile kapanır).
-            out = patch_match.refine_fill(crop, out, cm)
-        return out, cm
-
-    # CLEAN_LAMA_THREADS crops in flight (default 2; 1 = sequential). Results are composited in the original order.
-    workers = max(1, min(len(jobs), int(os.environ.get("CLEAN_LAMA_THREADS", "2") or 2)))
-    if workers > 1:
-        with ThreadPoolExecutor(max_workers=workers) as pool:
-            filled = list(pool.map(fill, jobs))
-    else:
-        filled = [fill(j) for j in jobs]
-    for (cy1, cy2, cx1, cx2, _crop, _cmask), (out, cm) in zip(jobs, filled):
-        if os.environ.get("CLEAN_LAMA_BLEND", "true").lower() == "true":
-            # LaMa dolgusu çoğu zaman zeminden hafif ton kayar ve maske kenarında sert dikdörtgen bırakır:
-            # maske kenarını yumuşat.
-            alpha = np.maximum(cm.astype(np.float32), cv2.GaussianBlur(cm.astype(np.float32), (0, 0), float(os.environ.get("CLEAN_LAMA_FEATHER", "2.5"))))
-            base = result[cy1:cy2, cx1:cx2].astype(np.float32)
-            result[cy1:cy2, cx1:cx2] = np.clip(base * (1 - alpha[..., None]) + out.astype(np.float32) * alpha[..., None], 0, 255).astype(np.uint8)
-        else:
-            result[cy1:cy2, cx1:cx2][cm] = out[cm]
-    return result
+def clean_selected(image: np.ndarray, mask: np.ndarray, config=None) -> np.ndarray:
+    """CV2-only fill. No neural inpainter, retries or post-clean scans."""
+    from modules.inpainting.opencv_clean import clean
+    if os.environ.get("CLEAN_ENGINE", "cv2").strip().lower() != "cv2":
+        raise ValueError("Only CLEAN_ENGINE=cv2 is supported")
+    report = {}
+    cleaned = clean(image, mask, mode=os.environ.get("CLEAN_CV2_MODE", "adaptive").strip().lower(),
+                    radius=int(os.environ.get("CLEAN_CV2_RADIUS", "3")), report=report)
+    print(f"  [clean-cv2] plane={report['plane']} telea={report['telea']} ns={report['ns']} postprocess=False", flush=True)
+    return cleaned
 
 
 def resolve_font(args: argparse.Namespace) -> str:
@@ -1689,7 +1612,7 @@ def clear_light_free_text_render_regions(image: np.ndarray, blocks) -> np.ndarra
             painted_mask = light_pixels & ~_wipe_structure_mask(light_pixels)
         # Edge-aware feathered fill: only the light pixels (closed over thin ghost strokes) are
         # repainted, with a Gaussian-feathered alpha, so no hard rectangle shows on gradients/art.
-        near_light = cv2.morphologyEx(painted_mask.astype(np.uint8), cv2.MORPH_CLOSE, np.ones((9, 9), np.uint8))
+        near_light = cv2.morphologyEx(painted_mask.astype(np.uint8), cv2.MORPH_CLOSE, np.ones((21, 21), np.uint8))
         near_light = cv2.erode(near_light, np.ones((3, 3), np.uint8))
         if local_bg:
             near_light = near_light & ~_wipe_structure_mask(light_pixels)
@@ -1718,12 +1641,16 @@ def _wipe_structure_mask(light_pixels: np.ndarray) -> np.ndarray:
     keep = np.zeros(count, np.uint8)
     for i in range(1, count):
         cx, cy, cw, ch, area = (int(v) for v in stats[i])
-        if max(cw, ch) >= 70:
+        reaches_edge = cx <= 1 or cy <= 1 or cx + cw >= w - 1 or cy + ch >= h - 1
+        if max(cw, ch) >= 70 and reaches_edge:
             keep[i] = 1
     out = (keep[labels] > 0)
     count, labels, stats, _ = cv2.connectedComponentsWithStats(thick, 8)
     for i in range(1, count):
-        if int(stats[i][4]) >= 2500:
+        cx, cy, cw, ch, area = map(int, stats[i])
+        reaches_edge = cx <= 1 or cy <= 1 or cx + cw >= w - 1 or cy + ch >= h - 1
+        dense = area / max(1, cw * ch) >= .65
+        if area >= 2500 and (reaches_edge or dense or cw > .5 * w or ch > .35 * h):
             out |= labels == i
     if not out.any():
         return out
@@ -1969,13 +1896,13 @@ def process_image(path: Path, output_dir: Path, args: argparse.Namespace) -> Pat
     strip_translation_garbage_letters(blocks)
     blocks = sort_blk_list(blocks, right_to_left=args.source_lang == "Japanese")
 
-    print("[3/6] clean: segmenter + block-aware LaMa", flush=True)
+    print(f"[3/6] clean: segmenter + {os.environ.get('CLEAN_ENGINE', 'cv2')}", flush=True)
     config = Config(hd_strategy="Resize", hd_strategy_resize_limit=2048)
     mask = build_segmenter_mask(image, blocks)
     if mask.sum() == 0:
         cleaned = image.copy()
     else:
-        cleaned = block_inpaint(image, mask, config)
+        cleaned = clean_selected(image, mask, config)
 
     print(f"[4/6] translate: {args.translator}", flush=True)
     os.environ["TRANSLATION_SOURCE_FILE"] = path.name
@@ -2423,51 +2350,10 @@ def _dump_clean_debug(path: Path, image: np.ndarray, mask: np.ndarray) -> None:
         print(f"  [clean-dump] failed: {exc}", flush=True)
 
 
-def clean_postprocess(image: np.ndarray, cleaned: np.ndarray, mask: np.ndarray, blocks=None) -> np.ndarray:
-    """After LaMa + watermark flat fill: (1) catch leftover source text the first mask missed (CLEAN_RESIDUAL_PASS),
-    (2) calm down objectively bad fills (CLEAN_FILL_QA) over first + residual masks. Best-effort, never raises."""
-    full_mask = mask
-    try:
-        from modules.inpainting import residual
-        cleaned, rrep = residual.residual_pass(sys.modules[__name__], image, cleaned, mask, blocks,
-                                               Config(hd_strategy="Resize", hd_strategy_resize_limit=2048))
-        if rrep.get("added"):
-            print(f"  [clean-residual] components added={rrep['added']} passes={rrep['passes']} px={rrep['px']}"
-                  + (f" outline={rrep['outline']}" if rrep.get("outline") else "")
-                  + (f" box={rrep['box']}" if rrep.get("box") else ""), flush=True)
-            full_mask = cv2.bitwise_or((mask > 0).astype(np.uint8) * 255, rrep["mask"])
-    except Exception as exc:
-        print(f"  [clean-residual] skipped: {exc}", flush=True)
-    try:
-        cleaned, rep = fill_qa.qa_pass(image, cleaned, full_mask, skip=watermark_clear_mask(image, blocks))
-        if rep.get("bad"):
-            print(f"  [clean-qa] bad fills={rep['bad']} fixed={rep['fixed']} {rep['kinds']}", flush=True)
-    except Exception as exc:
-        print(f"  [clean-qa] skipped: {exc}", flush=True)
-    try:
-        cleaned, frep = fill_qa.flat_snap(cleaned, full_mask, skip=watermark_clear_mask(image, blocks))
-        if frep.get("snapped"):
-            print(f"  [clean-flat] groups={frep['groups']} snapped_px={frep['snapped']}", flush=True)
-    except Exception as exc:
-        print(f"  [clean-flat] skipped: {exc}", flush=True)
-    try:  # last: the QA / snap passes must not touch what stays as drawn
-        from modules.inpainting import residual as _res
-        cleaned, n_back = _res.restore_untouched(sys.modules[__name__], image, cleaned, full_mask, blocks)
-        if n_back:
-            print(f"  [clean-restore] untranslated blocks restored={n_back}", flush=True)
-    except Exception as exc:
-        print(f"  [clean-restore] skipped: {exc}", flush=True)
-    try:  # an untranslated SFX half-erased by a neighbour's mask / pass gets its letters (and outline) back whole
-        from modules.inpainting import residual as _res2
-        cleaned, _n_sfx = _res2.revert_partial_sfx(sys.modules[__name__], image, cleaned, blocks,
-                                                   keep_erased=watermark_clear_mask(image, blocks))
-    except Exception as exc:
-        print(f"  [clean-sfx] skipped: {exc}", flush=True)
-    return cleaned
 
 
 def _stage_clean(task: tuple) -> tuple:
-    """Phase-3a worker: YOLOv8 segmentasyon maskesi + block-aware LaMa ile temizlik."""
+    """Phase-3a: initial mask, selected fill backend, optional postprocessing."""
     idx, path, image, blocks, args = task
     config = Config(hd_strategy="Resize", hd_strategy_resize_limit=2048)
 
@@ -2480,9 +2366,8 @@ def _stage_clean(task: tuple) -> tuple:
     if mask.sum() == 0:
         cleaned = image.copy()
     else:
-        cleaned = block_inpaint(image, mask, config)
+        cleaned = clean_selected(image, mask, config)
         cleaned = watermark_lib.flat_fill(image, cleaned, watermark_clear_mask(image, blocks))
-        cleaned = clean_postprocess(image, cleaned, mask, blocks)
         _dump_clean_debug(path, image, mask)
     assert cleaned.shape == image.shape, f"cleaned shape {cleaned.shape} != page {image.shape}"
     cleaned = restore_untranslated_regions(image, cleaned, blocks)
@@ -2757,7 +2642,6 @@ def process_all_batched(images: list[Path], output_dir: Path, args: argparse.Nam
         print("[BATCH] Tüm sayfalar zaten çevrilmiş.", flush=True)
         return 0
 
-    _prewarm_cleaners()
 
     # ── Model warm-up: thread'ler başlamadan önce modeli main thread'de indir ──
     print("[BATCH] Model warm-up...", flush=True)
@@ -3027,7 +2911,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--stamp-width-ratio", type=float, default=float(os.environ.get("STAMP_WIDTH_RATIO", "0.2")))
     parser.add_argument("--stamp-black-background", default=os.environ.get("STAMP_BLACK_BACKGROUND", "false"), choices=["true", "false"])
     # GPU is ON by default when CUDA is available (USE_GPU=auto|true|false); --gpu/--no-gpu override.
-    # It selects the device of the RT-DETR detector; the segmenter/LaMa follow SEG_DEVICE/LAMA_DEVICE (auto).
+    # It selects the device of the RT-DETR detector; the initial-mask segmenter follows SEG_DEVICE (auto).
     parser.add_argument("--gpu", action=argparse.BooleanOptionalAction,
                         default=compute_device.resolve_use_gpu(os.environ.get("USE_GPU"), compute_device.ort_cuda_available()))
     parser.add_argument("--uppercase", action=argparse.BooleanOptionalAction, default=os.environ.get("UPPERCASE", "true").lower() == "true")
@@ -3049,11 +2933,12 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> int:
     args = parse_args()
+    from runtime_config import configure_cleaner
+    configure_cleaner()
     os.environ["MASK_REFINER"] = args.mask_refiner
     if not args.gpu:
-        # --no-gpu / USE_GPU=false: cleaning also stays on CPU unless SEG_DEVICE/LAMA_DEVICE say otherwise
+        # --no-gpu / USE_GPU=false: cleaning also stays on CPU unless SEG_DEVICE say otherwise
         os.environ.setdefault("SEG_DEVICE", "cpu")
-        os.environ.setdefault("LAMA_DEVICE", "cpu")
     load_env((ROOT / args.env).resolve())
     app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
     args.resolved_font = resolve_font(args)

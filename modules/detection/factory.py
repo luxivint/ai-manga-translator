@@ -29,6 +29,14 @@ class DetectionEngineFactory:
             Appropriate detection engine instance
         """
         effective_backend = cls._resolve_backend(backend)
+        if effective_backend == "api":
+            from .api import APIDetection, cache_identity
+            api_key = f"api_{cache_identity()}_{settings.is_gpu_enabled() if settings else False}"
+            if api_key not in cls._engines:
+                engine = APIDetection(settings)
+                engine.initialize()
+                cls._engines[api_key] = engine
+            return cls._engines[api_key]
 
         # build cache key
         device = resolve_device(settings.is_gpu_enabled(), effective_backend)
@@ -54,7 +62,10 @@ class DetectionEngineFactory:
 
     @classmethod
     def _resolve_backend(cls, backend: str | None = None) -> str:
-        effective_backend = (backend or cls._DEFAULT_BACKEND).lower()
+        import os
+        effective_backend = (backend or os.environ.get("DETECTION_BACKEND") or cls._DEFAULT_BACKEND).strip().lower()
+        if effective_backend not in ("onnx", "torch", "api"):
+            raise ValueError("DETECTION_BACKEND must be onnx, torch or api")
         if effective_backend == "torch" and not torch_available():
             return "onnx"
         return effective_backend

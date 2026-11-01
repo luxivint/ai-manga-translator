@@ -1,7 +1,7 @@
 """Competitor scanlation watermark / banner handling (WATERMARK_POLICY=clean).
 
 `match_watermark` decides WHAT is a watermark (never the site's own brand), `region_mask` decides WHERE to erase:
-the whole banner, not just the glyphs, so LaMa repaints a clean area instead of smudging half a logo."""
+the whole banner, not just the glyphs, so CV2 fills a clean area instead of smudging half a logo."""
 from __future__ import annotations
 
 import os

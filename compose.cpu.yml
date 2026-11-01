@@ -10,7 +10,12 @@ services:
     environment:
       USE_GPU: "false"
       SEG_DEVICE: cpu
-      LAMA_DEVICE: cpu
+      CLEAN_ENGINE: cv2
+      CLEAN_POSTPROCESS: "false"
+      CLEAN_CV2_MODE: adaptive
+      CLEAN_CV2_REFINE_MASK: "true"
+      OPENCV_NUM_THREADS: "2"
+      DETECTION_BACKEND: api
       USE_TENSORRT: "false"
       BATCH_WORKERS: "1"
       BATCH_WORKERS_AUTO: "false"

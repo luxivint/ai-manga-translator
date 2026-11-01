@@ -2,8 +2,10 @@ mahotas>=1.4.18
 boto3>=1.34.0
 pillow>=11.0.0
 psycopg2-binary>=2.9.9
-numpy>=2.2.6
-opencv-python-headless>=4.9.0
+numpy==2.2.6
+opencv-python-headless==4.12.0.88
+# Ultralytics declares opencv-python; pin its transitive distribution to the same ABI.
+opencv-python==4.12.0.88
 setuptools
 PySide6>=6.8.0
 msgpack>=1.1.0

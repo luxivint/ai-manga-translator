@@ -1,4 +1,4 @@
-"""Device selection helpers for the cleaning stage (YOLO segmenter + LaMa)."""
+"""Device selection helpers for the cleaning stage (initial-mask YOLO segmenter)."""
 from __future__ import annotations
 
 import os
@@ -52,7 +52,7 @@ def ort_cuda_available() -> bool:
 def cuda_providers() -> list | None:
     """Explicit ORT provider list for CUDA (no TensorRT), or None if unavailable.
     cudnn_conv_algo_search defaults to HEURISTIC: ORT's EXHAUSTIVE default benchmarks
-    every conv algo for each new input shape (tens of seconds for LaMa)."""
+    every conv algo for each new input shape on variable shapes."""
     if not ort_cuda_available():
         return None
     search = os.environ.get("ORT_CUDNN_SEARCH", "HEURISTIC").strip().upper() or "HEURISTIC"

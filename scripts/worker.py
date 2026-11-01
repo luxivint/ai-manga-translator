@@ -836,6 +836,9 @@ def dry_run(queue_dir: Path, interval: float) -> int:
 
 def main() -> int:
     load_env(ROOT / ".env")
+    from runtime_config import configure_cleaner
+    profile = configure_cleaner()
+    print(f"Cleaner ready: {profile}", flush=True)
     command = os.environ.get("WORKER_STARTUP_COMMAND", "").strip()
     if command:
         print(f"Running WORKER_STARTUP_COMMAND: {command}", flush=True)

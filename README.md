@@ -1,3 +1,5 @@
+> Current translation worker: **CV2-only**, API detection, no neural inpainter or post-clean rescans. See [CV2-CLEANER.md](CV2-CLEANER.md).
+
 # manga-translation
 
 🇬🇧 English | [🇹🇷 Türkçe](README.tr.md)

@@ -77,7 +77,7 @@ def main():
         mask = lb.build_segmenter_mask(image, blocks)
         res = overlay(image, mask)
         if ns.inpaint and mask.sum():
-            cleaned = lb.block_inpaint(image, mask, lb.Config(hd_strategy="Resize", hd_strategy_resize_limit=2048))
+            cleaned = lb.clean_selected(image, mask, lb.Config(hd_strategy="Resize", hd_strategy_resize_limit=2048))
             res = np.concatenate([res, cleaned], axis=1)
         print(p.name, "blocks", len(blocks), "mask px", int((mask > 0).sum()))
         h = image.shape[0]

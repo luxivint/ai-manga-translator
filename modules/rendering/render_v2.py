@@ -445,7 +445,7 @@ def drop_row_slivers(blocks, orig_boxes, image):
     rows: list = []
     for b, bx in zip(blocks, boxes):
         h = bx[3] - bx[1]
-        if b.text_class == "text_bubble" or not (b.translation or "").strip() or h <= 0:
+        if b.text_class == "text_bubble" or (getattr(b, "style", "") or "").lower() == "narration" or not (b.translation or "").strip() or h <= 0:
             rows.append(None)
             continue
         probe = (bx[0], max(0.0, bx[1] - 3 * h - 20), bx[2], min(float(H), bx[3] + 3 * h + 20))
@@ -453,7 +453,10 @@ def drop_row_slivers(blocks, orig_boxes, image):
         cy = (bx[1] + bx[3]) / 2 - oy
         hit = [(oy + a, oy + e) for a, e in tst.row_runs(m, min_height=5) if a - 2 <= cy <= e + 2]
         rows.append(hit[0] if hit else None)
-    drop = set(bcl.row_slivers(boxes, rows))
+    # Narration rows are joined later as a paragraph. An expanded source row may
+    # span its neighbours; it must not discard their unique translations first.
+    drop = {i for i in bcl.row_slivers(boxes, rows)
+            if (getattr(blocks[i], "style", "") or "").lower() != "narration"}
     out_b, out_o, dropped = [], [], []
     for k, (b, o) in enumerate(zip(blocks, orig_boxes)):
         if k in drop:

@@ -1,7 +1,7 @@
 """Warm job runner: one long-lived child of scripts/worker.py that runs chapter jobs IN-PROCESS, one at a time.
 
 Why: every chapter used to be a fresh `python scripts/local_batch.py` process, so each job paid ~25 s to load the
-detector, the YOLO segmenter, the LaMa ORT session (~23 s) and the fonts again. Here local_batch is imported once and
+detector, the YOLO segmenter, the fonts again. Here local_batch is imported once and
 its module-level model singletons survive from job to job. Opt-in with WORKER_INPROCESS=true (worker.py).
 
 The worker keeps the supervision (stall timeout, cancel, kill tree, log file); this child only executes. A job
@@ -161,7 +161,7 @@ def run_job(req: dict, idle_out: int, idle_err: int) -> int:
 
 def watch_idle(idle_seconds: float) -> None:
     """Two idle stages, so an idle worker holds neither the GPU nor the RAM of the warm models:
-    after idle_seconds without a job the models are unloaded (LaMa, YOLO, detector, torch cache); after another
+    after idle_seconds without a job the models are unloaded (YOLO, detector, torch cache); after another
     idle_seconds this child exits, which also drops the CUDA contexts and the imported libraries. The worker simply
     starts a fresh child for the next job."""
     handled = _LAST_ACTIVITY  # the activity stamp we already unloaded for (nothing is loaded at start)

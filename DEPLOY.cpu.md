@@ -1,3 +1,7 @@
+# Güncel CV2-only dağıtım
+
+Güncel motor, PC ayarı ve Docker adımları için [CV2-CLEANER.md](CV2-CLEANER.md) belgesini kullanın. LaMa / hibrit / son tarama kaldırıldı. İlk maske segmenteri ayrı kalır.
+
 # GPU olmayan Linux sunucuda çeviri worker’ı
 
 Başlangıç: **1 worker, en fazla 2 vCPU / 8 GB RAM**. GPU veya NVIDIA sürücüsü

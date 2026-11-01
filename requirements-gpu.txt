@@ -1,4 +1,4 @@
-# NVIDIA GPU variant of the cleaning stack (YOLO text segmenter + LaMa).
+# NVIDIA GPU variant of the cleaning stack (initial-mask YOLO segmenter / optional local detector; CV2 always uses CPU).
 # requirements.txt stays the CPU baseline. To switch an existing venv:
 #   pip install -r requirements.txt            (everything else)
 #   pip uninstall -y onnxruntime torch torchvision
