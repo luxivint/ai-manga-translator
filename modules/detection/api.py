@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import base64
+from concurrent.futures import ThreadPoolExecutor
 import hashlib
 import io
 import json
@@ -80,8 +81,12 @@ def deduplicate(boxes):
 class APIDetection(DetectionEngine):
     """Same bubble/text and TextBlock contracts as the local RT-DETR engine."""
 
+    parallel_safe = True  # only immutable config + remote I/O in raw detection
+
     def initialize(self, **kwargs):
         self.config = configuration()
+        self.concurrency = gateway.detection_concurrency()
+        self.reuse_identity = cache_identity()
         c = self.config
         if not c['key']:
             raise ValueError('DETECTION_API_KEY or OPENAI_API_KEY is required')
@@ -111,13 +116,25 @@ class APIDetection(DetectionEngine):
         starts = tile_starts(h,tile_h,round(tile_h*.2)) if h > tile_h*1.3 else [0]
         bubbles,texts = [],[]
         started = time.monotonic()
-        for i,top in enumerate(starts):
-            bottom = min(h,top+tile_h) if len(starts)>1 else h
+        def request(top):
+            bottom = min(h, top+tile_h) if len(starts)>1 else h
             b,t = self._request_tile(image[top:bottom])
-            for source,target in ((b,bubbles),(t,texts)):
-                for box in source:
-                    box = list(box);box[1]+=top;box[3]+=top;target.append(box)
-            print(f'[DETECT API] tile={i+1}/{len(starts)} bubbles={len(b)} text={len(t)} elapsed={time.monotonic()-started:.2f}s',flush=True)
+            return top,b,t
+
+        def consume(results):
+            for i,(top,b,t) in enumerate(results):
+                for source,target in ((b,bubbles),(t,texts)):
+                    for box in source:
+                        box=list(box);box[1]+=top;box[3]+=top;target.append(box)
+                print(f'[DETECT API] tile={i+1}/{len(starts)} bubbles={len(b)} text={len(t)} '
+                      f'elapsed={time.monotonic()-started:.2f}s parallel={min(self.concurrency,len(starts))}',flush=True)
+
+        if len(starts)>1 and self.concurrency>1:
+            # Submit only coordinates; image views/encoding are made in running workers.
+            with ThreadPoolExecutor(max_workers=min(self.concurrency,len(starts))) as pool:
+                consume(pool.map(request,starts))
+        else:
+            consume(map(request,starts))
         return deduplicate(bubbles),deduplicate(texts)
 
     def _prompt(self, width, height):
@@ -199,7 +216,7 @@ class APIDetection(DetectionEngine):
         last=None
         for attempt in range(self.config['retries']+1):
             response=gateway.resilient_post(self.config['url'],headers={'Content-Type':'application/json','Authorization':'Bearer '+self.config['key']},
-                data=json.dumps(payload),timeout=self.config['timeout'],kind='detection',limiter=gateway.ocr_limiter(),cache='manual')
+                data=json.dumps(payload),timeout=self.config['timeout'],kind='detection',limiter=gateway.detection_limiter(),cache='manual')
             if response.status_code!=200:
                 gateway.cache_discard()
                 raise DetectionAPIError(f'Detection API HTTP {response.status_code}')

@@ -1871,7 +1871,7 @@ def process_image(path: Path, output_dir: Path, args: argparse.Namespace) -> Pat
 
     image = imk.read_image(str(path))
     print(f"[1/6] detect: {path.name}", flush=True)
-    blocks = TextBlockDetector(settings).detect(image)
+    blocks = detect_page_blocks(path,image,settings,args)
     if not blocks:
         output_dir.mkdir(parents=True, exist_ok=True)
         output_ext = path.suffix if args.output_format == "source" else f".{args.output_format.lstrip('.')}"
@@ -1952,6 +1952,23 @@ def crop_has_ad_evidence(blocks, y1: int, y2: int, page_w: int, page_h: int) -> 
     return False
 
 
+
+def detect_page_blocks(path,image,settings,args,*,source=None,crop_box=None):
+    """Reuse only exact matching first-pass geometry, then construct normal TextBlocks."""
+    detector=TextBlockDetector(settings)
+    context=getattr(args,'recut_detection_context',None)
+    if context:
+        from modules.detection.reuse import lookup
+        original=source if source is not None else image
+        boxes,reason=lookup(context,path,original,detector.reuse_identity(),crop_box)
+        if boxes is not None:
+            texts,bubbles=boxes
+            print(f'[DETECT REUSE] {Path(path).name}: text={len(texts)} bubbles={len(bubbles)}; no detection request',flush=True)
+            return detector.detect_from_regions(image,texts,bubbles)
+        print(f'[DETECT REUSE] {Path(path).name}: fallback={reason}',flush=True)
+    return detector.detect(image)
+
+
 def _stage_detect_ocr(task: tuple) -> tuple:
     gateway.raise_if_quota()
     """Phase-1 worker: detect + OCR for one page (thread-safe, fresh instances per call)."""
@@ -1959,8 +1976,9 @@ def _stage_detect_ocr(task: tuple) -> tuple:
     settings = LocalSettings(args)
     main = LocalMain(settings, args.source_lang, args.target_lang)
     image = imk.read_image(str(path))
-    def _detect_ocr(img):
-        found = TextBlockDetector(settings).detect(img)
+    source_image = image
+    def _detect_ocr(img,crop_box=None):
+        found = detect_page_blocks(path,img,settings,args,source=source_image,crop_box=crop_box)
         if found:
             ocr = OCRProcessor()
             ocr.initialize(main, args.source_lang)
@@ -1995,7 +2013,7 @@ def _stage_detect_ocr(task: tuple) -> tuple:
                 print(f"  [banner-crop] [{idx+1}] {path.name}: üst={btop}px alt={bbottom}px", flush=True)
             if (y1, y2) != (0, h) and y2 - y1 >= h * 0.08:
                 image = image[y1:y2].copy()
-                blocks = _detect_ocr(image)
+                blocks = _detect_ocr(image,(0,y1,source_image.shape[1],y2))
     except OCRFailedError as exc:
         # OCR could not be read (503 / timeout / broken stream after all retries): NOT the same as a page without
         # text. Flag it; the caller re-runs it later and fails the job if it stays unreadable.
@@ -2647,9 +2665,16 @@ def process_all_batched(images: list[Path], output_dir: Path, args: argparse.Nam
     print("[BATCH] Model warm-up...", flush=True)
     try:
         _warmup_settings = LocalSettings(args)
-        TextBlockDetector(_warmup_settings).detect(imk.read_image(str(pending[0])))
         from modules.detection.factory import DetectionEngineFactory
+        _warm_engine=DetectionEngineFactory.create_engine(_warmup_settings,args.detector)
+        if not getattr(_warm_engine,'reuse_identity',None):
+            TextBlockDetector(_warmup_settings).detect(imk.read_image(str(pending[0])))
+        else:
+            print('[BATCH] API detector ready; skipping remote warm-up request',flush=True)
         for _eng in DetectionEngineFactory._engines.values():
+            if getattr(_eng,'reuse_identity',None):
+                print('[BATCH] detector device: remote API',flush=True)
+                continue
             _prov = getattr(getattr(_eng, "session", None), "get_providers", lambda: ["?"])()
             print(f"[BATCH] detector device: {'cuda' if _prov[0] == 'CUDAExecutionProvider' else 'cpu'} ({_prov[0]})", flush=True)
         print("[BATCH] Model hazır.", flush=True)
@@ -2949,6 +2974,7 @@ def main() -> int:
 
 
 def run_batch(args, app, recut_work: Path) -> int:
+    args.recut_detection_context = None
     if gateway.quota_remaining():
         print("WAIT: model usage limit reached; raw images kept", flush=True)
         return 4
@@ -2994,14 +3020,18 @@ def run_batch(args, app, recut_work: Path) -> int:
                 engine.confidence_threshold = min(old_threshold, 0.25)
                 def detect_protected(image):
                     bubbles, texts = engine._detect_single_image(image)
-                    return list(bubbles) + list(texts)
+                    return {'bubbles':list(bubbles),'texts':list(texts)}
                 plan = prepare_safe_recut(images, recut_work / "input", detect_protected,
                     target=args.recut_target_height, minimum=min(800, args.recut_target_height // 2),
                     soft_max=max(args.recut_target_height, min(3600, args.recut_max_height)),
-                    hard_max=args.recut_max_height)
+                    hard_max=args.recut_max_height,
+                    workers=gateway.detection_concurrency() if getattr(engine, "parallel_safe", False) else 1)
             finally:
                 engine.confidence_threshold = old_threshold
             images = plan.images
+            if getattr(plan,'detections',None) is not None and getattr(engine,'reuse_identity',None):
+                args.recut_detection_context={'identity':engine.reuse_identity,
+                    'records':{str(path.resolve()):plan.detections[path.name] for path in images}}
             output_dir = recut_work / "output"
             output_dir.mkdir(parents=True, exist_ok=True)
         except Exception as exc:

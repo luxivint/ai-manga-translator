@@ -43,3 +43,30 @@ Run focused offline regression checks from this repository:
 ```sh
 python -m unittest discover -s tests -p test_api_detection.py -v
 ```
+
+
+## Bounded detection parallelism
+
+`DETECTION_API_CONCURRENCY=4` is the independent process-wide remote detection capacity (valid range 1–8). It does not change `OCR_CONCURRENCY`, `BATCH_WORKERS`, local segmenter threads or chapter-worker count.
+
+- Safe-recut scans multiple windows concurrently only for an engine declaring `parallel_safe`. Local detector engines keep the serial path.
+- Only the coordinator reads the virtual strip cache. At most the configured number of window arrays are queued/running. A window result is applied at its original strip offset; completion order does not change cut positions, protected-region order, or source pixels.
+- Long-image API tiles may overlap in flight too, but all detection calls share one limiter. Nested callers do not multiply the number of HTTP requests beyond the configured cap. OCR has a separate limiter.
+- The same shared gateway quota, retries and circuit breaker remain active. A failed detection prevents output/publishing; raw pages remain intact.
+- This is concurrent independent requests, not multiple images packed into one prompt. Coordinates remain image-specific. Rate limits or a serial upstream provider can still reduce the actual speedup.
+- On startup/progress, `[RECUT] scanning ... parallel=4` and `[RECUT] protect ... parallel=4` show the configured scanning path. A `tile=1/1` line describes one image's internal tile count; it does not mean other requests cannot be in flight.
+
+This change needs a rebuild/restart of the updated image. Adding the environment key to an older serial image alone cannot parallelize its loop. A running chapter does not change code midway through its job.
+
+
+## Reuse the first pass after lossless recut
+
+The recut scan now returns typed `bubbles` and `texts`, rather than mixing them into an untyped protection list. The protection/cut decision still uses all raw boxes. Independently, duplicate observations from overlapping windows are reconciled while keeping distinct same-window targets and preferring complete views over edge fragments.
+
+Each cut PNG receives a `recut-detection.json` entry containing its pixel SHA-256, dimensions, locally projected boxes and an explicit reusable/fallback status. The job holds these records with the first-pass API configuration identity. OCR builds the same TextBlocks/font attributes from these regions without calling region detection again. Trusted empty results are reused as empty. The API engine no longer receives a warm-up image solely to initialize a remote detector.
+
+Fallback is local to the affected page: missing/stale record, changed image or API identity, unresolved clipped scan region, a region crossing a cut, or an ad crop splitting a text box. Safe crops only reproject the cached boxes; they do not need another detection call. Existing OCR/translation and initial segmentation remain separate operations.
+
+Logs: `[RECUT] detection reuse eligible=N/M; fallback=K` reports coverage, `[DETECT REUSE] ... no detection request` confirms reuse, and `fallback=...` explains any necessary fresh page detection. A fallback remains a real detection and must never be counted as reuse. New records are job-local and checked against the exact decoded source pixels before use.
+
+Offline replay tests cannot establish provider speed or detection accuracy. They establish call elimination, geometry, pixel preservation and safe fallback. This update does not alter a chapter already running in an older process.

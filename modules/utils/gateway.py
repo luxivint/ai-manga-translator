@@ -168,12 +168,14 @@ def get_breaker() -> CircuitBreaker:
 
 
 def reset_process_state() -> None:
-    """Drop the process-wide breaker and OCR slot pool (a long-lived worker process starts each job clean)."""
-    global _BREAKER, _OCR_LIMITER
+    """Drop the process-wide breaker and independent OCR/detection slot pools (a long-lived worker process starts each job clean)."""
+    global _BREAKER, _OCR_LIMITER, _DETECTION_LIMITER
     with _BREAKER_LOCK:
         _BREAKER = None
     with _OCR_LIMITER_LOCK:
         _OCR_LIMITER = None
+    with _DETECTION_LIMITER_LOCK:
+        _DETECTION_LIMITER = None
 
 
 class AdaptiveLimiter:
@@ -218,6 +220,32 @@ def ocr_limiter() -> AdaptiveLimiter:
         if _OCR_LIMITER is None or _OCR_LIMITER.max_n != n:
             _OCR_LIMITER = AdaptiveLimiter(n)
         return _OCR_LIMITER
+
+
+
+_DETECTION_LIMITER = None
+_DETECTION_LIMITER_LOCK = threading.Lock()
+
+
+def detection_concurrency() -> int:
+    """Independent remote request capacity, never a local model worker count."""
+    try:
+        value = int(os.environ.get("DETECTION_API_CONCURRENCY", "4"))
+    except ValueError:
+        raise ValueError("DETECTION_API_CONCURRENCY must be an integer from 1 to 8") from None
+    if not 1 <= value <= 8:
+        raise ValueError("DETECTION_API_CONCURRENCY must be between 1 and 8")
+    return value
+
+
+def detection_limiter() -> AdaptiveLimiter:
+    """One process-wide detection pool, independent from OCR_CONCURRENCY."""
+    global _DETECTION_LIMITER
+    n = detection_concurrency()
+    with _DETECTION_LIMITER_LOCK:
+        if _DETECTION_LIMITER is None or _DETECTION_LIMITER.max_n != n:
+            _DETECTION_LIMITER = AdaptiveLimiter(n, breaker=get_breaker())
+        return _DETECTION_LIMITER
 
 
 def _short(text: str, limit: int = 200) -> str:

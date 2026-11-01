@@ -6,6 +6,7 @@ analysis window are decoded at once. No network, OCR, R2 writes or source edits.
 from __future__ import annotations
 
 import bisect
+from concurrent.futures import ThreadPoolExecutor, wait, FIRST_COMPLETED
 import hashlib
 import json
 import time
@@ -15,6 +16,7 @@ from pathlib import Path
 
 import numpy as np
 from PIL import Image, ImageOps
+from modules.detection.reuse import window_observations, merge_observations, page_record
 
 
 class RecutError(RuntimeError):
@@ -72,6 +74,7 @@ class RecutPlan:
     width: int
     height: int
     digest: str
+    detections: dict | None = None
 
 
 def safe_bands(uniform, minimum=24):
@@ -95,10 +98,43 @@ def choose_cuts(height, bands, target=2000, minimum=800, soft_max=3600):
     return cuts + [height]
 
 
+
+def detect_windows(strip, starts, detect, window, workers):
+    """Only the coordinator reads the strip cache. At most workers image arrays live."""
+    def pixels(top):
+        with strip.crop(top,min(strip.height,top+window)) as crop:
+            return np.asarray(crop).copy()
+    if workers==1:
+        for index,top in enumerate(starts):
+            image=pixels(top)
+            yield index,top,len(image),detect(image)
+        return
+    pool=ThreadPoolExecutor(max_workers=workers)
+    pending={};next_index=0
+    try:
+        def submit(index):
+            top=starts[index];image=pixels(top)
+            pending[pool.submit(detect,image)]=(index,top,len(image))
+        while next_index<min(workers,len(starts)):
+            submit(next_index);next_index+=1
+        while pending:
+            done,_=wait(pending,return_when=FIRST_COMPLETED)
+            for future in sorted(done,key=lambda f:pending[f][0]):
+                index,top,height=pending.pop(future)
+                boxes=future.result()  # a failed detection aborts before any output is written
+                yield index,top,height,boxes
+                if next_index<len(starts):
+                    submit(next_index);next_index+=1
+    finally:
+        pool.shutdown(wait=True,cancel_futures=True)
+
+
 def prepare(paths, workspace, detect, *, target=2000, minimum=800, soft_max=3600,
-            hard_max=8000, padding=24, window=1600, stride=1000):
+            hard_max=8000, padding=24, window=1600, stride=1000, workers=1):
     if not 0 < minimum <= target <= soft_max <= hard_max <= 16000 or not 0 < stride < window:
         raise RecutError('Invalid safe recut size settings')
+    if type(workers) is not int or not 1 <= workers <= 8:
+        raise RecutError("Safe recut workers must be between 1 and 8")
     strip = VerticalStrip(paths)
     workspace = Path(workspace)
     workspace.mkdir(parents=True, exist_ok=True)
@@ -119,17 +155,27 @@ def prepare(paths, workspace, detect, *, target=2000, minimum=800, soft_max=3600
         starts = sorted(set(list(range(0, max(1, strip.height - window + 1), stride)) + [max(0, strip.height - window)]))
         regions = []
         started = time.monotonic()
-        for index, top in enumerate(starts):
-            with strip.crop(top, min(strip.height, top + window)) as crop:
-                boxes = detect(np.asarray(crop))
-                for box in boxes:
-                    x1, y1, x2, y2 = map(int, box)
-                    y1, y2 = max(top, top + y1), min(strip.height, top + crop.height, top + y2)
-                    if x2 > x1 and y2 > y1:
-                        regions.append([x1, y1, x2, y2])
-                        protected[max(0, y1 - padding):min(strip.height, y2 + padding + 1)] = True
-            if index % 10 == 0 or index == len(starts) - 1:
-                print(f'[RECUT] protect {index + 1}/{len(starts)} windows ({time.monotonic() - started:.1f}s)', flush=True)
+        by_window={}
+        typed_by_window={}
+        print(f'[RECUT] scanning {len(starts)} windows parallel={workers}',flush=True)
+        for completed,(index,top,height,result) in enumerate(detect_windows(strip,starts,detect,window,workers),1):
+            boxes,typed = window_observations(result,top,height,strip.height,strip.width)
+            typed_by_window[index]=typed
+            current=[]
+            for box in boxes:
+                x1,y1,x2,y2=map(int,box)
+                y1,y2=max(top,top+y1),min(strip.height,top+height,top+y2)
+                if x2>x1 and y2>y1:
+                    current.append([x1,y1,x2,y2])
+                    protected[max(0,y1-padding):min(strip.height,y2+padding+1)]=True
+            by_window[index]=current
+            if completed==1 or completed%10==0 or completed==len(starts):
+                print(f'[RECUT] protect {completed}/{len(starts)} windows '
+                      f'({time.monotonic()-started:.1f}s) parallel={workers}',flush=True)
+        # Deterministic manifest/order regardless of API completion order.
+        regions=[box for index in range(len(starts)) for box in by_window[index]]
+        typed_groups = (merge_observations([item for index in range(len(starts)) for item in typed_by_window[index]])
+                        if all(typed_by_window[index] is not None for index in range(len(starts))) else None)
         bands = safe_bands(uniform & ~protected)
         cuts = choose_cuts(strip.height, bands, target, minimum, soft_max)
         # Prefer gutters, but an uninterrupted illustration need not be blank.
@@ -156,6 +202,7 @@ def prepare(paths, workspace, detect, *, target=2000, minimum=800, soft_max=3600
         if any(protected[y] for y in cuts[1:-1]):
             raise RecutError('Cut intersects a protected text/bubble region')
         images = []
+        detections = {}
         rebuilt_digest = hashlib.sha256()
         for index, (top, bottom) in enumerate(zip(cuts, cuts[1:]), 1):
             path = workspace / f'recut-{index:05d}.png'
@@ -164,8 +211,11 @@ def prepare(paths, workspace, detect, *, target=2000, minimum=800, soft_max=3600
             with Image.open(path) as saved:
                 if saved.size != (strip.width, bottom - top):
                     raise RecutError('Recut output dimensions changed')
-                rebuilt_digest.update(saved.convert('RGB').tobytes())
+                pixels = saved.convert('RGB').tobytes()
+                rebuilt_digest.update(pixels)
             images.append(path)
+            if typed_groups is not None:
+                detections[path.name]=page_record(typed_groups,top,bottom,strip.width,hashlib.sha256(pixels).hexdigest())
         if rebuilt_digest.hexdigest() != digest.hexdigest():
             raise RecutError('Recut images did not preserve source pixels')
         manifest = dict(width=strip.width, height=strip.height, source_files=[p.name for p in paths],
@@ -173,9 +223,14 @@ def prepare(paths, workspace, detect, *, target=2000, minimum=800, soft_max=3600
                         fallback_cuts=fallback_cuts,
                         source_sha256=digest.hexdigest(), pixel_exact=True,
                         oversized_heights=[b - a for a, b in zip(cuts, cuts[1:]) if b - a > soft_max])
+        if typed_groups is not None:
+            (workspace / 'recut-detection.json').write_text(json.dumps(detections,indent=2),encoding='utf8')
+            ready=sum(record['reusable'] for record in detections.values())
+            print(f'[RECUT] detection reuse eligible={ready}/{len(images)}; fallback={len(images)-ready}',flush=True)
         (workspace / 'recut-manifest.json').write_text(json.dumps(manifest, indent=2), encoding='utf-8')
         print(f'[RECUT] {len(paths)} source pages -> {len(images)} safe pieces; pixel verification OK; '
               f'max height={max(b - a for a, b in zip(cuts, cuts[1:]))}', flush=True)
-        return RecutPlan(images, cuts, strip.width, strip.height, digest.hexdigest())
+        return RecutPlan(images, cuts, strip.width, strip.height, digest.hexdigest(),
+                         detections if typed_groups is not None else None)
     finally:
         strip.close()
