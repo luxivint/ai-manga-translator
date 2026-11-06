@@ -94,8 +94,102 @@ def clean_white_balloons(original, cleaned, blocks):
             continue
         safe = _interior(original, bubble, [m.xyxy for m in members])
         if safe is None:
+            # An open outline or white page surrounding the balloon makes a
+            # full interior ambiguous. Clean just the confirmed text-box
+            # interiors instead of silently doing nothing.
+            result, count = _fallback_white_text_regions(original, result, bubble, members)
+            repainted += count
             continue
         (x1, y1, x2, y2), mask, fill = safe
         result[y1:y2, x1:x2][mask] = fill
         repainted += 1
     return result, repainted
+
+
+def _outline_guard(original, bubble_box):
+    """Protect long connected outline/panel strokes, never normal small letters."""
+    height, width = original.shape[:2]
+    x1, y1, x2, y2 = _rect(bubble_box, width, height)
+    protect = np.zeros((height, width), dtype=bool)
+    if x2 <= x1 or y2 <= y1:
+        return protect
+    crop = original[y1:y2, x1:x2]
+    h, w = crop.shape[:2]
+    gray = cv2.cvtColor(crop, cv2.COLOR_RGB2GRAY)
+    chroma = crop.max(axis=2).astype(np.int16) - crop.min(axis=2).astype(np.int16)
+    dark = ((gray <= 150) & (chroma < 80)).astype(np.uint8)
+    n, labels, stats, _ = cv2.connectedComponentsWithStats(dark, 8)
+    outline = np.zeros((h, w), np.uint8)
+    for k in range(1, n):
+        cx, cy, cw, ch, area = (int(v) for v in stats[k])
+        if area < 55 or (cw < 0.24 * w and ch < 0.24 * h):
+            continue
+        extent = area / max(1, cw * ch)
+        if extent < 0.48 or cw > 0.65 * w or ch > 0.65 * h:
+            outline[labels == k] = 255
+    if outline.any():
+        outline = cv2.dilate(outline, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7)))
+    protect[y1:y2, x1:x2] = outline > 0
+    return protect
+
+
+def _fallback_white_text_regions(original, cleaned, bubble_box, blocks):
+    """Repaint OCR text footprints on white paper when full segmentation fails.
+
+    A joined balloon may have a shared detector box whose outer edge is open,
+    cropped, or surrounded by another white page region. Rather than abandon
+    cleaning, use high-confidence local white support around each translated
+    OCR box, protecting all long black outline strokes and adjacent artwork.
+    """
+    height, width = original.shape[:2]
+    bx1, by1, bx2, by2 = _rect(bubble_box, width, height)
+    if bx2 <= bx1 or by2 <= by1:
+        return cleaned, 0
+    protect = _outline_guard(original, bubble_box)
+    if int(protect[by1:by2, bx1:bx2].sum()) < max(100, 0.0015 * (bx2-bx1) * (by2-by1)):
+        return cleaned, 0  # no surrounding outline: refuse to erase an open page
+
+    result = cleaned.copy()
+    cleaned_boxes = 0
+    for block in blocks:
+        tx1, ty1, tx2, ty2 = _rect(block.xyxy, width, height)
+        bw, bh = tx2 - tx1, ty2 - ty1
+        if bw < 14 or bh < 10 or bw * bh > 0.65 * (bx2-bx1) * (by2-by1):
+            continue
+        pad_x = max(6, min(18, round(bw * 0.07)))
+        pad_y = max(6, min(16, round(bh * 0.12)))
+        x1, y1 = max(bx1, tx1-pad_x), max(by1, ty1-pad_y)
+        x2, y2 = min(bx2, tx2+pad_x), min(by2, ty2+pad_y)
+        if x2 <= x1 or y2 <= y1:
+            continue
+        crop = original[y1:y2, x1:x2]
+        gray = cv2.cvtColor(crop, cv2.COLOR_RGB2GRAY)
+        chroma = crop.max(axis=2).astype(np.int16) - crop.min(axis=2).astype(np.int16)
+        white = (gray >= 222) & (chroma <= 38)
+        if float(white.mean()) < 0.42:
+            continue
+        # Don't repaint coloured illustrations that happen to lie in an OCR box.
+        if float(((chroma > 65) & (gray < 225)).mean()) > 0.025:
+            continue
+        sample = crop[white].astype(np.float32)
+        if not sample.size or float(np.std(sample, axis=0).max()) > 15:
+            continue
+        fill = np.median(sample, axis=0).astype(np.uint8)
+
+        # Unlike a rectangular fill, local white support avoids painting a
+        # square over the grey comic panel beneath a balloon's tail. Dense
+        # lettering still passes even when individual pixels are near black.
+        white_support = cv2.blur(white.astype(np.float32), (29, 29))
+        paint = (white_support >= 0.36) & ~protect[y1:y2, x1:x2]
+        # Separate untranslated lettering in the same bubble remains intact.
+        for other in blocks:
+            if other is block or (getattr(other, "translation", "") or "").strip():
+                continue
+            ox1, oy1, ox2, oy2 = _rect(other.xyxy, width, height)
+            paint[max(0, oy1-y1):min(y2-y1, oy2-y1),
+                  max(0, ox1-x1):min(x2-x1, ox2-x1)] = False
+        if not paint.any():
+            continue
+        result[y1:y2, x1:x2][paint] = fill
+        cleaned_boxes += 1
+    return result, cleaned_boxes
