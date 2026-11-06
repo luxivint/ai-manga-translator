@@ -150,6 +150,8 @@ class APIDetection(DetectionEngine):
             'leave 2 pixels around the complete glyphs. Inspect rightmost/bottommost letters. '
             'Include signs, captions, watermarks and sound effects, including non-Latin text. '
             'A bubble box covers its complete visible container, separate from its text box. '
+            'When two speech balloons touch or overlap, detect TWO separate bubble boxes '
+            'and TWO separate text groups, one per lobe; never enclose both in one text box. '
             'Include partial containers at image edges but never infer invisible text. '
             'Do not detect characters, panels or scenery. has_text indicates visible writing, NOT empty balloons. '
             'Only return strict JSON: {"has_text":true,"regions":[{"kind":"text","box":[1,2,30,40]},'
