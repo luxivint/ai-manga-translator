@@ -223,7 +223,7 @@ class GPTTranslation(BaseLLMTranslation):
             "model": self.model,
             "messages": messages,
             "temperature": self.temperature,
-            "max_completion_tokens": self.max_tokens,
+            "max_completion_tokens": getattr(self._request_local, "max_tokens", None) or self.max_tokens,
             "top_p": self.top_p,
         }
 
