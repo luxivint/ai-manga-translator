@@ -1,4 +1,5 @@
 import os
+import threading
 import re
 from typing import Any
 import numpy as np
@@ -28,6 +29,7 @@ class BaseLLMTranslation(LLMTranslation):
         self.temperature = None
         self.top_p = None
         self.max_tokens = None
+        self._request_local = threading.local()
         self.timeout = 30  
     
     def initialize(self, settings: Any, source_lang: str, target_lang: str, **kwargs) -> None:
@@ -93,12 +95,19 @@ class BaseLLMTranslation(LLMTranslation):
             image = list(images)
         else:
             image = images[0] if images else None
-        saved = self.max_tokens
-        self.max_tokens = max(self.max_tokens or 0, 16000 if len(raw) > 30 else 8000, len(raw) * 300)
+        # Per-thread token cap: a concurrent batch must not overwrite the
+        # limits used by another request sharing this translation engine.
+        previous = getattr(self._request_local, "max_tokens", None)
+        self._request_local.max_tokens = max(
+            self.max_tokens or 0, 16000 if len(raw) > 30 else 8000, len(raw) * 300
+        )
         try:
             content = self._perform_translation(user_prompt, system_prompt, image)
         finally:
-            self.max_tokens = saved
+            if previous is None:
+                del self._request_local.max_tokens
+            else:
+                self._request_local.max_tokens = previous
         m = re.search(r"\{[\s\S]*\}", content or "")
         try:
             if not m:
