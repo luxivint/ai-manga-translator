@@ -574,13 +574,13 @@ def verify_published_pages(conn, chapter: dict, check=upload_verify.check_urls):
     """HEAD every published page; definitive failures (404, HTML, empty file) raise PublishVerificationError.
     Network-only problems are logged, not failed: the daily link check re-tests them."""
     if not upload_verify.publish_verify_enabled():
-        return
+        return False
     urls = published_page_urls(conn, chapter["id"])
     if not urls:
         raise PublishVerificationError("Yayın doğrulaması: bölüm için hiç sayfa kaydedilmedi")
     if not all(url.startswith("http") for url in urls):
         print("publish_verify_skip: R2_PUBLIC_BASE_URL missing, page URLs cannot be checked", flush=True)
-        return
+        return False
     problems = check(urls)
     broken = [p for p in problems if p["reason"] != "network"]
     if len(problems) > len(broken):
@@ -590,6 +590,7 @@ def verify_published_pages(conn, chapter: dict, check=upload_verify.check_urls):
         raise PublishVerificationError(
             f"Yayın doğrulaması başarısız (müdahale gerekli): {len(broken)}/{len(urls)} sayfa kırık: {sample}")
     print(f"publish_verified: {len(urls)} pages", flush=True)
+    return not problems
 
 
 LOCAL_BATCH_VALIDATION_EXIT = 3  # keep in sync with local_batch.EXIT_VALIDATION_FAILED
@@ -755,9 +756,18 @@ def process_translate_job(conn, job):
             progress = max(progress, batch_progress(ROOT / "work/job-logs" / f"{job['id']}.log"))
             set_job(conn, job["id"], progress=progress)
             update_worker_heartbeat(conn)
-        raw_prefix, output_prefix = translate_chapter(chapter, delete_raw, job["id"], tick=tick)
-        record_translated_assets(conn, chapter, output_prefix, raw_prefix, delete_raw)
-        verify_published_pages(conn, chapter)
+        # Never delete source R2 pages in local_batch. They are required for
+        # recovery if publication or the public URL verification fails.
+        raw_prefix, output_prefix = translate_chapter(chapter, False, job["id"], tick=tick)
+        record_translated_assets(conn, chapter, output_prefix, raw_prefix, False)
+        verified = verify_published_pages(conn, chapter)
+        # Verification can be disabled/inconclusive (DNS/network): retain raw
+        # pages in that case, rather than treating the chapter as verified.
+        if delete_raw:
+            if verified:
+                cleanup_raw(conn, chapter["id"])
+            else:
+                print(f"raw_source_retained: publication not fully verified chapter={chapter['id']}", flush=True)
         heartbeat(conn, job["id"])
         set_job(conn, job["id"], progress=int(index / total * 95))
     return total
