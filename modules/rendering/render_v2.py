@@ -631,6 +631,8 @@ def dedupe_duplicate_blocks(blocks, orig_boxes):
     boxes = [[float(v) for v in o] for o in orig_boxes]
     bubbles = [None if getattr(b, "bubble_xyxy", None) is None else tuple(float(v) for v in b.bubble_xyxy) for b in blocks]
     groups = bl.group_by_balloon(bubbles, boxes) + bcl.overlap_groups(boxes)
+    # Distinct lobes split before OCR must never be deduplicated against each other.
+    groups = [g for g in groups if not any(getattr(blocks[i], "split_from_double_balloon", False) for i in g)]
     if not groups:
         return blocks, orig_boxes
     drop, rewrite = bcl.drop_duplicate_translations(blocks, boxes, groups)
@@ -739,6 +741,10 @@ def prepare_balloon_blocks(blocks, orig_boxes, image, cleaned=None):
                 print(f"[merge-echo] {len(idx)} OCR windows -> one paragraph: {merged.translation[:70]!r}", flush=True)
 
     for g in bl.group_by_balloon(bubbles, boxes):
+        # A connected two-lobe shape may share detector bounds, but its halves
+        # are different writing areas. Do not collapse the halves into one block.
+        if any(getattr(blocks[i], "split_from_double_balloon", False) for i in g):
+            continue
         g = [i for i in g if (blocks[i].translation or "").strip() and not getattr(blocks[i], "is_ad", False) and i not in drop]
         if len(g) < 2:
             continue
@@ -1181,6 +1187,8 @@ def build_items(blocks, image, cleaned, orig_boxes, render_settings, alignment, 
         touch = 12.0 if os.environ.get("RENDER_GROUP_TOUCHING", "true").lower() == "true" else 0.0
         for g in bl.group_by_balloon([None if plans[i]["blk"].bubble_xyxy is None else tuple(float(v) for v in plans[i]["blk"].bubble_xyxy) for i in cand],
                                      [plans[i]["obox"] for i in cand], touch_gap=touch):
+            if any(getattr(plans[cand[k]]["blk"], "split_from_double_balloon", False) for k in g):
+                continue  # protect independent sizing and regions of two-lobe dialogue
             balloon_groups.append([cand[k] for k in g])
         for g in balloon_groups:
             for i in g:
