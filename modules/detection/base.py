@@ -53,7 +53,12 @@ class DetectionEngine(ABC):
         
         text_boxes = filter_and_fix_bboxes(text_boxes, image.shape)
         bubble_boxes = filter_and_fix_bboxes(bubble_boxes, image.shape)
+        # Keep the existing duplicate-box cleanup, then recover text that spans
+        # two distinct touching balloons BEFORE font inference and OCR.
+        from .utils.balloon_regions import assign_balloon_regions
         text_boxes = merge_overlapping_boxes(text_boxes)
+        regions = assign_balloon_regions(image, text_boxes, bubble_boxes)
+        text_boxes = [text_box for text_box, _, _ in regions]
 
         text_blocks = []
         text_matched = [False] * len(text_boxes)  # Track matched text boxes
@@ -95,57 +100,18 @@ class DetectionEngine(ABC):
             direction = font_attrs.get('direction', '')
             text_color = tuple(font_attrs.get('text_color', ()))
 
-            # If no bubble boxes, all text is free text
-            if len(bubble_boxes) == 0:
-                text_blocks.append(
-                    TextBlock(
-                        text_bbox=txt_box,
-                        text_class='text_free',
-                        direction=direction,
-                        font_color=text_color,
-                    )
-                )
-                continue
-            
-            for bble_box in bubble_boxes:
-                if bble_box is None:
-                    continue
-                if does_rectangle_fit(bble_box, txt_box):
-                    # Text is inside a bubble
-                    text_blocks.append(
-                        TextBlock(
-                            text_bbox=txt_box,
-                            bubble_bbox=bble_box,
-                            text_class='text_bubble',
-                            direction=direction,
-                            font_color=text_color,
-                        )
-                    )
-                    text_matched[txt_idx] = True  
-                    break
-                elif do_rectangles_overlap(bble_box, txt_box):
-                    # Text overlaps with a bubble
-                    text_blocks.append(
-                        TextBlock(
-                            text_bbox=txt_box,
-                            bubble_bbox=bble_box,
-                            text_class='text_bubble',
-                            direction=direction,
-                            font_color=text_color,
-                        )
-                    )
-                    text_matched[txt_idx] = True  
-                    break
-            
-            if not text_matched[txt_idx]:
-                text_blocks.append(
-                    TextBlock(
-                        text_bbox=txt_box,
-                        text_class='text_free',
-                        direction=direction,
-                        font_color=text_color,
-                    )
-                )
-        
+            # The owner is chosen by overlap area (not detector order). Splits
+            # retain their individual balloon identities through rendering.
+            _, matched_bubble, split_from_double_balloon = regions[txt_idx]
+            block = TextBlock(
+                text_bbox=txt_box,
+                bubble_bbox=matched_bubble,
+                text_class='text_bubble' if matched_bubble is not None else 'text_free',
+                direction=direction,
+                font_color=text_color,
+            )
+            block.split_from_double_balloon = split_from_double_balloon
+            text_blocks.append(block)
+
         return text_blocks
     
