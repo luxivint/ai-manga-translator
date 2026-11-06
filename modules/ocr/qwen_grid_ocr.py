@@ -111,9 +111,8 @@ class QwenGridOCR(OCREngine):
             data = response.json()
             content = ((data.get("choices") or [{}])[0].get("message") or {}).get("content") or ""
             parsed = self._parse_json(content)
-            if not self._looks_like_failed_batch(parsed, len(id_to_idx)):
-                if parsed or self._is_valid_empty_answer(content):
-                    gateway.cache_commit()
+            if not self._looks_like_failed_batch(parsed, len(id_to_idx), set(id_to_idx)):
+                gateway.cache_commit()
                 break
             gateway.cache_discard()  # a suspicious answer must never be replayed from the cache
             if attempt < max_attempts:
@@ -123,10 +122,18 @@ class QwenGridOCR(OCREngine):
                     flush=True,
                 )
 
-        if not parsed and not self._is_valid_empty_answer(content):
-            # no JSON list at all (empty / prose / cut-off stream): that is a failed read, not "no text"
+        if self._looks_like_failed_batch(parsed, len(id_to_idx), set(id_to_idx)):
+            # A missing crop ID is not an empty string: it is lost dialogue.
+            # Fail the page (and retain its raw source) instead of silently
+            # publishing a partly untranslated or misaligned double balloon.
             gateway.cache_discard()
-            raise OCRFailedError(f"OCR answer is not parseable JSON (len={len(content)})")
+            seen = {int(item["id"]) for item in parsed if isinstance(item, dict)
+                    and str(item.get("id", "")).isdigit()}
+            missing = sorted(set(id_to_idx) - seen)
+            raise OCRFailedError(
+                f"OCR incomplete after {max_attempts} attempt(s): "
+                f"missing crop IDs {missing}, expected {sorted(id_to_idx)}"
+            )
 
         for item in parsed:
             try:
@@ -146,22 +153,40 @@ class QwenGridOCR(OCREngine):
         return bool(re.search(r"\[\s*\]", content or ""))
 
     @staticmethod
-    def _looks_like_failed_batch(parsed: list[dict[str, Any]], crop_count: int) -> bool:
-        if crop_count <= 2:
-            return False
+    def _looks_like_failed_batch(
+        parsed: list[dict[str, Any]],
+        crop_count: int,
+        expected_ids: set[int] | None = None,
+    ) -> bool:
+        """Reject missing, repeated or malformed crop IDs, even for two balloons.
+
+        Explicit {"id": N, "text": ""} is accepted for an unreadable crop,
+        while a crop omitted from the JSON is never interpreted as blank.
+        """
         if not parsed:
-            return True
-        recognized = 0
+            return crop_count > 0
+        expected = expected_ids if expected_ids is not None else set(range(1, crop_count + 1))
+        found = set()
         empty = 0
         for item in parsed:
-            if not isinstance(item, dict) or "id" not in item:
-                continue
-            recognized += 1
-            if not str(item.get("text") or "").strip():
+            if not isinstance(item, dict) or "id" not in item or "text" not in item:
+                return True
+            try:
+                crop_id = int(item["id"])
+            except (ValueError, TypeError):
+                return True
+            if crop_id not in expected or crop_id in found:
+                return True
+            found.add(crop_id)
+            if not str(item["text"] or "").strip():
                 empty += 1
-        if recognized < max(1, int(crop_count * 0.6)):
+        if found != expected:
             return True
-        return empty / max(1, recognized) >= float(os.environ.get("QWEN_GRID_OCR_RETRY_EMPTY_RATIO", "0.85"))
+        # Large sheets with almost exclusively empty reads may be gateway
+        # failures; small sheets can legitimately contain an empty bubble.
+        return crop_count > 2 and empty / max(1, crop_count) >= float(
+            os.environ.get("QWEN_GRID_OCR_RETRY_EMPTY_RATIO", "0.85")
+        )
 
     def _make_sheet(self, img: np.ndarray, blk_list: list[TextBlock]) -> tuple[Image.Image | None, dict[int, int]]:
         source = Image.fromarray(img).convert("RGB")
