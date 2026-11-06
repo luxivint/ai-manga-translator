@@ -2224,12 +2224,14 @@ def _batch_translate_all(page_results: list, args: argparse.Namespace) -> None:
     @trace.traced("translation.request")
     def _call_batch_translate(batch_dict: dict[str, str], extra: str = "") -> dict[str, tuple[str, str]]:
         """One GPT call for a batch -> {key: (text, style)}. Raises on API/JSON failure."""
-        images, hint = None, extra
+        # Always bind each translated string to its original OCR crop ID:
+        # a visually joined two-lobe balloon is still TWO independent blocks.
+        images, hint = None, ORDER_HINT + extra
         if use_images:
             page_ids = sorted({int(k[1:].split("_", 1)[0]) for k in batch_dict})
             images = [page_results[pi][1] for pi in page_ids]
-            hint = (f"\nThe attached page images are, in order, pages {', '.join(f'p{pi}' for pi in page_ids)}. "
-                    f"A key 'pN_bM' is block M of page pN.")
+            hint += (f"\nThe attached page images are, in order, pages {', '.join(f'p{pi}' for pi in page_ids)}. "
+                     f"A key 'pN_bM' is block M of page pN.")
         crops: list = []
         for pi in sorted({int(k[1:].split("_", 1)[0]) for k in batch_dict}):
             page_keyed = {f"p{pi}_b{bi}": b for bi, b in enumerate(page_results[pi][2]) if f"p{pi}_b{bi}" in batch_dict}
@@ -2251,7 +2253,7 @@ def _batch_translate_all(page_results: list, args: argparse.Namespace) -> None:
         best: dict[str, tuple[str, str]] = {}
         for attempt in range(1, max_attempts + 1):
             try:
-                batch_result = _call_batch_translate(pending, extra=ORDER_HINT if attempt > 1 else "") or {}
+                batch_result = _call_batch_translate(pending, extra=" RETRY: preserve visual crop IDs and meaning." if attempt > 1 else "") or {}
             except gateway.GatewayQuotaError:
                 raise
             except Exception as exc:
