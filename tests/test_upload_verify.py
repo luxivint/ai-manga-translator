@@ -247,6 +247,61 @@ class WorkerPublishVerifyTests(unittest.TestCase):
         with self.env(TRANSLATION_VERIFY_PUBLISHED="false"):
             worker.verify_published_pages(FakeConn([]), self.chapter, check=lambda u: 1 / 0)
 
+    def test_verified_urls_allow_raw_cleanup(self):
+        with self.env(), quiet():
+            self.assertTrue(worker.verify_published_pages(
+                FakeConn(self.rows), self.chapter, check=lambda urls: []))
+
+    def test_network_problem_retains_raw(self):
+        with self.env(), quiet():
+            self.assertFalse(worker.verify_published_pages(
+                FakeConn(self.rows), self.chapter,
+                check=lambda urls: [{"url": urls[0], "status": 0, "reason": "network"}]))
+
+    def test_verify_disabled_retains_raw(self):
+        with self.env(TRANSLATION_VERIFY_PUBLISHED="false"):
+            self.assertFalse(worker.verify_published_pages(FakeConn(self.rows), self.chapter))
+
+    def test_worker_does_not_delete_raw_until_publication_verified(self):
+        chapter = {"id": "ch1", "auto_delete_raw_after_translate": True}
+        job = {"id": "job1", "job_type": "TRANSLATE_CHAPTER", "chapter_id": "ch1"}
+        conn = mock.MagicMock()
+        with mock.patch.object(worker, "single_chapter", return_value=chapter), \
+             mock.patch.object(worker, "stop_if_cancelled"), \
+             mock.patch.object(worker, "heartbeat"), \
+             mock.patch.object(worker, "update_worker_heartbeat"), \
+             mock.patch.object(worker, "set_job"), \
+             mock.patch.object(worker, "translate_chapter", return_value=("raw/x", "translated/x")) as translate, \
+             mock.patch.object(worker, "record_translated_assets") as publish, \
+             mock.patch.object(worker, "verify_published_pages", return_value=False), \
+             mock.patch.object(worker, "cleanup_raw") as cleanup, quiet():
+            worker.process_translate_job(conn, job)
+        translate.assert_called_once()
+        self.assertIs(translate.call_args.args[1], False)
+        self.assertIs(publish.call_args.args[-1], False)
+        cleanup.assert_not_called()
+
+    def test_worker_deletes_raw_only_after_verified_publication(self):
+        chapter = {"id": "ch1", "auto_delete_raw_after_translate": True}
+        job = {"id": "job1", "job_type": "TRANSLATE_CHAPTER", "chapter_id": "ch1"}
+        conn = mock.MagicMock()
+        order = []
+        with mock.patch.object(worker, "single_chapter", return_value=chapter), \
+             mock.patch.object(worker, "stop_if_cancelled"), \
+             mock.patch.object(worker, "heartbeat"), \
+             mock.patch.object(worker, "update_worker_heartbeat"), \
+             mock.patch.object(worker, "set_job"), \
+             mock.patch.object(worker, "translate_chapter",
+                               side_effect=lambda *args, **kw: (order.append("translate"), ("raw/x", "translated/x"))[1]), \
+             mock.patch.object(worker, "record_translated_assets",
+                               side_effect=lambda *args: order.append("publish")), \
+             mock.patch.object(worker, "verify_published_pages",
+                               side_effect=lambda *args: (order.append("verify"), True)[1]), \
+             mock.patch.object(worker, "cleanup_raw",
+                               side_effect=lambda *args: order.append("delete")), quiet():
+            worker.process_translate_job(conn, job)
+        self.assertEqual(order, ["translate", "publish", "verify", "delete"])
+
     def test_run_once_marks_failed_without_retry(self):
         job = {"id": "j1", "job_type": "TRANSLATE_CHAPTER", "chapter_id": "ch1", "manga_id": "m1"}
         with mock.patch.object(worker, "claim_job", return_value=job), \
