@@ -632,7 +632,7 @@ def dedupe_duplicate_blocks(blocks, orig_boxes):
     bubbles = [None if getattr(b, "bubble_xyxy", None) is None else tuple(float(v) for v in b.bubble_xyxy) for b in blocks]
     groups = bl.group_by_balloon(bubbles, boxes) + bcl.overlap_groups(boxes)
     # Distinct lobes split before OCR must never be deduplicated against each other.
-    groups = [g for g in groups if not any(getattr(blocks[i], "split_from_double_balloon", False) for i in g)]
+    groups = [g for g in groups if not any(getattr(blocks[i], "split_from_double_balloon", False) or getattr(blocks[i], "linked_lobe_region", None) is not None for i in g)]
     if not groups:
         return blocks, orig_boxes
     drop, rewrite = bcl.drop_duplicate_translations(blocks, boxes, groups)
@@ -674,6 +674,49 @@ def _rim_fragments(blocks, g, boxes, cleaned, max_words: int = 5, min_cover: flo
         if sub.size and float(sub.sum()) / full_area < min_cover:
             out.append(k)
     return out
+
+
+def detect_joined_lobes(blocks, orig_boxes, image, cleaned):
+    """Find two separate OCR texts inside one detector balloon box.
+
+    A shared bubble_xyxy does not imply one writing area. For two separated
+    blocks, use the cleaned balloon's actual two-lobe silhouette; normal
+    single-ellipse balloons remain unchanged.
+    """
+    import copy
+    from modules.rendering import linked_lobes as lobes
+
+    output = list(blocks)
+    owners = {}
+    for i, blk in enumerate(output):
+        box = getattr(blk, "bubble_xyxy", None)
+        if box is not None and blk.text_class == "text_bubble" and (blk.translation or "").strip():
+            owners.setdefault(tuple(map(int, box)), []).append(i)
+    for box, group in owners.items():
+        if len(group) != 2 or not lobes.separated_text_boxes([orig_boxes[i] for i in group], box):
+            continue
+        # Evaluate both cleaned and original contours, because cleaner leakage
+        # or source glyphs can make one of the floodfills unreliable.
+        pair = None
+        for page in (cleaned, image):
+            _, interior, offset = bubble_interior_ex(page, output[group[0]])
+            if interior is None:
+                continue
+            pair = lobes.split_lobe_interiors(interior, offset, [orig_boxes[i] for i in group], box)
+            if pair is not None:
+                break
+        if pair is None:
+            if os.environ.get("RENDER_DEBUG"):
+                print(f"[linked-lobes] shared balloon {box}, silhouette uncertain; no forced split", flush=True)
+            continue
+        for i, (region, interior, offset) in zip(group, pair):
+            output[i] = copy.copy(output[i])
+            output[i].linked_lobe_region = region
+            output[i].linked_lobe_inner = interior
+            output[i].linked_lobe_offset = offset
+        if os.environ.get("RENDER_DEBUG"):
+            print(f"[linked-lobes] split shared bubble {box}: {[output[i].linked_lobe_region for i in group]}", flush=True)
+    return output
 
 
 def prepare_balloon_blocks(blocks, orig_boxes, image, cleaned=None):
@@ -721,7 +764,7 @@ def prepare_balloon_blocks(blocks, orig_boxes, image, cleaned=None):
         srcs = [(getattr(blocks[i], "text", "") or "") for i in cand]
         for grp in bcl.overlap_chain_groups([boxes[i] for i in cand], srcs):
             idx = [cand[k] for k in grp]
-            if any(getattr(blocks[i], "split_from_double_balloon", False) for i in idx):
+            if any(getattr(blocks[i], "split_from_double_balloon", False) or getattr(blocks[i], "linked_lobe_region", None) is not None for i in idx):
                 continue  # never rejoin OCR pieces from separate lobes
             done, parts = "", []
             for pos, i in enumerate(idx):
@@ -745,7 +788,7 @@ def prepare_balloon_blocks(blocks, orig_boxes, image, cleaned=None):
     for g in bl.group_by_balloon(bubbles, boxes):
         # A connected two-lobe shape may share detector bounds, but its halves
         # are different writing areas. Do not collapse the halves into one block.
-        if any(getattr(blocks[i], "split_from_double_balloon", False) for i in g):
+        if any(getattr(blocks[i], "split_from_double_balloon", False) or getattr(blocks[i], "linked_lobe_region", None) is not None for i in g):
             continue
         g = [i for i in g if (blocks[i].translation or "").strip() and not getattr(blocks[i], "is_ad", False) and i not in drop]
         if len(g) < 2:
@@ -997,6 +1040,7 @@ def build_items(blocks, image, cleaned, orig_boxes, render_settings, alignment, 
         blocks, orig_boxes, slivers = drop_row_slivers(blocks, orig_boxes, image)
         deliberate += slivers  # a dropped duplicate read is deliberate: the safety net must not draw it again
         blocks, orig_boxes = split_merged_blocks(blocks, orig_boxes, image, cleaned)
+        blocks = detect_joined_lobes(blocks, orig_boxes, image, cleaned)
         blocks, orig_boxes = drop_split_duplicates(blocks, orig_boxes)
         blocks, orig_boxes = dedupe_duplicate_blocks(blocks, orig_boxes)
         blocks, orig_boxes = prepare_balloon_blocks(blocks, orig_boxes, image, cleaned)
@@ -1096,7 +1140,10 @@ def build_items(blocks, image, cleaned, orig_boxes, render_settings, alignment, 
             sh = 0.47 if (boxed and os.environ.get("RENDER_TILT_FIT", "true").lower() == "true") else 0.62
             region = (int(cx - long_len * 0.58), int(cy - short_len * sh), int(cx + long_len * 0.58), int(cy + short_len * sh))
         elif in_bubble:
-            region, inner, ioff = bubble_interior_ex(cleaned, blk)
+            if getattr(blk, "linked_lobe_region", None) is not None:
+                region, inner, ioff = blk.linked_lobe_region, blk.linked_lobe_inner, blk.linked_lobe_offset
+            else:
+                region, inner, ioff = bubble_interior_ex(cleaned, blk)
             is_bubble = region is not None
         if "\n" in text and blk.text_class != "text_bubble" and (getattr(blk, "text", "") or ""):
             rim_m, _ = tst.ink_mask_original(image, obox)
@@ -1189,7 +1236,7 @@ def build_items(blocks, image, cleaned, orig_boxes, render_settings, alignment, 
         touch = 12.0 if os.environ.get("RENDER_GROUP_TOUCHING", "true").lower() == "true" else 0.0
         for g in bl.group_by_balloon([None if plans[i]["blk"].bubble_xyxy is None else tuple(float(v) for v in plans[i]["blk"].bubble_xyxy) for i in cand],
                                      [plans[i]["obox"] for i in cand], touch_gap=touch):
-            if any(getattr(plans[cand[k]]["blk"], "split_from_double_balloon", False) for k in g):
+            if any(getattr(plans[cand[k]]["blk"], "split_from_double_balloon", False) or getattr(plans[cand[k]]["blk"], "linked_lobe_region", None) is not None for k in g):
                 continue  # protect independent sizing and regions of two-lobe dialogue
             balloon_groups.append([cand[k] for k in g])
         for g in balloon_groups:
