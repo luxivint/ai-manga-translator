@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import base64
 import cv2
 import json
@@ -2423,12 +2424,65 @@ def _do_render_and_save(
     saved_paths = save_rendered_output(renderer, out_path)
     verify_output_dims(saved_paths, image)
     apply_page_stamp_to_outputs(saved_paths, path, args, idx + 1)
+    _mark_output_complete(path, out_path, args)
     return out_path
 
 
+def _output_path(path: Path, output_dir: Path, args: argparse.Namespace) -> Path:
+    ext = path.suffix if args.output_format == "source" else f".{args.output_format.lstrip('.')}"
+    return output_dir / f"{path.stem}{args.suffix}{ext}"
+
+
+def _resume_fingerprint(path: Path, args: argparse.Namespace) -> str:
+    """Invalidate local resume when source, relevant settings or code changes.
+
+    Secrets are deliberately excluded. The source is hashed to avoid false
+    resumes after a file is replaced while retaining its name and timestamp.
+    """
+    h = hashlib.sha256()
+    with path.open("rb") as source:
+        for chunk in iter(lambda: source.read(1 << 20), b""):
+            h.update(chunk)
+    for key, value in sorted(os.environ.items()):
+        if key.startswith(("RENDER_", "CLEAN_", "MASK_", "SEG_", "FONT_", "LIGHT_", "BUBBLE_")) or key in {
+            "OCR", "DETECTION_BACKEND", "DETECTOR", "TRANSLATOR", "SOURCE_LANG", "TARGET_LANG",
+            "UPPERCASE", "MIN_FONT_SIZE", "MAX_FONT_SIZE", "RENDER_V2",
+        }:
+            h.update(f"{key}={value}\n".encode("utf-8"))
+    for name in ("scripts/local_batch.py", "modules/rendering/render_v2.py",
+                 "modules/inpainting/white_bubble.py", "modules/ocr/qwen_grid_ocr.py",
+                 "modules/translation/llm/base.py", "modules/translation/llm/gpt.py"):
+        file = ROOT / name
+        if file.exists():
+            stat = file.stat()
+            h.update(f"{name}:{stat.st_size}:{stat.st_mtime_ns}\n".encode("utf-8"))
+    for value in (args.source_lang, args.target_lang, args.translator, args.ocr,
+                  args.output_format, args.suffix, args.detector):
+        h.update(str(value).encode("utf-8"))
+        h.update(b"\0")
+    return h.hexdigest()
+
+
+def _mark_output_complete(source: Path, output: Path, args: argparse.Namespace) -> None:
+    import json
+    marker = output.with_name(output.name + ".complete.json")
+    record = {"source": source.name, "fingerprint": _resume_fingerprint(source, args)}
+    temp = marker.with_suffix(marker.suffix + ".tmp")
+    temp.write_text(json.dumps(record), encoding="utf-8")
+    os.replace(temp, marker)
+
+
 def _already_done(path: Path, output_dir: Path, args: argparse.Namespace) -> bool:
-    output_ext = path.suffix if args.output_format == "source" else f".{args.output_format.lstrip('.')}"
-    return (output_dir / f"{path.stem}{args.suffix}{output_ext}").exists()
+    out = _output_path(path, output_dir, args)
+    if not out.is_file() or out.stat().st_size == 0:
+        return False
+    if os.environ.get("RESUME_VERIFY_FINGERPRINT", "true").lower() != "true":
+        return True
+    marker = out.with_name(out.name + ".complete.json")
+    try:
+        return json.loads(marker.read_text(encoding="utf-8")).get("fingerprint") == _resume_fingerprint(path, args)
+    except (OSError, ValueError):
+        return False
 
 
 @trace.traced("render.passthrough", page_arg="path")
