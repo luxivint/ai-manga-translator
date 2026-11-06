@@ -91,6 +91,21 @@ class WhiteBalloonInteriorTests(unittest.TestCase):
         outline = _outline_guard(image, bubble)
         self.assertFalse(np.any(np.any(output != image, axis=2) & outline))
 
+    def test_full_interior_is_reported_as_safe_skip_candidate(self):
+        image, boxes, bubble = self.page()
+        details = {}
+        _, count = clean_white_balloons(image, image, [block(boxes[0], bubble)], details=details)
+        self.assertEqual(count, 1)
+        self.assertIn(tuple(bubble), details.get("full_balloons", set()))
+
+    def test_fallback_does_not_claim_safe_full_interior(self):
+        image = np.full((420, 550, 3), 255, np.uint8)
+        cv2.ellipse(image, (220, 200), (180, 130), 0, 0, 360, (0, 0, 0), 4)
+        cv2.putText(image, "SPEECH", (130, 200), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 0), 3)
+        details = {}
+        clean_white_balloons(image, image, [block([100, 150, 330, 230], [40, 30, 450, 345])], details=details)
+        self.assertNotIn((40, 30, 450, 345), details.get("full_balloons", set()))
+
     def test_single_balloon_is_cleaned(self):
         image, boxes, bubble = self.page()
         out, count = clean_white_balloons(image, image, [block(boxes[0], bubble)])
