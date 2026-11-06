@@ -1896,6 +1896,13 @@ def process_image(path: Path, output_dir: Path, args: argparse.Namespace) -> Pat
     cleaned = restore_untranslated_regions(image, cleaned, blocks)
 
     print("[5/6] render", flush=True)
+    # Verified plain-white bubble interiors are filled independently of YOLO's
+    # glyph mask, before the normal typesetter measures the cleaned backdrop.
+    if parse_bool(os.environ.get("CLEAN_WHITE_BALLOON_INTERIOR", "true")):
+        from modules.inpainting.white_bubble import clean_white_balloons
+        cleaned, white_cleaned = clean_white_balloons(image, cleaned, blocks)
+        if white_cleaned:
+            print(f"  [clean-white-interior] {white_cleaned} balloon(s) repainted", flush=True)
     cleaned, text_items_state = build_text_items_state(blocks, image, cleaned, args, main)
 
     renderer = ImageSaveRenderer(cleaned)
@@ -2402,6 +2409,13 @@ def _do_render_and_save(
         print(f"  [{idx+1}/{n_total}] passthrough: {out_path.name}", flush=True)
         return out_path
 
+    # Verified plain-white bubble interiors are filled independently of YOLO's
+    # glyph mask, before the normal typesetter measures the cleaned backdrop.
+    if parse_bool(os.environ.get("CLEAN_WHITE_BALLOON_INTERIOR", "true")):
+        from modules.inpainting.white_bubble import clean_white_balloons
+        cleaned, white_cleaned = clean_white_balloons(image, cleaned, blocks)
+        if white_cleaned:
+            print(f"  [clean-white-interior] {white_cleaned} balloon(s) repainted", flush=True)
     cleaned, text_items_state = build_text_items_state(blocks, image, cleaned, args, main)
     with trace.span("render.draw"):
         debug_dump_items(path.name, text_items_state)
