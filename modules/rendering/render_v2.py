@@ -721,6 +721,8 @@ def prepare_balloon_blocks(blocks, orig_boxes, image, cleaned=None):
         srcs = [(getattr(blocks[i], "text", "") or "") for i in cand]
         for grp in bcl.overlap_chain_groups([boxes[i] for i in cand], srcs):
             idx = [cand[k] for k in grp]
+            if any(getattr(blocks[i], "split_from_double_balloon", False) for i in idx):
+                continue  # never rejoin OCR pieces from separate lobes
             done, parts = "", []
             for pos, i in enumerate(idx):
                 t = blocks[i].translation.strip()
