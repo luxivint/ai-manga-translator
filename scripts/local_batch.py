@@ -2289,13 +2289,9 @@ def _batch_translate_all(page_results: list, args: argparse.Namespace) -> None:
         for bi, batch_keys in enumerate(batches):
             results.update(_translate_one_batch(bi, batch_keys))
     else:
-        saved_max_tokens = engine.max_tokens  # translate_keyed temporarily raises it; undo any drift
-        try:
-            with ThreadPoolExecutor(max_workers=concurrency) as tpool:
-                for part in trace.map_in_context(tpool, _translate_gated, list(enumerate(batches))):
-                    results.update(part)
-        finally:
-            engine.max_tokens = saved_max_tokens
+        with ThreadPoolExecutor(max_workers=concurrency) as tpool:
+            for part in trace.map_in_context(tpool, _translate_gated, list(enumerate(batches))):
+                results.update(part)
 
     # Güvenlik ağı: GPT bir reklamı kaçırsa bile, blok metninde açık bir
     # domain / URL / davet kodu varsa reklam say (kendi markamız hariç).
