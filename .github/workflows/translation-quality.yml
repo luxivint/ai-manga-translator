@@ -1,0 +1,42 @@
+name: Translation quality gates
+
+on:
+  push:
+    branches:
+      - fix/double-balloon-ocr-layout
+  pull_request:
+    paths:
+      - "modules/**"
+      - "scripts/**"
+      - "tests/**"
+      - ".github/workflows/translation-quality.yml"
+
+jobs:
+  geometry-and-safety:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    env:
+      QT_QPA_PLATFORM: offscreen
+      USE_GPU: "false"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - name: Install project dependencies
+        run: python -m pip install -r requirements.txt
+      - name: Verify modified files compile
+        run: python -m compileall -q modules scripts tests
+      - name: Run balloon/OCR/cache/translation regression tests
+        run: |
+          python -m unittest -v \
+            tests.test_ocr_completeness \
+            tests.test_double_balloon_regions \
+            tests.test_linked_lobes \
+            tests.test_white_balloon_interior \
+            tests.test_gateway_cache_isolation \
+            tests.test_gateway_cache \
+            tests.test_translate_consistency \
+            tests.test_balloon_layout \
+            tests.test_upload_verify
