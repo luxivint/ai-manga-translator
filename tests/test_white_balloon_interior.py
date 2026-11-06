@@ -101,6 +101,9 @@ class WhiteBalloonInteriorTests(unittest.TestCase):
     def test_fallback_does_not_claim_safe_full_interior(self):
         image = np.full((420, 550, 3), 255, np.uint8)
         cv2.ellipse(image, (220, 200), (180, 130), 0, 0, 360, (0, 0, 0), 4)
+        # Intentionally open the TOP arc so the white interior leaks into the
+        # white page. A closed ellipse must legitimately count as full.
+        cv2.rectangle(image, (175, 50), (265, 100), (255, 255, 255), -1)
         cv2.putText(image, "SPEECH", (130, 200), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 0), 3)
         details = {}
         clean_white_balloons(image, image, [block([100, 150, 330, 230], [40, 30, 450, 345])], details=details)
