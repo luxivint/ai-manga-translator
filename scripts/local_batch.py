@@ -1905,6 +1905,7 @@ def process_image(path: Path, output_dir: Path, args: argparse.Namespace) -> Pat
         if white_cleaned:
             print(f"  [clean-white-interior] {white_cleaned} balloon(s) repainted", flush=True)
     cleaned, text_items_state = build_text_items_state(blocks, image, cleaned, args, main)
+    _audit_quality(path, image, cleaned, blocks, text_items_state)
 
     renderer = ImageSaveRenderer(cleaned)
     renderer.add_state_to_image({"text_items_state": text_items_state})
@@ -2442,6 +2443,7 @@ def _do_render_and_save(
         if white_cleaned:
             print(f"  [clean-white-interior] {white_cleaned} balloon(s) repainted", flush=True)
     cleaned, text_items_state = build_text_items_state(blocks, image, cleaned, args, main)
+    _audit_quality(path, image, cleaned, blocks, text_items_state)
     with trace.span("render.draw"):
         debug_dump_items(path.name, text_items_state)
 
@@ -2454,6 +2456,22 @@ def _do_render_and_save(
     apply_page_stamp_to_outputs(saved_paths, path, args, idx + 1)
     _mark_output_complete(path, out_path, args)
     return out_path
+
+
+def _audit_quality(path: Path, original: np.ndarray, cleaned: np.ndarray, blocks, items) -> None:
+    """Best-effort diagnostics, never edits rendered output or fails a page."""
+    if not parse_bool(os.environ.get("QUALITY_REPORT_ENABLED", "false")):
+        return
+    try:
+        from modules.rendering.quality_audit import write_report
+        root = Path(os.environ.get("QUALITY_REPORT_DIR", "work/quality"))
+        job = re.sub(r"[^a-zA-Z0-9_-]", "_", os.environ.get("TRANSLATION_CHAPTER_ID", "local"))
+        output = root / job / f"{path.stem}.json"
+        report = write_report(output, original, cleaned, blocks, items)
+        if report["warnings"]:
+            print(f"  [quality] {path.name}: {len(report['warnings'])} warning(s) in {output}", flush=True)
+    except Exception as exc:
+        print(f"  [quality] report failed for {path.name}: {exc}", flush=True)
 
 
 def _output_path(path: Path, output_dir: Path, args: argparse.Namespace) -> Path:
