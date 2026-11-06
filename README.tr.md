@@ -1,3 +1,30 @@
+## Kalite kapıları ve güvenli yayın (2026-11)
+
+Bu branch'teki yeni kontroller isteğe bağlı raporlama dışında mevcut görselleri değiştirmez:
+
+- **OCR:** Her crop ID'si tam bir kez gelmelidir. Eksik bir balon sessizce boş kabul edilmez; sayfa yeniden denenir / hata olarak işaretlenir.
+- **Çift balon:** Aynı detection kutusundaki ayrı metinler OCR kimliklerini korur; kaynağı değiştirmeden iki lobiye yerleştirilir.
+- **Temizlik:** Beyaz balonun tam içi kanıtlanırsa modelden bağımsız temizlenir. Açık sınırda sınırlı fallback kullanılır.
+- **Yayın:** Worker ham R2'yi yalnızca public URL kontrolü gerçekten başarılıysa siler; kontrol kapalıysa veya ağ hatası varsa kaynak korunur.
+- **Resume:** Girdi, ilgili kod veya render ayarları değişirse sayfa eski çıktıya bakılarak atlanmaz.
+- **Paralel çeviri:** İsteklerin çıktı token limitleri thread bazında izole edilir.
+
+Yerel kalite raporları için:
+
+```dotenv
+QUALITY_REPORT_ENABLED=true
+QUALITY_REPORT_DIR=work/quality
+RESUME_VERIFY_FINGERPRINT=true
+```
+
+Raporlar `work/quality/<bölüm-kimliği>/<sayfa>.json` altında tutulur. Bu uyarılar **otomatik yayın engeli değildir**; görseli kontrol etmek için yardımcı tanılardır.
+
+Yalnızca **tamamı kapalı, tek renk beyaz balonlardan** oluşan sayfalarda YOLO segmenterini atlamak için `CLEAN_SKIP_SEGMENTER_WHITE_ONLY=true` kullanılabilir. Bu ayar deneysel olarak **varsayılan kapalıdır**; gerçek bölümler üzerinde kalite/süre karşılaştırması yapılmadan üretimde açılmamalıdır.
+
+Ayrıca `tests/test_ocr_completeness.py`, `tests/test_white_balloon_interior.py`, `tests/test_quality_audit.py`, `tests/test_upload_verify.py` ve GitHub Actions `translation-quality.yml` yeni regresyon kapılarını içerir. Sadece testlerin repoda bulunması geçtikleri anlamına gelmez; PR kontrollerini ve gerçek kaynak sayfa çıktısını ayrı doğrulayın.
+
+---
+
 > Current translation worker: **CV2-only**, API detection, no neural inpainter or post-clean rescans. See [CV2-CLEANER.md](CV2-CLEANER.md).
 
 # manga-translation
