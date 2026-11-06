@@ -3042,7 +3042,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--no-outline", action="store_true", default=os.environ.get("NO_OUTLINE", "false").lower() == "true")
     parser.add_argument("--r2-input-prefix", default=os.environ.get("R2_INPUT_PREFIX", ""))
     parser.add_argument("--r2-output-prefix", default=os.environ.get("R2_OUTPUT_PREFIX", ""))
-    parser.add_argument("--r2-delete-input", action=argparse.BooleanOptionalAction, default=os.environ.get("R2_DELETE_RAW_AFTER_TRANSLATE", "true").lower() == "true")
+    parser.add_argument("--r2-delete-input", action=argparse.BooleanOptionalAction, default=os.environ.get("R2_DELETE_RAW_AFTER_TRANSLATE", "false").lower() == "true")
     parser.add_argument("--r2-workdir", default=os.environ.get("R2_WORKDIR", "work/r2"))
     parser.add_argument("--r2-keep-workdir", action="store_true", default=os.environ.get("R2_KEEP_WORKDIR", "false").lower() == "true")
     parser.add_argument("--zip-output", action=argparse.BooleanOptionalAction, default=os.environ.get("ZIP_OUTPUT", "false").lower() == "true",
