@@ -1,8 +1,8 @@
 """Local on-disk cache for gateway (9router / OpenAI-compatible) answers, so retries and re-runs never re-spend tokens.
 
-The key is the SHA-256 of (cache version, call kind, URL path, exact request body). The body already holds the model, the
+The key is the SHA-256 of (cache version, call kind, endpoint URL, exact request body). The body already holds the model, the
 system + user prompt (= the prompt version), the source text and the images, so any change of text, prompt, model or
-image is a different key. Headers (API keys) and the host are NOT part of the key and nothing secret is ever written:
+image is a different key. Headers (API keys) are not part of the key and nothing secret is ever written:
 a cache file only holds the answer JSON the gateway returned.
 
 Only answers the CALLER accepted are stored (OCR: parsed list; translation: parsed JSON with all keys), see
@@ -22,7 +22,7 @@ import time
 from pathlib import Path
 from urllib.parse import urlparse
 
-CACHE_VERSION = 1
+CACHE_VERSION = 2
 _PURGED: set[str] = set()
 _LOCK = threading.Lock()
 
@@ -46,7 +46,11 @@ def _ttl_seconds() -> float:
 def make_key(kind: str, url: str, data) -> str:
     body = bytes(data) if isinstance(data, (bytes, bytearray)) else str(data).encode("utf-8")
     h = hashlib.sha256()
-    h.update(f"v{CACHE_VERSION}\0{kind}\0{urlparse(url).path}\0".encode("utf-8"))
+    parsed = urlparse(url)
+    # Provider origin matters: two compatible gateways can respond differently
+    # to the same model/prompt. Never include credentials or query tokens.
+    endpoint = f"{parsed.scheme.lower()}://{parsed.netloc.lower()}{parsed.path}"
+    h.update(f"v{CACHE_VERSION}\0{kind}\0{endpoint}\0".encode("utf-8"))
     h.update(body)
     return h.hexdigest()
 
