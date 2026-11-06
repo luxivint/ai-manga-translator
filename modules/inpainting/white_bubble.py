@@ -76,8 +76,12 @@ def _interior(original, bubble_box, text_boxes):
     return (x1, y1, x2, y2), inside > 0, fill
 
 
-def clean_white_balloons(original, cleaned, blocks):
-    """Fill verified white interiors; preserve outlines and untranslated text."""
+def clean_white_balloons(original, cleaned, blocks, details=None):
+    """Fill verified white interiors; preserve outlines and untranslated text.
+
+    Optional details dict records full-area successes separately from weaker
+    text-box fallbacks, allowing a safe YOLO bypass only for proven interiors.
+    """
     result = cleaned.copy()
     groups = {}
     for block in blocks or []:
@@ -102,6 +106,8 @@ def clean_white_balloons(original, cleaned, blocks):
             continue
         (x1, y1, x2, y2), mask, fill = safe
         result[y1:y2, x1:x2][mask] = fill
+        if details is not None:
+            details.setdefault("full_balloons", set()).add(bubble)
         repainted += 1
     return result, repainted
 
