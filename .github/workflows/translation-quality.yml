@@ -30,13 +30,6 @@ jobs:
         run: python -m compileall -q modules scripts tests
       - name: Run balloon/OCR/cache/translation regression tests
         run: |
-          python -m unittest -v \
-            tests.test_ocr_completeness \
-            tests.test_double_balloon_regions \
-            tests.test_linked_lobes \
-            tests.test_white_balloon_interior \
-            tests.test_gateway_cache_isolation \
-            tests.test_gateway_cache \
-            tests.test_translate_consistency \
-            tests.test_balloon_layout \
-            tests.test_upload_verify
+          for name in ocr_completeness double_balloon_regions linked_lobes white_balloon_interior gateway_cache_isolation gateway_cache translate_consistency balloon_layout upload_verify; do
+            python -m unittest discover -v -s tests -p "test_${name}.py"
+          done
