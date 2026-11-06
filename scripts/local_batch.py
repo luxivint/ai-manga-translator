@@ -2381,7 +2381,7 @@ def _stage_clean(task: tuple) -> tuple:
                 if getattr(b, "text_class", None) == "text_bubble"
                 and getattr(b, "bubble_xyxy", None) is not None
                 and not getattr(b, "is_ad", False)}
-        if eligible and len(keys) and len(keys) <= len(eligible) and all(
+        if eligible and len(eligible) == len(blocks) and len(keys) and len(keys) <= len(eligible) and all(
             getattr(b, "text_class", None) == "text_bubble"
             and getattr(b, "bubble_xyxy", None) is not None
             and not getattr(b, "is_ad", False) for b in eligible
