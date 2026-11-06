@@ -2369,13 +2369,38 @@ def _stage_clean(task: tuple) -> tuple:
     suppress_noisy_ocr_blocks(blocks, args.source_lang)
     strip_translation_garbage_letters(blocks)
     debug_dump_blocks("after-clean-translate", blocks, page=Path(path).name)
-    mask = build_segmenter_mask(image, blocks, require_translation=True)
-    if mask.sum() == 0:
-        cleaned = image.copy()
+    # Opt-in fast path: when EVERY translated target is a fully enclosed,
+    # uniformly white speech balloon, YOLO cannot improve the already proven
+    # fill. Never bypass for a fallback wipe, art, a free-text region or ad.
+    white_only = False
+    precleaned = None
+    if parse_bool(os.environ.get("CLEAN_SKIP_SEGMENTER_WHITE_ONLY", "false")) and blocks:
+        eligible = [b for b in blocks if len((getattr(b, "translation", "") or "").strip()) > 1]
+        keys = {tuple(int(v) for v in b.bubble_xyxy) for b in eligible
+                if getattr(b, "text_class", None) == "text_bubble"
+                and getattr(b, "bubble_xyxy", None) is not None
+                and not getattr(b, "is_ad", False)}
+        if eligible and len(keys) and len(keys) <= len(eligible) and all(
+            getattr(b, "text_class", None) == "text_bubble"
+            and getattr(b, "bubble_xyxy", None) is not None
+            and not getattr(b, "is_ad", False) for b in eligible
+        ):
+            from modules.inpainting.white_bubble import clean_white_balloons
+            info = {}
+            precleaned, _ = clean_white_balloons(image, image, blocks, details=info)
+            white_only = keys.issubset(info.get("full_balloons", set()))
+    if white_only:
+        cleaned = precleaned
+        mask = np.zeros(image.shape[:2], dtype=np.uint8)
+        print(f"  [clean] {path.name}: fully white speech balloons, YOLO skipped", flush=True)
     else:
-        cleaned = clean_selected(image, mask, config)
-        cleaned = watermark_lib.flat_fill(image, cleaned, watermark_clear_mask(image, blocks))
-        _dump_clean_debug(path, image, mask)
+        mask = build_segmenter_mask(image, blocks, require_translation=True)
+        if mask.sum() == 0:
+            cleaned = image.copy()
+        else:
+            cleaned = clean_selected(image, mask, config)
+            cleaned = watermark_lib.flat_fill(image, cleaned, watermark_clear_mask(image, blocks))
+            _dump_clean_debug(path, image, mask)
     assert cleaned.shape == image.shape, f"cleaned shape {cleaned.shape} != page {image.shape}"
     cleaned = restore_untranslated_regions(image, cleaned, blocks)
     print(f"  clean [{idx+1}] {path.name}: OK", flush=True)
