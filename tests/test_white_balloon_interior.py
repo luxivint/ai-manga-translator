@@ -57,6 +57,40 @@ class WhiteBalloonInteriorTests(unittest.TestCase):
         self.assertFalse(np.any(changed & (border > 0)))
         np.testing.assert_array_equal(out[415, 40:845], image[415, 40:845])
 
+
+    def test_open_white_surrounding_page_uses_text_box_fallback(self):
+        # Touching double balloons on white paper can make the bright connected
+        # component touch the detector box edge. The old full-contour cleaner
+        # silently rejected it, leaving all missed YOLO glyphs in place.
+        image = np.full((420, 550, 3), 255, np.uint8)
+        image[282:, :] = (195, 202, 216)
+        cv2.rectangle(image, (65, 280), (510, 411), (38, 38, 38), 3)
+        shape = np.zeros(image.shape[:2], np.uint8)
+        cv2.ellipse(shape, (210, 160), (143, 104), 0, 0, 360, 255, -1)
+        cv2.ellipse(shape, (362, 240), (128, 98), 0, 0, 360, 255, -1)
+        image[shape > 0] = 255
+        contours, _ = cv2.findContours(shape, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        cv2.drawContours(image, contours, -1, (0, 0, 0), 4)
+        cv2.putText(image, "WHAT IS", (133, 134), cv2.FONT_HERSHEY_SIMPLEX,
+                    .78, (0, 0, 0), 2, cv2.LINE_AA)
+        cv2.putText(image, "HAPPENING", (115, 167), cv2.FONT_HERSHEY_SIMPLEX,
+                    .72, (0, 0, 0), 2, cv2.LINE_AA)
+        cv2.putText(image, "ANOTHER", (300, 224), cv2.FONT_HERSHEY_SIMPLEX,
+                    .75, (0, 0, 0), 2, cv2.LINE_AA)
+        cv2.putText(image, "SENTENCE", (294, 257), cv2.FONT_HERSHEY_SIMPLEX,
+                    .72, (0, 0, 0), 2, cv2.LINE_AA)
+        bubble = [65, 55, 490, 345]
+        blocks = [block([110, 108, 293, 180], bubble),
+                  block([286, 196, 443, 267], bubble)]
+        output, count = clean_white_balloons(image, image, blocks)
+        self.assertGreater(count, 0)
+        self.assertGreater(int(output[134, 148].min()), 238)
+        self.assertGreater(int(output[225, 322].min()), 238)
+        np.testing.assert_array_equal(output[385:400, 80:500], image[385:400, 80:500])
+        from modules.inpainting.white_bubble import _outline_guard
+        outline = _outline_guard(image, bubble)
+        self.assertFalse(np.any(np.any(output != image, axis=2) & outline))
+
     def test_single_balloon_is_cleaned(self):
         image, boxes, bubble = self.page()
         out, count = clean_white_balloons(image, image, [block(boxes[0], bubble)])
