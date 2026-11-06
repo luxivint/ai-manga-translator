@@ -1914,6 +1914,7 @@ def process_image(path: Path, output_dir: Path, args: argparse.Namespace) -> Pat
     print(f"[6/6] save: {out_path}", flush=True)
     saved_paths = save_rendered_output(renderer, out_path)
     apply_page_stamp_to_outputs(saved_paths, path, args)
+    _mark_output_complete(path, out_path, args)
     return out_path
 
 
