@@ -41,6 +41,11 @@ The current Latin-dialogue profile preserves Korean/CJK sound effects instead of
 - **Inspect actual progress.** Per-job logs, heartbeats and stage timings distinguish a live process from useful work.
 - **Review the image.** Automated QA flags are diagnostics, not a substitute for checking real chapter pages.
 
+The recut target/soft height is a preference. Long illustration spans can use
+safe rows up to the actual hard limit, with future cut reachability checked
+before selecting a row. Protected lettering and the 8,000-pixel limit remain
+intact. If no safe path exists, the error identifies the affected strip rows.
+
 ## Costs: what is actually measured?
 
 There is no reliable fixed “price per chapter”. Page height, dialogue density, model, retries, detection windows, source verification and cache hits all change usage.

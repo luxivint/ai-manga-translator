@@ -185,6 +185,50 @@ def choose_cuts(height, bands, target=2000, minimum=800, soft_max=3600):
     return cuts + [height]
 
 
+def supplement_cuts(cuts, bands, *, target, minimum, hard_max):
+    """Complete oversized gutter spans using only proven unprotected rows.
+
+    The soft target is a preference, not a second hard ceiling. Compute future
+    reachability before picking a row: a locally attractive cut must not leave
+    a protected span unreachable or the next safe row below the minimum size.
+    The final piece may be shorter than minimum, matching choose_cuts.
+    """
+    expanded, added = [cuts[0]], []
+    for end in cuts[1:]:
+        origin = expanded[-1]
+        length = end-origin
+        if length <= hard_max:
+            expanded.append(end)
+            continue
+        allowed = np.zeros(length+1, dtype=bool)
+        for a, b in bands:
+            lo, hi = max(1, a-origin), min(length, b-origin)
+            if lo < hi:
+                allowed[lo:hi] = True
+        allowed[0] = allowed[-1] = True
+        reachable = np.zeros(length+1, dtype=bool)
+        reachable[-1] = True
+        count = 0
+        for y in range(length-1, -1, -1):
+            if y+minimum <= length:
+                count += int(reachable[y+minimum])
+            if y+hard_max+1 <= length:
+                count -= int(reachable[y+hard_max+1])
+            reachable[y] = allowed[y] and (length-y <= hard_max or count > 0)
+        if not reachable[0]:
+            raise RecutError(f'No safe cut within {hard_max}px in strip rows {origin}:{end} '
+                             f'(span {length}px). Raw images kept; no protected region was cut.')
+        start = 0
+        while length-start > hard_max:
+            lo, hi = start+minimum, min(length-1, start+hard_max)
+            candidates = np.flatnonzero(reachable[lo:hi+1])+lo
+            y = int(candidates[np.argmin(np.abs(candidates-(start+target)))])
+            expanded.append(origin+y); added.append(origin+y)
+            start = y
+        expanded.append(end)
+    return expanded, added
+
+
 
 def detect_windows(strip, starts, detect, window, workers):
     """Only the coordinator reads the strip cache. At most workers image arrays live."""
@@ -273,24 +317,8 @@ def prepare(paths, workspace, detect, *, target=2000, minimum=800, soft_max=3600
             # Prefer gutters, but an uninterrupted illustration need not be blank.
             # Only supplement oversized spans with rows outside every detected balloon/text.
             fallback_bands = safe_bands(~protected)
-            expanded = [cuts[0]]
-            fallback_cuts = []
-            for end in cuts[1:]:
-                while end - expanded[-1] > hard_max:
-                    start = expanded[-1]
-                    candidates = []
-                    for a, b in fallback_bands:
-                        lo, hi = max(a, start + minimum), min(b - 1, start + soft_max, end - minimum)
-                        if lo <= hi:
-                            candidates.append(min(max(start + target, lo), hi))
-                    if not candidates:
-                        break
-                    y = min(candidates, key=lambda y: abs(y - start - target))
-                    expanded.append(y); fallback_cuts.append(y)
-                expanded.append(end)
-            cuts = expanded
-            if any(b - a > hard_max for a, b in zip(cuts, cuts[1:])):
-                raise RecutError(f'No safe cut within {hard_max}px. Raw images kept; inspect this chapter or disable safe recut explicitly.')
+            cuts, fallback_cuts = supplement_cuts(cuts, fallback_bands, target=target,
+                                                  minimum=minimum, hard_max=hard_max)
             if any(protected[y] for y in cuts[1:-1]):
                 raise RecutError('Cut intersects a protected text/bubble region')
         images = []

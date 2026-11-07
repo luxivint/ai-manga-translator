@@ -41,6 +41,11 @@ Mevcut Latin diyalog profilinde Korece/CJK ses efektleri uydurma Latin metinlere
 - **Gerçek ilerlemeyi izleme:** İş günlükleri, heartbeat ve aşama süreleri, açık bir işlemle ilerleyen bir işi ayırt eder.
 - **Görsel kontrol:** Otomatik kalite uyarıları yardımcı tanıdır; gerçek sayfalara bakmanın yerini tutmaz.
 
+Güvenli kesimde hedef/soft yükseklik bir tercihtir. Uzun çizim alanlarında kesim
+araması gerçek hard sınıra kadar devam eder; sonraki parçaların da güvenle
+kesilebileceği doğrulanır. Balon/metin koruması veya 8.000 piksel sınırı aşılmaz.
+Güvenli yol gerçekten yoksa hata, sorunlu kaynak satırı aralığını bildirir.
+
 ## Maliyetler: neyi gerçekten biliyoruz?
 
 Sabit bir “bölüm başı ücret” vermek doğru olmaz. Sayfa yüksekliği, diyalog yoğunluğu, model, yeniden denemeler, tespit pencereleri, kaynak kontrolü ve önbellek kullanımı maliyeti değiştirir.

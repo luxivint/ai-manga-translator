@@ -17,6 +17,25 @@ from scripts.safe_recut import VerticalStrip, RecutError, prepare, choose_cuts, 
 
 
 class RecutTests(unittest.TestCase):
+    def test_long_protected_span_can_use_safe_row_beyond_soft_target(self):
+        from scripts.safe_recut import supplement_cuts
+        cuts, extra = supplement_cuts([0, 12000], [(0, 2976), (8836, 12000)],
+                                     target=2000, minimum=800, hard_max=8000)
+        self.assertEqual(cuts[0], 0)
+        self.assertEqual(cuts[-1], 12000)
+        self.assertTrue(extra)
+        self.assertLessEqual(max(b-a for a,b in zip(cuts,cuts[1:])), 8000)
+        self.assertTrue(all(y < 2976 or y >= 8836 for y in cuts[1:-1]))
+
+    def test_safe_cut_search_looks_ahead_past_minimum_length_trap(self):
+        from scripts.safe_recut import supplement_cuts
+        cuts, _ = supplement_cuts([0, 3000], [(890, 911), (990, 1011),
+                                  (1690, 1711), (2490, 2511)],
+                                  target=1000, minimum=800, hard_max=1000)
+        self.assertEqual(cuts[-1], 3000)
+        self.assertTrue(all(800 <= b-a <= 1000 for a,b in zip(cuts,cuts[1:-1])))
+        self.assertLessEqual(cuts[-1]-cuts[-2], 1000)
+
     def test_virtual_strip_crop_across_seam_and_cache_bound(self):
         with tempfile.TemporaryDirectory() as work:
             paths = []
