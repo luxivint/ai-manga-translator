@@ -36,7 +36,7 @@ class NineRouterGridOCRTests(unittest.TestCase):
         response = SimpleNamespace(
             status_code=200,
             json=lambda: {
-                "choices": [{"message": {"content": '[{"id":1,"text":"Hello there"}]'}}],
+                "choices": [{"message": {"content": '[{"id":1,"text":"Hello there","original_text":"Hello there","script":"latin","kind":"dialogue"}]'}}],
                 "usage": {"prompt_tokens": 10, "completion_tokens": 3, "total_tokens": 13},
             },
         )

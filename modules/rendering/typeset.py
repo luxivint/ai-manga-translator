@@ -270,7 +270,10 @@ def _fit(text, measure, box_w, box_h, max_size, min_size, floor, pad, hyphenate)
     avail_w = max(1.0, box_w - 2 * pad)
     avail_h = max(1.0, box_h - 2 * pad)
     best_effort = None
+    orphan_fallback = None
     for size in range(int(max_size), int(floor) - 1, -1):
+        if orphan_fallback is not None and size < .88 * orphan_fallback[1]:
+            return orphan_fallback
         width, line_h = measure(size)
         cands = balanced_lines(text, width, avail_w, hyphenate=hyphenate)
         fitting = []
@@ -285,7 +288,17 @@ def _fit(text, measure, box_w, box_h, max_size, min_size, floor, pad, hyphenate)
             # prefer lower normalised raggedness, then fewer lines
             fitting.sort(key=lambda t: (round(t[0], 3), t[1]))
             _, _, lines, w, h = fitting[0]
-            return "\n".join(lines), size, w + 2 * pad, h + 2 * pad, False
+            result = ("\n".join(lines), size, w + 2 * pad, h + 2 * pad, False)
+            # Do not strand a tiny opening pronoun/article ('O', 'BU') above a
+            # paragraph when a modest size adjustment can keep it with a word.
+            orphan = (len(text.split()) > 3 and len(lines) > 1 and
+                      len(lines[0].split()) == 1 and len(lines[0].strip('.,!?…')) <= 2)
+            if not orphan:
+                return result
+            if orphan_fallback is None:
+                orphan_fallback = result
+    if orphan_fallback is not None:
+        return orphan_fallback
     if best_effort is None:
         return text, floor, box_w, box_h, True
     lines, size, w, h = best_effort

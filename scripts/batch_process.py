@@ -1,13 +1,36 @@
 """Supervise a batch without blocking the worker heartbeat or a tray output pipe."""
 import os
 import subprocess
+import shutil
+import psutil
 import time
 from pathlib import Path
 
 
+def archive_job_log(path):
+    path = Path(path)
+    if path.is_file() and path.stat().st_size:
+        history = path.parent / 'history'
+        history.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(path, history / f'{path.stem}-{time.time_ns()}.log')
+
+
 def stop_tree(process):
     if os.name == 'nt':
-        subprocess.run(['taskkill', '/PID', str(process.pid), '/T', '/F'], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        # Use process handles instead of depending on an external taskkill
+        # executable. Capture descendants before terminating their parent.
+        try:
+            parent = psutil.Process(process.pid)
+            children = parent.children(recursive=True)
+            for child in reversed(children):
+                try:
+                    child.kill()
+                except psutil.NoSuchProcess:
+                    pass
+        except psutil.NoSuchProcess:
+            pass
+        if process.poll() is None:
+            process.kill()
     else:
         process.kill()
     process.wait(timeout=10)
@@ -50,6 +73,7 @@ class LogActivity:
 
 def run_batch_process(command, cwd, env, log_path, tick=None, stall_seconds=600):
     path = Path(log_path); path.parent.mkdir(parents=True, exist_ok=True)
+    archive_job_log(path)
     with path.open('wb') as output:
         process = subprocess.Popen(command, cwd=cwd, env=env, stdout=output, stderr=subprocess.STDOUT)
         activity = LogActivity(path, forward_timing=True)
@@ -248,6 +272,7 @@ class WarmRunner:
         activity = LogActivity(log_path, forward_timing=True)
         path = Path(log_path)
         path.parent.mkdir(parents=True, exist_ok=True)
+        archive_job_log(path)
         fingerprint = fingerprint if fingerprint is not None else env_fingerprint(env)
         self._ensure(fingerprint)
         events = self.events

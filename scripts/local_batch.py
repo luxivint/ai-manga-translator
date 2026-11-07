@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+from functools import lru_cache
 import base64
 import cv2
 import json
@@ -81,7 +82,8 @@ from modules.utils.openai_endpoint import get_openai_chat_completions_url, get_o
 from scripts.storage import (delete_keys, delete_prefix, download_prefix, list_objects, normalize_key,
                              upload_directory, upload_file)
 from scripts import upload_verify
-from scripts.safe_recut import prepare as prepare_safe_recut
+from scripts.safe_recut import prepare_cached as prepare_safe_recut
+from scripts.page_checkpoint import PageCheckpoints
 
 
 IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".webp", ".bmp"}
@@ -949,6 +951,7 @@ def recover_empty_bubble_text_with_gpt(image: np.ndarray, blocks, args: argparse
         block
         for block in blocks
         if getattr(block, "text_class", None) == "text_bubble" and not (getattr(block, "text", "") or "").strip()
+        and not getattr(block, 'preserve_original', False)
     ]
     if not candidates:
         return
@@ -1022,6 +1025,9 @@ def restore_untranslated_regions(original: np.ndarray, cleaned: np.ndarray, bloc
 
     failed_blocks = []
     for block in blocks:
+        if getattr(block, 'preserve_original', False):
+            failed_blocks.append(block)
+            continue
         translation = (getattr(block, "translation", "") or "").strip()
         if not translation or len(translation) <= 1:
             text = (getattr(block, "text", "") or "").strip()
@@ -1036,6 +1042,12 @@ def restore_untranslated_regions(original: np.ndarray, cleaned: np.ndarray, bloc
     if not failed_blocks:
         return cleaned
     failed_mask = generate_mask(original, failed_blocks)
+    # A large graphic's detector box can brush a genuine caption. Protect the
+    # graphic without restoring English letters over that translated caption.
+    for block in blocks:
+        if not getattr(block, 'preserve_original', False) and (getattr(block, 'translation', '') or '').strip():
+            x1, y1, x2, y2 = clamp_box(*map(int, block.xyxy), original.shape[1], original.shape[0])
+            failed_mask[y1:y2, x1:x2] = 0
     if failed_mask.max() == 0:
         return cleaned
     result = cleaned.copy()
@@ -1085,6 +1097,9 @@ def drop_non_english_ocr_blocks(blocks):
     dropped = 0
     min_latin_ratio = float(os.environ.get("NON_ENGLISH_MIN_LATIN_RATIO", "0.35"))
     for block in blocks:
+        if getattr(block, 'preserve_original', False):
+            kept.append(block)
+            continue
         text = (getattr(block, "text", "") or "").strip()
         if text and _has_cjk_or_hangul(text) and _latin_signal_ratio(text) < min_latin_ratio:
             dropped += 1
@@ -1122,6 +1137,9 @@ def prune_ocr_blocks(blocks, image: np.ndarray | None = None):
     dropped_duplicate = 0
 
     for block in blocks:
+        if getattr(block, 'preserve_original', False):
+            kept.append(block)
+            continue
         text = (getattr(block, "text", "") or "").strip()
         if drop_empty and not text:
             dropped_empty += 1
@@ -1756,8 +1774,11 @@ def build_text_items_state(blocks, image: np.ndarray, cleaned: np.ndarray, args:
 
     target_code = get_language_code(args.target_lang)
     render_settings = main.render_settings()
-    v2 = render_v2.render_v2_enabled() and not any(is_vertical_block(b, target_code) for b in blocks)
+    v2 = render_v2.render_v2_enabled() and not any(is_vertical_block(b, target_code) for b in blocks
+        if (getattr(b, 'translation', '') or '').strip() and not getattr(b, 'preserve_original', False))
     orig_boxes = [np.array(b.xyxy).copy() for b in blocks]
+    from modules.inpainting.flat_caption import clean_flat_dark_captions
+    cleaned = clean_flat_dark_captions(image, cleaned, blocks)
     if v2:
         pass  # casing is decided per block style in V2 (RENDER_CASING=upper|keep|auto, default auto)
     else:
@@ -1905,6 +1926,7 @@ def process_image(path: Path, output_dir: Path, args: argparse.Namespace) -> Pat
         if white_cleaned:
             print(f"  [clean-white-interior] {white_cleaned} balloon(s) repainted", flush=True)
     cleaned, text_items_state = build_text_items_state(blocks, image, cleaned, args, main)
+    cleaned = restore_untranslated_regions(image, cleaned, blocks)
     _audit_quality(path, image, cleaned, blocks, text_items_state)
 
     renderer = ImageSaveRenderer(cleaned)
@@ -2432,6 +2454,7 @@ def _do_render_and_save(
                 src = src.convert("RGBA" if "A" in src.getbands() else "RGB")
             save_image_for_format(src, out_path)
         apply_page_stamp(out_path, path, args, idx + 1)
+        _mark_output_complete(path, out_path, args)
         print(f"  [{idx+1}/{n_total}] passthrough: {out_path.name}", flush=True)
         return out_path
 
@@ -2443,6 +2466,7 @@ def _do_render_and_save(
         if white_cleaned:
             print(f"  [clean-white-interior] {white_cleaned} balloon(s) repainted", flush=True)
     cleaned, text_items_state = build_text_items_state(blocks, image, cleaned, args, main)
+    cleaned = restore_untranslated_regions(image, cleaned, blocks)
     _audit_quality(path, image, cleaned, blocks, text_items_state)
     with trace.span("render.draw"):
         debug_dump_items(path.name, text_items_state)
@@ -2475,38 +2499,79 @@ def _audit_quality(path: Path, original: np.ndarray, cleaned: np.ndarray, blocks
 
 
 def _output_path(path: Path, output_dir: Path, args: argparse.Namespace) -> Path:
-    ext = path.suffix if args.output_format == "source" else f".{args.output_format.lstrip('.')}"
-    return output_dir / f"{path.stem}{args.suffix}{ext}"
+    output_format = getattr(args, 'output_format', 'webp')
+    ext = path.suffix if output_format == "source" else f".{output_format.lstrip('.')}"
+    return output_dir / f"{path.stem}{getattr(args, 'suffix', '_translated')}{ext}"
 
 
-def _resume_fingerprint(path: Path, args: argparse.Namespace) -> str:
-    """Invalidate local resume when source, relevant settings or code changes.
-
-    Secrets are deliberately excluded. The source is hashed to avoid false
-    resumes after a file is replaced while retaining its name and timestamp.
-    """
+@lru_cache(maxsize=1)
+def _pipeline_code_fingerprint():
+    """Include helper modules too, so a font/lobe fix cannot replay old bad artwork."""
     h = hashlib.sha256()
-    with path.open("rb") as source:
-        for chunk in iter(lambda: source.read(1 << 20), b""):
-            h.update(chunk)
+    files = {ROOT / 'scripts/local_batch.py', ROOT / 'scripts/page_checkpoint.py',
+             ROOT / 'modules/utils/textblock.py', ROOT / 'modules/utils/merged_blocks.py'}
+    for directory in ('detection', 'ocr', 'rendering', 'inpainting', 'translation'):
+        files.update((ROOT / 'modules' / directory).rglob('*.py'))
+    for file in sorted(files):
+        if file.is_file():
+            h.update(file.relative_to(ROOT).as_posix().encode())
+            h.update(hashlib.sha256(file.read_bytes()).digest())
+    return h.digest()
+
+
+def _processing_fingerprint(args):
+    h = hashlib.sha256(_pipeline_code_fingerprint())
     for key, value in sorted(os.environ.items()):
-        if key.startswith(("RENDER_", "CLEAN_", "MASK_", "SEG_", "FONT_", "LIGHT_", "BUBBLE_")) or key in {
+        if key.startswith(("RENDER_", "CLEAN_", "MASK_", "SEG_", "FONT_", "LIGHT_", "BUBBLE_",
+                           "OCR_", "QWEN_", "DETECTION_", "AD_", "STAMP_", "BATCH_TRANSLATE_",
+                           "TRANSLATE_")) or key in {
             "OCR", "DETECTION_BACKEND", "DETECTOR", "TRANSLATOR", "SOURCE_LANG", "TARGET_LANG",
             "UPPERCASE", "MIN_FONT_SIZE", "MAX_FONT_SIZE", "RENDER_V2",
+            "OPENAI_BASE_URL", "OPENAI_MODEL", "DASHSCOPE_BASE_URL", "DASHSCOPE_MODEL",
+            "TRANSLATION_MANGA_ID", "TRANSLATION_CHAPTER_ID", "EXTRA_CONTEXT",
         }:
             h.update(f"{key}={value}\n".encode("utf-8"))
-    for name in ("scripts/local_batch.py", "modules/rendering/render_v2.py",
-                 "modules/inpainting/white_bubble.py", "modules/ocr/qwen_grid_ocr.py",
-                 "modules/translation/llm/base.py", "modules/translation/llm/gpt.py"):
-        file = ROOT / name
-        if file.exists():
-            stat = file.stat()
-            h.update(f"{name}:{stat.st_size}:{stat.st_mtime_ns}\n".encode("utf-8"))
-    for value in (args.source_lang, args.target_lang, args.translator, args.ocr,
-                  args.output_format, args.suffix, args.detector):
+    for name in ('source_lang', 'target_lang', 'translator', 'ocr', 'output_format', 'suffix', 'detector',
+                 'extra_context', 'font', 'font_file', 'min_font_size', 'max_font_size', 'uppercase',
+                 'resolved_font', 'stamp_enabled', 'stamp_path', 'stamp_every_pages', 'stamp_opacity',
+                 'hd_strategy', 'resize_limit', 'gpu'):
+        value = getattr(args, name, None)
         h.update(str(value).encode("utf-8"))
         h.update(b"\0")
     return h.hexdigest()
+
+
+def _resume_fingerprint(path: Path, args: argparse.Namespace) -> str:
+    """Content/settings/code identity; never records credentials in checkpoint files."""
+    h = hashlib.sha256(_processing_fingerprint(args).encode())
+    with path.open('rb') as source:
+        for chunk in iter(lambda: source.read(1 << 20), b''):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def _stage_checkpoint_fingerprint(path, args, crop=None):
+    return hashlib.sha256((_resume_fingerprint(path, args) + json.dumps(crop)).encode()).hexdigest()
+
+
+def _stage_detect_ocr_resumable(task):
+    idx, path, args, crop = task
+    directory = getattr(args, 'checkpoint_dir', None)
+    if not directory:
+        return _stage_detect_ocr(task)
+    fingerprint = _stage_checkpoint_fingerprint(path, args, crop)
+    checkpoints = PageCheckpoints(directory)
+    cached = checkpoints.load('ocr', path, fingerprint)
+    if cached is not None:
+        print(f'[RESUME OCR] [{idx+1}] {path.name}: verified checkpoint; detection/OCR skipped', flush=True)
+        return idx, path, *cached
+    result = _stage_detect_ocr(task)
+    if not result[4].get('ocr_failed'):
+        try:
+            checkpoints.save('ocr', path, fingerprint, result[2], result[3], result[4])
+        except (OSError, TypeError, ValueError) as exc:
+            print(f'[CHECKPOINT WARNING] {path.name}: {type(exc).__name__}; processing continues', flush=True)
+    return result
 
 
 def _mark_output_complete(source: Path, output: Path, args: argparse.Namespace) -> None:
@@ -2631,13 +2696,12 @@ def _rate_translation_quality(page_results: list, args: argparse.Namespace) -> f
 
 
 def _stage_clean_safe(task: tuple) -> tuple:
-    """_stage_clean with exception fallback: returns original image as cleaned on failure."""
+    """Keep the successful earlier stages, but never certify a failed clean as passthrough."""
     try:
         return _stage_clean(task)
     except Exception as exc:
         idx, path, image, blocks, args = task
-        print(f"  clean FAILED [{idx+1}] {path.name}: {exc}, passthrough", file=sys.stderr, flush=True)
-        return idx, path, image, [], image.copy()
+        raise BatchValidationError(f'clean failed on {path.name}: {exc}') from exc
 
 
 class BatchValidationError(RuntimeError):
@@ -2672,7 +2736,7 @@ def enforce_page_failures(what: str, names: list, total: int) -> None:
 def rerun_failed_ocr(phase1: list, tasks: list, run=None, cooldown: float | None = None, sleep=None) -> tuple[list, list]:
     """After phase 1: wait for the gateway to calm down, then re-run the OCR-failed pages ONE AT A TIME.
     Returns (updated phase1, names of pages that are still failed)."""
-    run = run or _stage_detect_ocr
+    run = run or _stage_detect_ocr_resumable
     sleep = sleep or time.sleep
     failed_idx = [r[0] for r in phase1 if r[4].get("ocr_failed")]
     if not failed_idx:
@@ -2782,22 +2846,32 @@ def process_all_batched(images: list[Path], output_dir: Path, args: argparse.Nam
 
     # ── GPT-Vision: ilk/son N sayfada reklam bölgelerini bul (üst%/alt%) ─────
     gateway.raise_if_quota()
-    ad_regions = detect_ad_regions(pending, args)
+    # Preserve chapter edge positions when only a few pages need resuming.
+    # A middle page must not become an ad candidate because other pages passed.
+    all_ad_regions = detect_ad_regions(images, args)
     gateway.raise_if_quota()
     # Kırpınca %8'den az içerik kalan sayfalar tam reklam -> tamamen atla.
-    vision_ad_pages = {i for i, (t, b) in ad_regions.items() if (100 - t - b) < 8}
+    all_vision_ad_pages = {i for i, (t, b) in all_ad_regions.items() if (100 - t - b) < 8}
     # OCR'sız şerit dedektörü: Vision yüzdesi banner'ın gerçek kenarını kaçırınca (örn. %46 yerine %54) kalan şeridi keser.
-    banner_strips = detect_banner_strips(pending, vision_ad_pages)
+    all_banner_strips = detect_banner_strips(images, all_vision_ad_pages)
+    original_indices = {str(p): i for i, p in enumerate(images)}
+    pending_indices = {i: original_indices[str(p)] for i, p in enumerate(pending)}
+    ad_regions = {i: all_ad_regions[j] for i, j in pending_indices.items() if j in all_ad_regions}
+    vision_ad_pages = {i for i, j in pending_indices.items() if j in all_vision_ad_pages}
+    banner_strips = {i: all_banner_strips[j] for i, j in pending_indices.items() if j in all_banner_strips}
 
     # ── Faz 1: Parallel detect + OCR (reklam bölgesi kırpılmış görselde) ─────
-    w1 = _dynamic_workers(base_workers)
+    # Network OCR capacity is independent of CPU-heavy cleaning parallelism.
+    w1 = int(os.environ.get('BATCH_OCR_WORKERS', str(_dynamic_workers(base_workers))))
+    if not 1 <= w1 <= 8:
+        raise ValueError('BATCH_OCR_WORKERS must be between 1 and 8')
     print(f"\n[BATCH] Faz 1/3  detect+ocr  {len(pending)} sayfa  {w1} worker", flush=True)
     t1 = time.perf_counter()
     phase1_tasks = [(i, p, args, None if i in vision_ad_pages else
                      (*ad_regions.get(i, (0, 0)), *banner_strips[i]) if i in banner_strips else ad_regions.get(i))
                     for i, p in enumerate(pending)]
     with ThreadPoolExecutor(max_workers=w1) as pool:
-        phase1 = list(trace.map_in_context(pool, _stage_detect_ocr, phase1_tasks))
+        phase1 = list(trace.map_in_context(pool, _stage_detect_ocr_resumable, phase1_tasks))
     gateway.raise_if_quota()
     phase1, ocr_failed_pages = rerun_failed_ocr(phase1, phase1_tasks)
     # Fail BEFORE spending translate/clean time on a result that must not be published.
@@ -2811,9 +2885,37 @@ def process_all_batched(images: list[Path], output_dir: Path, args: argparse.Nam
     # ── Faz 2: Batch translate ───────────────────────────────────────────────
     n_text = sum(1 for _, _, bl in page_results if any(b.text for b in bl))
     if n_text:
-        print(f"\n[BATCH] Faz 2/3  batch translate  {n_text} sayfa metinli  1 GPT call", flush=True)
+        print(f"\n[BATCH] Faz 2/3  batch translate  {n_text} sayfa metinli; istek sayısı aşağıda", flush=True)
         t2 = time.perf_counter()
-        _batch_translate_all(page_results, args)
+        translated = []
+        checkpoint_dir = getattr(args, 'checkpoint_dir', None)
+        checkpoints = PageCheckpoints(checkpoint_dir) if checkpoint_dir else None
+        # Translation depends on the whole chapter's OCR context. Bind every
+        # page checkpoint to all ordered page fingerprints and OCR blocks.
+        if checkpoints:
+            context = hashlib.sha256()
+            signatures_complete = True
+            # Use ALL chapter pages, including already-rendered ones. A render
+            # retry for one page must retain its original translation context.
+            for i, path in enumerate(images):
+                crop = (None if i in all_vision_ad_pages else
+                        (*all_ad_regions.get(i, (0, 0)), *all_banner_strips[i])
+                        if i in all_banner_strips else all_ad_regions.get(i))
+                fingerprint = _stage_checkpoint_fingerprint(path, args, crop)
+                signature = checkpoints.signature('ocr', path, fingerprint)
+                signatures_complete &= signature is not None
+                context.update(fingerprint.encode())
+                context.update((signature or 'missing').encode())
+            translation_key = context.hexdigest()
+            if signatures_complete:
+                translated = [checkpoints.load('translated', p, translation_key) for p, _, _ in page_results]
+            else:
+                checkpoints = None
+        if translated and all(row is not None for row in translated):
+            page_results = [(old[0], row[0], row[1]) for old, row in zip(page_results, translated)]
+            print(f'[RESUME TRANSLATE] verified {len(page_results)} pages; translation skipped', flush=True)
+        else:
+            _batch_translate_all(page_results, args)
         print(f"[BATCH] Faz 2 bitti: {time.perf_counter()-t2:.1f}s", flush=True)
 
         quality_threshold = float(os.environ.get("QUALITY_SCORE_RETRY_THRESHOLD", "2.5"))
@@ -2834,6 +2936,12 @@ def process_all_batched(images: list[Path], output_dir: Path, args: argparse.Nam
         unresolved = unresolved_translation_pages(page_results, args.source_lang)
         enforce_page_failures("translation unresolved", unresolved, len(pending))
         degraded += [n for n in unresolved if n not in degraded]
+        if checkpoints and not unresolved:
+            for path, image, blocks in page_results:
+                try:
+                    checkpoints.save('translated', path, translation_key, image, blocks, {})
+                except (OSError, TypeError, ValueError) as exc:
+                    print(f'[CHECKPOINT WARNING] {path.name}: {type(exc).__name__}', flush=True)
     else:
         print(f"\n[BATCH] Faz 2/3  translate atlandi (metin bulunamadi)", flush=True)
 
@@ -2986,13 +3094,17 @@ def seo_upload_name(prefix: str, page_number: int, extension: str) -> str:
 
 
 @trace.traced("storage.prepare_upload")
-def prepare_seo_upload_dir(output_dir: Path, out_prefix: str, work_dir: Path) -> Path:
+def prepare_seo_upload_dir(output_dir: Path, out_prefix: str, work_dir: Path,
+                           expected_stems: set[str] | None = None) -> Path:
     seo_dir = work_dir / "seo-upload"
     if seo_dir.exists():
         shutil.rmtree(seo_dir)
     seo_dir.mkdir(parents=True, exist_ok=True)
 
     images = iter_images(output_dir)
+    if expected_stems is not None:
+        images = [p for p in images if p.stem in expected_stems or
+                  re.sub(r'_part\d+$', '', p.stem) in expected_stems]
     for index, image in enumerate(images, start=1):
         target = seo_dir / seo_upload_name(out_prefix, index, image.suffix)
         shutil.copy2(image, target)
@@ -3068,9 +3180,10 @@ def main() -> int:
     app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
     args.resolved_font = resolve_font(args)
 
-    # Fresh processing outputs prevent resume from using translations of old cuts.
-    with tempfile.TemporaryDirectory(prefix="manga-safe-recut-") as work:
-        return run_batch(args, app, Path(work))
+    # Actual recut generations are content-addressed. Failed jobs retain their
+    # successful pieces/OCR/translation checkpoints across worker restarts.
+    work = ROOT / 'work' / 'resume'
+    return run_batch(args, app, work)
 
 
 @trace.traced("pipeline.run")
@@ -3084,8 +3197,6 @@ def run_batch(args, app, recut_work: Path) -> int:
         chapter_work = ROOT / args.r2_workdir / r2_work_name(args.r2_input_prefix)
         input_dir = (chapter_work / "input").resolve()
         output_dir = (chapter_work / "output").resolve()
-        if chapter_work.exists() and not args.r2_keep_workdir:
-            shutil.rmtree(chapter_work)
         input_dir.mkdir(parents=True, exist_ok=True)
         output_dir.mkdir(parents=True, exist_ok=True)
         print(f"R2 download: {args.r2_input_prefix} -> {input_dir}", flush=True)
@@ -3101,12 +3212,18 @@ def run_batch(args, app, recut_work: Path) -> int:
         print("OPENAI_API_KEY missing. Put it in .env or set it as an environment variable.", file=sys.stderr)
         return 2
 
-    images = iter_images(input_dir)
+    # Retained local files removed remotely must never reappear in a chapter.
+    images = list(downloaded) if using_r2 else iter_images(input_dir)
     if not images:
         print(f"FAILED: No input images found in {input_dir}; R2 upload/delete skipped", flush=True)
         return EXIT_VALIDATION_FAILED
 
     final_output_dir = output_dir
+    if using_r2:
+        # Hashed chapter namespaces live under a short path. Long manga slugs
+        # must not push PNG/JSON checkpoint filenames past Windows MAX_PATH.
+        recut_work = ROOT / 'work' / 'resume'
+    args.checkpoint_dir = output_dir.parent / ('.checkpoints-' + output_dir.name)
     recut_active = bool(args.safe_recut)
     if recut_active:
         if input_dir == final_output_dir:
@@ -3122,18 +3239,27 @@ def run_batch(args, app, recut_work: Path) -> int:
                 def detect_protected(image):
                     bubbles, texts = engine._detect_single_image(image)
                     return {'bubbles':list(bubbles),'texts':list(texts)}
-                plan = prepare_safe_recut(images, recut_work / "input", detect_protected,
+                plan = prepare_safe_recut(images, recut_work, detect_protected,
                     target=args.recut_target_height, minimum=min(800, args.recut_target_height // 2),
                     soft_max=max(args.recut_target_height, min(3600, args.recut_max_height)),
                     hard_max=args.recut_max_height,
+                    detector_identity=getattr(engine, 'reuse_identity', None),
                     workers=gateway.detection_concurrency() if getattr(engine, "parallel_safe", False) else 1)
             finally:
                 engine.confidence_threshold = old_threshold
             images = plan.images
+            recut_work = getattr(plan, 'workspace', None) or recut_work
+            # Geometry reuse and processing reuse have different identities.
+            # A new OCR/render build gets a fresh output generation instead of
+            # mixing corrected images with old skipped ads or stale overlays.
+            generation = hashlib.sha256((str(recut_work.resolve()) + '\0' + str(plan.digest) +
+                '\0' + repr(plan.cuts) + '\0' + _processing_fingerprint(args)).encode()).hexdigest()[:32]
+            stage_work = ROOT / 'work' / 'stages' / generation
+            args.checkpoint_dir = stage_work / 'checkpoints'
             if getattr(plan,'detections',None) is not None and getattr(engine,'reuse_identity',None):
                 args.recut_detection_context={'identity':engine.reuse_identity,
                     'records':{str(path.resolve()):plan.detections[path.name] for path in images}}
-            output_dir = recut_work / "output"
+            output_dir = stage_work / "output"
             output_dir.mkdir(parents=True, exist_ok=True)
         except Exception as exc:
             app.quit()
@@ -3207,7 +3333,8 @@ def run_batch(args, app, recut_work: Path) -> int:
 
     if using_r2 and failed == 0:
         out_prefix = args.r2_output_prefix or translated_prefix(args.r2_input_prefix)
-        upload_dir = prepare_seo_upload_dir(output_dir, out_prefix, chapter_work)
+        expected_stems = {_output_path(p, output_dir, args).stem for p in images}
+        upload_dir = prepare_seo_upload_dir(output_dir, out_prefix, chapter_work, expected_stems)
         print(f"R2 upload: {upload_dir} -> {out_prefix}", flush=True)
         # Overwrite in place (same SEO names) instead of emptying the folder first: the published chapter keeps
         # working while pages upload, and a failed upload can no longer leave it pointing at deleted images.
@@ -3232,8 +3359,15 @@ def run_batch(args, app, recut_work: Path) -> int:
         elif args.r2_delete_input:
             deleted = delete_prefix(args.r2_input_prefix)
             print(f"R2 raw deleted: {deleted} objects", flush=True)
-        if not args.r2_keep_workdir:
+        if not args.r2_keep_workdir and not parse_bool(os.environ.get('PIPELINE_KEEP_CHECKPOINTS', 'true')):
             shutil.rmtree(chapter_work, ignore_errors=True)
+            cache_root = (ROOT / 'work' / 'resume').resolve()
+            cache_work = recut_work.resolve()
+            if recut_active and cache_work != cache_root and cache_work.is_relative_to(cache_root):
+                shutil.rmtree(cache_work, ignore_errors=True)
+            stages_root = (ROOT / 'work' / 'stages').resolve()
+            if recut_active and stage_work.resolve() != stages_root and stage_work.resolve().is_relative_to(stages_root):
+                shutil.rmtree(stage_work, ignore_errors=True)
     elif using_r2 and failed:
         print("R2 upload/delete skipped because translation had failures.", file=sys.stderr, flush=True)
 

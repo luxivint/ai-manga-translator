@@ -1161,7 +1161,8 @@ def build_items(blocks, image, cleaned, orig_boxes, render_settings, alignment, 
         if region is None:
             region = free_region(blk, W, H, obox, tight=style in {"sign", "phone"})
         shaped = False
-        if is_bubble and inner is not None and style not in {"sfx", "shout", "title"}:
+        if (is_bubble and inner is not None and style not in {"sfx", "shout", "title"}
+                and getattr(blk, 'linked_lobe_region', None) is None):
             cnts, _ = cv2.findContours(inner.astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
             pts = np.concatenate(cnts) if cnts else None
             hull_area = float(cv2.contourArea(cv2.convexHull(pts))) if pts is not None else 0.0
@@ -1175,7 +1176,11 @@ def build_items(blocks, image, cleaned, orig_boxes, render_settings, alignment, 
                     a_hull = float(cv2.contourArea(cv2.convexHull(apts))) if apts is not None else 0.0
                     if a_hull > 0 and float(alt_inner.sum()) / a_hull >= 0.88:
                         region, inner, ioff, hull_area = alt_r, alt_inner, alt_off, 0.0
-            if hull_area > 0 and float(inner.sum()) / hull_area < 0.88:
+            bb_area = max(1.0, float((blk.bubble_xyxy[2]-blk.bubble_xyxy[0]) *
+                                     (blk.bubble_xyxy[3]-blk.bubble_xyxy[1])))
+            # A large, continuous spiky balloon is legitimately non-convex.
+            # Its source lettering box must not turn it into a narrow column.
+            if hull_area > 0 and float(inner.sum()) / hull_area < 0.88 and float(inner.sum()) < 0.35 * bb_area:
                 # ragged flood fill (translucent hologram, textured panel): the balloon shape is not trustworthy, so
                 # the text may only use the footprint of the original lettering (+12% sideways, +45% vertically)
                 ox1, oy1, ox2, oy2 = [float(v) for v in obox]
@@ -1351,16 +1356,14 @@ def build_items(blocks, image, cleaned, orig_boxes, render_settings, alignment, 
             cap = max_size if not target else max(FLOOR_SIZE, min(MAX_TARGET_SIZE, int(math.ceil(target * grow))))
             best = fit_once(plan, region, cap)
             plan["fit_region"] = region
-        if plan["bubble"] and plan["inner"] is not None and best[1] < cap:
+        if plan["bubble"] and plan["inner"] is not None:
             # balloons are ellipses: the largest rectangle is narrow and tall. Try wider layouts and
             # keep one only if every laid-out line still lies inside the balloon interior.
-            for fw, fh in ((1.2, 1.1), (1.4, 1.2), (1.6, 1.3)):
+            for fw, fh in ((1.2, 1.0), (1.4, .85), (1.6, .7), (1.8, .6), (1.2, 1.1), (1.4, 1.2), (1.6, 1.3)):
                 wide = widen(region, fw, W, H, fh)
                 cand = fit_once(plan, wide, cap)
-                if cand[1] > best[1] and lines_inside(plan, cand[0], cand[1], wide, line_spacing):
+                if (cand[1] > best[1] or (cand[1] == best[1] and cand[0].count('\n') < best[0].count('\n'))) and lines_inside(plan, cand[0], cand[1], wide, line_spacing):
                     best, plan["fit_region"] = cand, wide
-                    if best[1] >= cap:
-                        break
         if plan["bubble"] and "-\n" in best[0] and HYPHEN_KEEP > 0:
             # a word cut by a hyphen ('BAŞVUR-/MUŞTUM'): rewrap unbroken, in the same or a wider part of the balloon, and keep
             # that layout when it costs at most (1 - RENDER_HYPHEN_KEEP) of the size (default 0.75)
@@ -1463,6 +1466,19 @@ def build_items(blocks, image, cleaned, orig_boxes, render_settings, alignment, 
         if os.environ.get("RENDER_GUARD_REWRAP", "true").lower() != "true" or plan["angle"] or plan["list_like"]:
             return None
         cuts = out.count("-\n")  # never trade the shrink for more words cut by a hyphen
+        # A small size adjustment within the same broad paragraph is preferable
+        # to making every word its own row. Always prove clearance first.
+        broad = []
+        for limit in range(size, max(FLOOR_SIZE, int(.88 * size)) - 1, -1):
+            for fw, fh in ((1., 1.), (1.15, .95), (1.3, .9), (1.5, .8)):
+                reg2 = widen(plan['fit_region'], fw, W, H, fh)
+                cand = fit_once(plan, reg2, limit, no_hyphen=cuts == 0)
+                if (cand[1] >= .88 * size and cand[0].count('\n') <= out.count('\n')
+                        and cand[0].count('-\n') <= cuts
+                        and lines_inside(probe, cand[0], cand[1], reg2, line_spacing, frac)):
+                    broad.append((cand, reg2))
+        if broad:
+            return min(broad, key=lambda entry: (entry[0][0].count('\n'), -entry[0][1]))
         for fw, fh in ((0.88, 1.12), (0.76, 1.25), (0.66, 1.4)):
             reg2 = widen(plan["fit_region"], fw, W, H, fh)
             cand = fit_once(plan, reg2, size, no_hyphen=cuts == 0)
@@ -1499,6 +1515,9 @@ def build_items(blocks, image, cleaned, orig_boxes, render_settings, alignment, 
             plan["strict"] = was
 
     before = [f[1] for f in fits]
+    if os.environ.get('RENDER_DEBUG'):
+        for plan, fitted in zip(plans, fits):
+            print(f"[fit-before-guard] box={plan['obox']} region={plan['fit_region']} size={fitted[1]} text={fitted[0]!r}", flush=True)
     guard_fit()
     if bl.hard_guard_enabled():
         guard_fit(hard=True)

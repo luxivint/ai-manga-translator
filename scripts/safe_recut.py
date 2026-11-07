@@ -11,7 +11,9 @@ import bisect
 from concurrent.futures import ThreadPoolExecutor, wait, FIRST_COMPLETED
 import hashlib
 import json
+import os
 import time
+import uuid
 from collections import OrderedDict
 from dataclasses import dataclass
 from pathlib import Path
@@ -77,6 +79,89 @@ class RecutPlan:
     height: int
     digest: str
     detections: dict | None = None
+    workspace: Path | None = None
+
+
+def _file_hash(path):
+    h = hashlib.sha256()
+    with Path(path).open('rb') as stream:
+        for chunk in iter(lambda: stream.read(1 << 20), b''):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def prepare_cached(paths, workspace, detect, *, detector_identity=None, **settings):
+    """Content-addressed recut cache; never reuses unverified or partial output.
+
+    No Python objects are deserialized. Source bytes, geometry settings,
+    detector identity and recut/detection code determine the cache namespace.
+    Failed attempts remain available for diagnostics, but are never resumed.
+    """
+    paths = list(paths)
+    if not isinstance(detector_identity, str) or not detector_identity:
+        attempt = Path(workspace) / ('g' + uuid.uuid4().hex[:16])
+        plan = prepare(paths, attempt / 'input', detect, **settings)
+        plan.workspace = attempt
+        return plan
+    identity = {'sources': [(p.name, _file_hash(p)) for p in paths],
+                'source_folder': str(paths[0].parent.resolve()) if paths else '',
+                'detector': detector_identity, 'settings': settings,
+                'code': [_file_hash(p) for p in (Path(__file__),
+                         Path(__file__).parents[1] / 'modules/detection/reuse.py',
+                         Path(__file__).parents[1] / 'modules/detection/api.py')]}
+    key = hashlib.sha256(json.dumps(identity, sort_keys=True).encode()).hexdigest()
+    # Keep Windows paths bounded even with long chapter names. The full key
+    # remains in the marker so a truncated-key collision cannot reuse output.
+    root = Path(workspace) / key[:32]
+    root.mkdir(parents=True, exist_ok=True)
+    marker = root / 'complete.json'
+    try:
+        record = json.loads(marker.read_text(encoding='utf8'))
+        if record['fingerprint'] != key:
+            raise ValueError('Recut fingerprint mismatch')
+        attempt_name = record['attempt']
+        if not isinstance(attempt_name, str) or not attempt_name.startswith('g') or \
+                len(attempt_name) != 17 or any(c not in '0123456789abcdef' for c in attempt_name[1:]):
+            raise ValueError('Invalid attempt directory')
+        attempt = root / attempt_name
+        manifest_path = attempt / 'input/recut-manifest.json'
+        manifest = json.loads(manifest_path.read_text(encoding='utf8'))
+        images = [attempt / 'input' / f'recut-{i:05d}.png' for i in range(1, len(manifest['cuts']))]
+        required = [manifest_path, *images]
+        detection_file = attempt / 'input/recut-detection.json'
+        if record.get('typed'):
+            required.append(detection_file)
+        for path in required:
+            if _file_hash(path) != record['files'][path.relative_to(attempt).as_posix()]:
+                raise ValueError('Recut file checksum mismatch')
+        detections = json.loads(detection_file.read_text(encoding='utf8')) if record.get('typed') else None
+        print(f'[RECUT RESUME] verified {len(images)} pieces; scan/API/write skipped', flush=True)
+        return RecutPlan(images, manifest['cuts'], manifest['width'], manifest['height'],
+                         manifest['source_sha256'], detections, attempt)
+    except (OSError, ValueError, KeyError, TypeError):
+        pass
+    attempt = root / ('g' + uuid.uuid4().hex[:16])
+    plan = prepare(paths, attempt / 'input', detect, **settings)
+    plan.workspace = attempt
+    files = [*plan.images, attempt / 'input/recut-manifest.json']
+    if plan.detections is not None:
+        files.append(attempt / 'input/recut-detection.json')
+    record = {'fingerprint': key, 'attempt': attempt.name, 'typed': plan.detections is not None,
+              'files': {p.relative_to(attempt).as_posix(): _file_hash(p) for p in files}}
+    temporary = root / ('complete-' + uuid.uuid4().hex + '.tmp')
+    temporary.write_text(json.dumps(record), encoding='utf8')
+    os.replace(temporary, marker)
+    return plan
+
+
+def uniform_rows(pixels):
+    """Only compute expensive standard deviations for low-range candidate rows."""
+    a = np.asarray(pixels, dtype=np.uint8)
+    candidate = (a.max(axis=1) - a.min(axis=1)).max(axis=1) <= 22
+    result = np.zeros(len(a), dtype=bool)
+    if candidate.any():
+        result[candidate] = a[candidate].std(axis=1).max(axis=1) <= 3.5
+    return result
 
 
 def safe_bands(uniform, minimum=24):
@@ -152,16 +237,15 @@ def prepare(paths, workspace, detect, *, target=2000, minimum=800, soft_max=3600
             for top in range(0, strip.height, 2048):
                 with strip.crop(top, min(strip.height, top + 2048)) as crop:
                     digest.update(crop.tobytes())
-                    a = np.asarray(crop, dtype=np.int16)
-                    span = (a.max(axis=1) - a.min(axis=1)).max(axis=1)
-                    std = a.std(axis=1).max(axis=1)
-                    uniform[top:top + len(a)] = (span <= 22) & (std <= 3.5)
+                    uniform[top:top + crop.height] = uniform_rows(crop)
         starts = sorted(set(list(range(0, max(1, strip.height - window + 1), stride)) + [max(0, strip.height - window)]))
         regions = []
         started = time.monotonic()
         by_window={}
         typed_by_window={}
-        print(f'[RECUT] scanning {len(starts)} windows parallel={workers}',flush=True)
+        print(f'[RECUT] scanning {len(starts)} windows parallel={workers} '
+              f'strip={strip.width}x{strip.height} window={window} stride={stride}; '
+              'remote detector latency is included in recut.detect_windows',flush=True)
         with trace.span("recut.detect_windows"):
             for completed,(index,top,height,result) in enumerate(detect_windows(strip,starts,detect,window,workers),1):
                 boxes,typed = window_observations(result,top,height,strip.height,strip.width)
@@ -175,8 +259,10 @@ def prepare(paths, workspace, detect, *, target=2000, minimum=800, soft_max=3600
                         protected[max(0,y1-padding):min(strip.height,y2+padding+1)]=True
                 by_window[index]=current
                 if completed==1 or completed%10==0 or completed==len(starts):
+                    elapsed = time.monotonic()-started
+                    eta = elapsed / completed * (len(starts)-completed)
                     print(f'[RECUT] protect {completed}/{len(starts)} windows '
-                          f'({time.monotonic()-started:.1f}s) parallel={workers}',flush=True)
+                          f'({elapsed:.1f}s) parallel={workers} eta={eta:.0f}s',flush=True)
         # Deterministic manifest/order regardless of API completion order.
         with trace.span("recut.plan_cuts"):
             regions=[box for index in range(len(starts)) for box in by_window[index]]

@@ -48,6 +48,13 @@ class FakeResponse:
 
 
 def ok(content="[]"):
+    try:
+        items = json.loads(content)
+        if isinstance(items, list):
+            content = json.dumps([dict(script='latin', kind='dialogue', original_text=item.get('text', ''), **item)
+                                  for item in items])
+    except (ValueError, TypeError):
+        pass
     return FakeResponse(200, {"choices": [{"message": {"content": content}}], "usage": {}})
 
 
@@ -288,9 +295,10 @@ class OCREngineTests(unittest.TestCase):
         self.assertEqual(out[0].text, "")
         self.assertEqual(fc.sleeps, [])
 
-    def test_empty_array_is_empty_not_failure(self):
-        out, _fc = self.run_ocr([ok("[]")])
-        self.assertEqual(out[0].text, "")
+    def test_empty_array_missing_crop_id_is_failure(self):
+        # An explicit {id:1,text:""} is blank; [] omitted a required crop.
+        with self.assertRaises(OCRFailedError):
+            self.run_ocr([ok("[]"), ok("[]")])
 
     def test_garbage_content_is_failure(self):
         with self.assertRaises(OCRFailedError):

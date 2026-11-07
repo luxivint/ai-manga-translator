@@ -27,7 +27,9 @@ def _best_owner(box, bubbles):
     matches = []
     for index, bubble in enumerate(bubbles):
         shared = _intersection(box, bubble) / max(1.0, _area(box))
-        if shared >= 0.2:
+        cx, cy = _centre(box)
+        centre_inside = bubble[0] <= cx <= bubble[2] and bubble[1] <= cy <= bubble[3]
+        if shared >= 0.55 or (shared >= 0.2 and centre_inside):
             matches.append((shared, -_area(bubble), index))
     return max(matches)[2] if matches else None
 
@@ -69,7 +71,7 @@ def assign_balloon_regions(image: np.ndarray, text_boxes, bubble_boxes):
             if _intersection(box, bubble) >= 0.24 * area
         ]
         overlaps.sort(key=lambda item: item[1], reverse=True)
-        if len(overlaps) == 2:
+        if len(overlaps) == 2 and overlaps[0][1] < 0.90:
             ia, ib = overlaps[0][0], overlaps[1][0]
             a, b = bubbles[ia], bubbles[ib]
             shared = _intersection(a, b)
@@ -99,5 +101,11 @@ def assign_balloon_regions(image: np.ndarray, text_boxes, bubble_boxes):
                         results.extend(parts)
                         continue
         owner = _best_owner(box, bubbles)
+        if owner is not None:
+            from modules.rendering.linked_lobes import split_source_paragraphs
+            parts = split_source_paragraphs(image, box, bubbles[owner])
+            if parts is not None:
+                results.extend((part, bubbles[owner], True) for part in parts)
+                continue
         results.append((box, bubbles[owner] if owner is not None else None, False))
     return results

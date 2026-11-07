@@ -27,6 +27,58 @@ def separated_text_boxes(boxes, bubble):
     return np.linalg.norm(_centre(a)-_centre(b)) > 0.36 * span
 
 
+def split_source_paragraphs(image, text_box, bubble):
+    """Split a merged OCR region only with BOTH a paragraph gap and a two-lobe silhouette.
+
+    Text inside one ordinary oval remains one block, however many rows it has.
+    Runs are measured on the original pixels, before OCR or translation.
+    """
+    from modules.rendering.text_style import row_runs
+    h, w = image.shape[:2]
+    bx1, by1, bx2, by2 = map(int, bubble)
+    bx1, by1, bx2, by2 = max(0, bx1), max(0, by1), min(w, bx2), min(h, by2)
+    x1, y1, x2, y2 = map(int, text_box)
+    x1, y1, x2, y2 = max(bx1, x1), max(by1, y1), min(bx2, x2), min(by2, y2)
+    if x2-x1 < 40 or y2-y1 < 100:
+        return None
+    crop = image[by1:by2, bx1:bx2, :3]
+    if not crop.size:
+        return None
+    bright = ((crop.min(axis=2) > 205) & (crop.max(axis=2)-crop.min(axis=2) < 45)).astype(np.uint8)
+    _, labels = cv2.connectedComponents(bright, connectivity=4)
+    counts = np.bincount(labels[y1-by1:y2-by1, x1-bx1:x2-bx1].ravel())
+    if len(counts) < 2:
+        return None
+    counts[0] = 0
+    comp = (labels == int(counts.argmax())).astype(np.uint8)
+    contours, _ = cv2.findContours(comp, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    interior = np.zeros_like(comp)
+    cv2.drawContours(interior, contours, -1, 1, -1)
+    interior = cv2.erode(interior, np.ones((7, 7), np.uint8))
+    ink = (image[y1:y2, x1:x2, :3].mean(axis=2) < 150) & \
+          interior[y1-by1:y2-by1, x1-bx1:x2-bx1].astype(bool)
+    runs = row_runs(ink, min_height=8)
+    if len(runs) < 4:
+        return None
+    candidates = [(runs[i+1][0]-runs[i][1], i) for i in range(1, len(runs)-2)]
+    if not candidates:
+        return None
+    gap, index = max(candidates)
+    if gap < max(24, 1.2*np.median([b-a for a, b in runs])):
+        return None
+    cut = (runs[index][1] + runs[index+1][0]) // 2
+    boxes = []
+    for top, bottom in [(0, cut), (cut, y2-y1)]:
+        ys, xs = np.nonzero(ink[top:bottom])
+        if not len(xs):
+            return None
+        boxes.append(np.array([max(x1, x1+xs.min()-3), max(y1, y1+top+ys.min()-3),
+                               min(x2, x1+xs.max()+4), min(y2, y1+top+ys.max()+4)], dtype=np.int32))
+    if split_lobe_interiors(interior, (bx1, by1), boxes, bubble) is None:
+        return None
+    return boxes
+
+
 def _peak_near(dist, centre, radius):
     h, w = dist.shape
     x, y = map(int, np.rint(centre))
@@ -80,11 +132,20 @@ def split_lobe_interiors(inner, offset, boxes, bubble):
         x = int(round(a[0]*(1-t)+b[0]*t))
         y = int(round(a[1]*(1-t)+b[1]*t))
         samples.append(float(dist[y, x]))
-    if min(samples) > 0.76 * min(a[2], b[2]):
+    if min(samples) > 0.86 * min(a[2], b[2]):
         return None
     yy, xx = np.ogrid[:h, :w]
-    d0 = (xx-a[0])**2 + (yy-a[1])**2
-    d1 = (xx-b[0])**2 + (yy-b[1])**2
+    # Peaks identify the silhouette, but are poor ownership anchors when one
+    # paragraph is much wider than the other. Distance to the source rectangles
+    # keeps each complete paragraph in its own lobe instead of cutting its left
+    # half off with a diagonal bisector through the original lettering.
+    distances = []
+    for box in boxes:
+        x1, y1, x2, y2 = np.asarray(box, dtype=float) - np.tile(offset, 2)
+        dx = np.maximum(np.maximum(x1-xx, xx-x2), 0)
+        dy = np.maximum(np.maximum(y1-yy, yy-y2), 0)
+        distances.append(dx*dx + dy*dy)
+    d0, d1 = distances
     regions = []
     for part in ((mask.astype(bool) & (d0 <= d1)), (mask.astype(bool) & (d0 > d1))):
         step = max(1, min(h, w)//210)

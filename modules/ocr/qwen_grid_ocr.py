@@ -61,7 +61,13 @@ class QwenGridOCR(OCREngine):
             "If the crop is Korean, Japanese, Chinese, raw SFX, watermark text, or has no readable English text, return an empty string. "
             "Preserve the original wording as much as possible. Use spaces instead of line breaks. "
             "If a crop has no readable text, return an empty string for it. "
-            'Return strict JSON only: [{"id":1,"text":"..."},{"id":2,"text":"..."}].'
+            "For EVERY ID also transcribe original_text VERBATIM in the original writing system, "
+            "and classify script (latin, hangul, han, kana, mixed, none) and kind "
+            "(dialogue, narration, sign, sfx, watermark, other). "
+            "Do not romanize or guess English words from Korean shapes. Large decorative effects are sfx, "
+            "even if a shape resembles 'OF' or 'IN'. Ignore neighbouring captions crossing the crop edge. "
+            'Return strict JSON only: [{"id":1,"original_text":"...","script":"latin",'
+            '"kind":"dialogue","text":"..."}]. Non-Latin and sfx crops must have text="".'
         )
         payload = {
             "model": self.model,
@@ -122,7 +128,25 @@ class QwenGridOCR(OCREngine):
                     flush=True,
                 )
 
-        if self._looks_like_failed_batch(parsed, len(id_to_idx), set(id_to_idx)):
+        failed = self._looks_like_failed_batch(parsed, len(id_to_idx), set(id_to_idx))
+        if failed and not self._looks_like_failed_batch(
+            parsed, len(id_to_idx), set(id_to_idx), check_empty_ratio=False
+        ):
+            # A structurally COMPLETE sheet can legitimately consist of SFX,
+            # Korean text or decoration. Verify its empty crops independently;
+            # do not drop missing IDs or trust a suspicious all-empty sheet.
+            print(f"Qwen grid OCR: verifying blank crops individually ({len(id_to_idx)} total)", flush=True)
+            for item in parsed:
+                if not str(item['text'] or '').strip() and not self._preserve_source(item):
+                    block = blk_list[id_to_idx[int(item['id'])]].deep_copy()
+                    self.process_image(img, [block])
+                    item['text'] = block.text
+                    if getattr(block, 'ocr_source_verified', False):
+                        item.update(script=block.source_script, kind=block.source_kind,
+                                    original_text=block.original_text)
+            failed = False
+
+        if failed:
             # A missing crop ID is not an empty string: it is lost dialogue.
             # Fail the page (and retain its raw source) instead of silently
             # publishing a partly untranslated or misaligned double balloon.
@@ -135,6 +159,13 @@ class QwenGridOCR(OCREngine):
                 f"missing crop IDs {missing}, expected {sorted(id_to_idx)}"
             )
 
+        # Old cache entries without provenance must not bypass source-script
+        # validation on free lettering. Normal legacy dialogue stays compatible.
+        missing = [item for item in parsed if self._needs_source_verification(
+            item, blk_list[id_to_idx[int(item['id'])]])]
+        if missing:
+            self._verify_source_metadata(img, blk_list, id_to_idx, missing)
+
         for item in parsed:
             try:
                 crop_id = int(item.get("id"))
@@ -142,10 +173,87 @@ class QwenGridOCR(OCREngine):
                 continue
             idx = id_to_idx.get(crop_id)
             if idx is not None and 0 <= idx < len(blk_list):
-                blk_list[idx].text = self._normalize_text(str(item.get("text") or ""))
+                block = blk_list[idx]
+                metadata = self._source_metadata(item)
+                block.ocr_source_verified = metadata is not None
+                if metadata:
+                    block.source_script, block.source_kind, block.original_text = metadata
+                block.preserve_original = self._preserve_source(item)
+                block.text = '' if block.preserve_original else self._normalize_text(str(item.get("text") or ""))
+                if block.preserve_original:
+                    block.translation = ''
+                    print(f'OCR source kept: id={crop_id} script={block.source_script} kind={block.source_kind}', flush=True)
 
         self._log_usage(data.get("usage") or {}, seconds, len(blk_list))
         return blk_list
+
+    @staticmethod
+    def _source_metadata(item):
+        script, kind, original = item.get('script'), item.get('kind'), item.get('original_text')
+        if script not in {'latin', 'hangul', 'han', 'kana', 'mixed', 'none'} or \
+                kind not in {'dialogue', 'narration', 'sign', 'sfx', 'watermark', 'other'} or not isinstance(original, str):
+            return None
+        return script, kind, original
+
+    @classmethod
+    def _preserve_source(cls, item):
+        metadata = cls._source_metadata(item)
+        if metadata is None:
+            return False
+        non_latin = bool(re.search(r'[\u1100-\u11ff\u3040-\u30ff\u3400-\u9fff\uac00-\ud7af]', metadata[2]))
+        return non_latin or metadata[0] != 'latin' or metadata[1] in {'sfx', 'watermark', 'other'}
+
+    @classmethod
+    def _needs_source_verification(cls, item, block):
+        if cls._source_metadata(item) is None:
+            return True
+        if cls._preserve_source(item) or getattr(block, 'text_class', '') != 'text_free':
+            return False
+        text = str(item.get('text') or '').strip()
+        box = block.xyxy
+        # A huge isolated 'OF'/'IN' or a couple of words over art is a common
+        # transliteration hallucination. Verify the original independently;
+        # genuine Latin titles/signs remain eligible after that check.
+        return bool(text and len(text.split()) <= 4 and float(box[3])-float(box[1]) >= 96)
+
+    def _verify_source_metadata(self, image, blocks, id_to_idx, items):
+        selected = [blocks[id_to_idx[int(item['id'])]] for item in items]
+        sheet, _ = self._make_sheet(image, selected)
+        prompt = ('Identify the ORIGINAL writing system and role in EACH ID-labelled crop. '
+                  'Transcribe original_text VERBATIM, including Hangul; NEVER translate or romanize. '
+                  'Korean effects can resemble OF or IN: do not interpret those glyphs as English. '
+                  'Report script: latin/hangul/han/kana/mixed/none and '
+                  'kind: dialogue/narration/sign/sfx/watermark/other. '
+                  'Return one JSON object per ID: [{"id":1,"script":"hangul","kind":"sfx","original_text":"..."}].')
+        payload = {'model': self.model, 'temperature': 0,
+            self.max_tokens_parameter: self.max_tokens,
+            'messages': [{'role': 'user', 'content': [
+                {'type': 'image_url', 'image_url': {'url': 'data:image/jpeg;base64,' + self.encode_image(np.asarray(sheet), 'jpg')}},
+                {'type': 'text', 'text': prompt}]}]}
+        for attempt in range(2):
+            try:
+                response = gateway.resilient_post(self.api_base_url,
+                    headers={'Content-Type': 'application/json', 'Authorization': f'Bearer {self.api_key}'},
+                    data=json.dumps(payload), timeout=90, kind='ocr-source', limiter=gateway.ocr_limiter(), cache='manual')
+                response.raise_for_status()
+                data = response.json()
+                verified = self._parse_json(data['choices'][0]['message']['content'])
+                ids = [int(item['id']) for item in verified]
+                if len(ids) != len(items) or set(ids) != set(range(1, len(items)+1)) or \
+                        any(self._source_metadata(item) is None for item in verified):
+                    raise ValueError('incomplete source metadata')
+                by_id = {int(item['id']): item for item in verified}
+                for index, item in enumerate(items, 1):
+                    item.update({key: by_id[index][key] for key in ('script', 'kind', 'original_text')})
+                    if not self._preserve_source(item):
+                        if not item['original_text'].strip():
+                            raise ValueError('Latin text has no original transcription')
+                        item['text'] = item['original_text']
+                gateway.cache_commit()
+                return
+            except (GatewayError, requests.RequestException, ValueError, KeyError, TypeError, IndexError):
+                gateway.cache_discard()
+        raise OCRFailedError('Original script/role could not be verified; source graphics kept')
 
     @staticmethod
     def _is_valid_empty_answer(content: str) -> bool:
@@ -157,6 +265,7 @@ class QwenGridOCR(OCREngine):
         parsed: list[dict[str, Any]],
         crop_count: int,
         expected_ids: set[int] | None = None,
+        *, check_empty_ratio: bool = True,
     ) -> bool:
         """Reject missing, repeated or malformed crop IDs, even for two balloons.
 
@@ -178,13 +287,13 @@ class QwenGridOCR(OCREngine):
             if crop_id not in expected or crop_id in found:
                 return True
             found.add(crop_id)
-            if not str(item["text"] or "").strip():
+            if not str(item["text"] or "").strip() and not QwenGridOCR._preserve_source(item):
                 empty += 1
         if found != expected:
             return True
         # Large sheets with almost exclusively empty reads may be gateway
         # failures; small sheets can legitimately contain an empty bubble.
-        return crop_count > 2 and empty / max(1, crop_count) >= float(
+        return check_empty_ratio and crop_count > 2 and empty / max(1, crop_count) >= float(
             os.environ.get("QWEN_GRID_OCR_RETRY_EMPTY_RATIO", "0.85")
         )
 

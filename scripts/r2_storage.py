@@ -7,6 +7,7 @@ import re
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 
 IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".webp", ".bmp", ".tif", ".tiff", ".avif"}
@@ -102,9 +103,9 @@ def iter_files(root: Path, images_only: bool = False) -> list[Path]:
     return files
 
 
-def upload_file(path: Path, key: str, config: R2Config | None = None) -> dict[str, str | int]:
+def upload_file(path: Path, key: str, config: R2Config | None = None, *, _s3=None) -> dict[str, str | int]:
     config = config or R2Config.from_env()
-    s3 = client(config)
+    s3 = _s3 if _s3 is not None else client(config)
     key = normalize_key(key)
     s3.upload_file(
         str(path),
@@ -119,9 +120,9 @@ def upload_file(path: Path, key: str, config: R2Config | None = None) -> dict[st
     }
 
 
-def put_json(key: str, payload: dict, config: R2Config | None = None) -> dict[str, str | int]:
+def put_json(key: str, payload: dict, config: R2Config | None = None, *, _s3=None) -> dict[str, str | int]:
     config = config or R2Config.from_env()
-    s3 = client(config)
+    s3 = _s3 if _s3 is not None else client(config)
     body = json.dumps(payload, ensure_ascii=False, indent=2).encode("utf-8")
     key = normalize_key(key)
     s3.put_object(Bucket=config.bucket, Key=key, Body=body, ContentType="application/json; charset=utf-8")
@@ -131,10 +132,22 @@ def put_json(key: str, payload: dict, config: R2Config | None = None) -> dict[st
 def upload_directory(local_dir: Path, prefix: str, config: R2Config | None = None) -> dict:
     config = config or R2Config.from_env()
     local_dir = local_dir.resolve()
-    items = []
-    for path in iter_files(local_dir, images_only=True):
-        rel = path.relative_to(local_dir).as_posix()
-        items.append(upload_file(path, normalize_key(prefix, rel), config))
+    workers = int(os.environ.get('R2_UPLOAD_WORKERS', '4'))
+    if not 1 <= workers <= 8:
+        raise ValueError('R2_UPLOAD_WORKERS must be between 1 and 8')
+    paths = iter_files(local_dir, images_only=True)
+    items = [None] * len(paths)
+    # One connection pool per chapter, constructed before any worker starts.
+    # A client per image discarded keep-alive connections and hid progress.
+    s3 = client(config)
+    print(f'R2 upload progress: 0/{len(paths)} workers={workers}', flush=True)
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        pending = {pool.submit(upload_file, path, normalize_key(prefix, path.relative_to(local_dir).as_posix()),
+                               config, _s3=s3): index for index, path in enumerate(paths)}
+        for completed, future in enumerate(as_completed(pending), 1):
+            items[pending[future]] = future.result()
+            if completed % 10 == 0 or completed == len(paths):
+                print(f'R2 upload progress: {completed}/{len(paths)} workers={workers}', flush=True)
 
     manifest = {
         "prefix": normalize_key(prefix),
@@ -142,7 +155,8 @@ def upload_directory(local_dir: Path, prefix: str, config: R2Config | None = Non
         "count": len(items),
         "items": items,
     }
-    manifest["manifest"] = put_json(normalize_key(prefix, "manifest.json"), manifest, config)
+    # Publish the ordered manifest only if every image upload succeeded.
+    manifest["manifest"] = put_json(normalize_key(prefix, "manifest.json"), manifest, config, _s3=s3)
     return manifest
 
 

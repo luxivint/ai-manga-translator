@@ -754,7 +754,19 @@ def row_cap_height(orig: np.ndarray, xyxy) -> float:
     if not mask.any():
         return 0.0
     runs = [b - a for a, b in row_runs(mask, min_height=8)]
-    return float(np.median(runs)) if runs else 0.0
+    local_height = float(np.median(runs)) if runs else 0.0
+    # Adaptive local thresholding can retain only the 8-9px horizontal strokes
+    # of an italic 32px letter. Cross-check a real multi-glyph original mask
+    # before using that fragmented row estimate to shrink the entire balloon.
+    original, _ = ink_mask_original(orig, xyxy)
+    _, stats, ids = components(original)
+    original_rows = [b-a for a, b in row_runs(original, min_height=8)]
+    if len(ids) >= 6 and original_rows and float(original.mean()) < 0.4:
+        row_height = float(np.median(original_rows))
+        letter_height = cap_height(original)
+        if 0.7*row_height <= letter_height <= 1.3*row_height and local_height < 0.6*row_height:
+            return row_height
+    return local_height
 
 
 def looks_merged(groups: list[dict], min_groups: int = 4) -> bool:
