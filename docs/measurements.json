@@ -1,0 +1,38 @@
+{
+  "verified_on": "2026-11-07",
+  "scope": "Sanitized documentation snapshot; no keys, endpoints or database identifiers.",
+  "translation_usage": [
+    {
+      "model": "cx/gpt-6-luna",
+      "operation": "translation",
+      "billing_mode": "subscription",
+      "calls": 55,
+      "input_tokens": 118749,
+      "output_tokens": 12216,
+      "cached_tokens": 0,
+      "recorded_estimate_usd": "0.000000"
+    }
+  ],
+  "translation_usage_scope": "Translation operation only. Detection, OCR, vision and independent source validation are not covered by this aggregate. Zero recorded estimate in subscription mode is not a zero total bill.",
+  "recovered_run": {
+    "raw_images": 257,
+    "recut_pieces": 169,
+    "published_images": 167,
+    "verified_public_urls": 167,
+    "worker_seconds": 996.291,
+    "cache_used": true,
+    "limitation": "Earlier recovery run; predates the latest layout changes. Not a cold-run benchmark or current throughput guarantee."
+  },
+  "visual_review": {
+    "pages": [
+      21,
+      23,
+      26,
+      48,
+      85,
+      95
+    ],
+    "method": "Local production clean/render replay from saved real OCR and translations; no new provider request or publication.",
+    "tests_passed": 573
+  }
+}

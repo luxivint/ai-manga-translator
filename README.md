@@ -1,416 +1,157 @@
-> Current translation worker: **CV2-only**, API detection, no neural inpainter or post-clean rescans. See [CV2-CLEANER.md](CV2-CLEANER.md).
+# Manga Translation
 
-# manga-translation
+**From chapter images to translated, typeset pages — with recovery, visual checks and a publication queue.**
 
-🇬🇧 English | [🇹🇷 Türkçe](README.tr.md)
+English · [Türkçe](README.tr.md) · [Configuration](.env.example) · [CPU / Docker](CV2-CLEANER.md) · [Worker integration](docs/worker-integration.md)
 
-A headless, queue-driven worker that translates manga/comic chapters end to
-end: download raw pages → detect text → OCR → clean bubbles → translate →
-render translated text → upload the result. No GUI, no desktop dependencies
-beyond what's needed to render text offscreen.
+Manga Translation is the translation worker used in the TrendManga workflow. It detects text and balloons, reads dialogue, translates it, removes source lettering and places the translation back into the artwork. Run it on a local image folder, or connect the queue worker to PostgreSQL and S3-compatible storage.
 
-## Speed & cost
+The current English → Turkish profile uses **API detection + vision OCR + LLM translation + local CV2 cleanup + offscreen Qt typesetting**. The text-mask segmenter still uses model weights; “CV2 cleanup” does not mean the entire system is model-free or offline.
 
-Real numbers from translating a 67-page chapter end to end with the
-default engines (RT-DETR v4-s int8 detector, Qwen3-VL-Flash Grid OCR,
-GPT-5.4-mini translation), `BATCH_PIPELINE=true`, 3 parallel workers on a
-plain CPU machine:
+## See the result
 
-| | OCR (Qwen3-VL-Flash) | Translation (GPT-5.4-mini) | Total |
-|---|---|---|---|
-| Tokens (in / out) | 16,234 / 1,723 | 1,629 / 2,000 | 21,586 |
-| Price per 1M tokens (in / out) | $0.10 / $0.40 | $0.75 / $4.50 | — |
-| **Cost for this chapter** | $0.0023 | $0.0102 | **~$0.0125** |
+![Visual walkthrough: source page, detection, OCR, cleaned page and Turkish lettering](assets/examples/pipeline-overview.jpg)
 
-Detection and rendering run locally and cost nothing — the only spend is
-OCR + translation API calls. At roughly $0.0125/chapter, **1,000 chapters
-of this size cost about $12–13 in API usage**. Total wall-clock time for
-this chapter (detect → OCR → clean → translate → render → save) was
-**~90–115 seconds**.
+The illustration above explains the visual states. Runtime batches can overlap stages; translation precedes cleanup so only text selected for translation is erased.
 
-Your own numbers will vary with dialogue density per page and current
-provider pricing. Set `QWEN_GRID_OCR_USAGE_PATH` / `BATCH_TRANSLATE_USAGE_PATH`
-(see `.env.example`) to dump real per-call token usage to a file, or
-`LOG_OPENAI_USAGE=true` with a `DATABASE_URL` for persistent cost tracking
-(see [Configuration](#configuration)).
+### Real layout checks
 
-## Absolute beginner walkthrough (no prior knowledge needed)
+![Six reviewed examples: joined balloons, broad paragraphs and white captions on black](docs/assets/layout-review.png)
 
-If you've never run a Python project before, do exactly this, in order.
+These are real saved chapter pages, reprocessed locally through the production cleaner and renderer on **2026-11-07**. The six examples cover separate writing areas in joined balloons, wider paragraphs in spiky balloons, source-letter cleanup on black and balanced font sizes. They demonstrate the reviewed cases, not a guarantee for every page. This review did not make new OCR requests or publish the chapter.
 
-1. **Install Python.** Go to https://www.python.org/downloads/, download
-   the latest "Python 3.12" installer for your OS, and run it. On Windows,
-   make sure you tick **"Add python.exe to PATH"** during install.
-2. **Download this project.** Click the green "Code" button on GitHub →
-   "Download ZIP", then unzip it anywhere (e.g. your Desktop).
-3. **Open a terminal in that folder.**
-   - Windows: open the unzipped folder in File Explorer, click the address
-     bar, type `cmd`, press Enter.
-   - Mac/Linux: right-click the folder → "Open Terminal here" (or `cd` into
-     it manually).
-4. **Install the project's dependencies** by typing this and pressing
-   Enter:
-   ```
-   pip install -r requirements.txt
-   ```
-   This downloads everything the project needs. It can take a few minutes.
-5. **Create your settings file.** Copy `.env.example` and rename the copy
-   to `.env` (in File Explorer: copy/paste the file, then rename it; on
-   Mac/Linux: `cp .env.example .env`).
-6. **Get a translation API key.** Go to https://platform.openai.com/api-keys,
-   create an account if you don't have one, and create a new API key (it
-   looks like `sk-...`). Open `.env` in any text editor (Notepad is fine),
-   find the line `OPENAI_API_KEY=`, and paste your key right after the `=`
-   with no spaces, e.g. `OPENAI_API_KEY=sk-abc123...`. Save the file.
-   (OpenAI charges a small amount per page translated — a few cents per
-   chapter is typical.)
-7. **Put your images in.** There's an `input` folder in the project — drag
-   and drop your manga page images (jpg/png/webp) into it.
-8. **Run it.** Back in the terminal, type:
-   ```
-   python scripts/local_batch.py
-   ```
-   and press Enter. You'll see progress printed for each page
-   (`detect` → `ocr` → `clean` → `translate` → `render` → `save`).
-9. **Get your result.** When it finishes, open the `output` folder — your
-   translated pages are there. Want everything as a single .zip file
-   instead of loose images? Open `.env`, change `ZIP_OUTPUT=false` to
-   `ZIP_OUTPUT=true`, save, and run step 8 again — you'll get an
-   `output.zip` next to the `output` folder.
+## What the worker does
 
-That's it — no database, no server, no account other than the translation
-API key. Everything below this point is reference documentation for more
-advanced setups (changing the target language, running on a server,
-hooking it into a website, etc.).
-
-It can run two ways:
-
-- **CLI mode** (`scripts/local_batch.py`) — the main, batteries-included
-  way to use this project. Drop images in `input/`, run one command, get
-  translated images in `output/`. No database, no cloud account, no
-  integration work required. This is what most people want.
-- **Worker mode** (`scripts/worker.py`) — an advanced/optional mode that
-  polls a Postgres job queue and writes results back into a website's
-  database. This is how the original author runs it in production,
-  integrated with their own site's schema. It is **not** a drop-in
-  component — see [Worker mode / database integration](#worker-mode--database-integration)
-  before attempting to use it.
-
-Storage and branding are environment-driven, not hardcoded, so the same
-code works for any site name, target language, font, or storage backend.
-
-## Pipeline stages
-
-```
-raw pages (R2 bucket or local disk)
-        │  download
-        ▼
- [1] detect       — find text/bubble regions (RT-DETR ONNX)
-        ▼
- [2] ocr          — read text out of each region
-        ▼
- [3] clean         — remove source text, inpaint/clean the bubble
-        ▼
- [4] translate     — translate each text block (GPT, Gemini, etc.)
-        ▼
- [5] render        — draw translated text back onto the page
-        ▼
- [6] save          — write the translated image (webp/png/jpg)
-        │  upload
-        ▼
-translated pages (R2 bucket or local disk)
-        │
-        ▼ (worker mode only)
-   write chapter_assets / page rows + SEO alt text to DATABASE_URL
-```
-
-## What each stage actually looks like
-
-Still not sure what "detect → ocr → clean → translate → render" means in
-practice? Here's the same page, photographed at every step. (Example page is
-in English; the target language here is Turkish — yours can be anything via
-`TARGET_LANG`.)
-
-| | |
+| Stage | Behavior |
 |---|---|
-| <img src="assets/examples/1-raw.jpg" width="260"><br>**1. Raw page** — exactly what you dropped into `input/`. Untouched. | <img src="assets/examples/2-detect.jpg" width="260"><br>**2. Detect** — the model finds every speech bubble / text area (green boxes). It doesn't know what the text says yet, just *where* it is. |
-| <img src="assets/examples/3-ocr.jpg" width="260"><br>**3. OCR** — each boxed area gets read. The orange text above each box is what the OCR engine thinks it says (here: "GREAT, IT'S A NEW BEGINN...", "NOW THAT"). | <img src="assets/examples/4-cleaned.jpg" width="260"><br>**4. Clean** — the original English text is erased and the bubble is patched back to a plain background, ready for new text. |
-| <img src="assets/examples/5-rendered.jpg" width="260"><br>**5. Translate + render** — the OCR'd text is translated ("Great, it's a new beginning!" → "Harika, yeni bir başlangıç!") and drawn back into the cleaned bubble, matching size/position. | This is the image that lands in `output/`. Steps 4 and 5 happen so fast you'll only ever see the raw page and the final result in normal use — these in-between shots exist purely to show what the pipeline does under the hood. |
+| Input and safe recut | Read local/R2 images; find cuts outside padded text and balloon regions; verify retained pixels. |
+| Detection and OCR | Locate balloons/text through the configured API; require complete crop IDs and original-script metadata. |
+| Translation | Translate chapter batches with context, then check missing responses and consistency. |
+| Cleanup | Build the initial segmentation mask and fill with CV2. Use proven flat balloon/caption interiors where safe. |
+| Typesetting | Match source lettering, fit text inside the balloon, separate joined lobes and check overlap/borders. |
+| Save and publish | Write images; in queue mode upload, record pages, verify public URLs and then optionally remove raw sources. |
 
-## Requirements
+The current Latin-dialogue profile preserves Korean/CJK sound effects instead of inventing Latin translations. Large suspicious readings outside balloons receive an independent source check. Uncertain or incomplete OCR fails the page rather than silently losing dialogue.
 
-- Python 3.12
-- An API key for whichever translator/OCR engine you select (e.g.
-  `OPENAI_API_KEY` for GPT, `DASHSCOPE_API_KEY` for Qwen)
-- Optional: Cloudflare R2 (or any S3-compatible) bucket, if not running
-  fully local
-- Only for worker mode: a Postgres database matching the schema described
-  in [Worker mode / database integration](#worker-mode--database-integration)
+## Recovery and quality
 
-Model weights (detector, OCR, inpainting) are downloaded automatically on
-first use from their public hosts — nothing to download manually.
+- **Resume completed stages.** Source hashes, relevant code and settings identify checkpoints. Changed code cannot silently reuse an old bad output.
+- **Keep the source on failure.** Failed OCR, uploads or inconclusive publication checks retain raw assets.
+- **Separate network and CPU work.** `BATCH_OCR_WORKERS`, `BATCH_WORKERS` and `R2_UPLOAD_WORKERS` control different pools.
+- **Inspect actual progress.** Per-job logs, heartbeats and stage timings distinguish a live process from useful work.
+- **Review the image.** Automated QA flags are diagnostics, not a substitute for checking real chapter pages.
 
-## Quick start (PC / local use, no database)
+## Costs: what is actually measured?
 
-This is the easiest way to use the project — no cloud account, no database.
+There is no reliable fixed “price per chapter”. Page height, dialogue density, model, retries, detection windows, source verification and cache hits all change usage.
 
-```bash
-pip install -r requirements.txt
-cp .env.example .env   # fill in OPENAI_API_KEY at minimum
+### A recorded translation run
+
+| Metric | Recorded value |
+|---|---:|
+| Translation requests | 55 |
+| Input tokens | 118,749 |
+| Output tokens | 12,216 |
+| Cached input tokens reported | 0 |
+| Billing mode | Subscription |
+| Estimated token charge recorded by the app | $0.00 |
+
+This is a **translation-only usage aggregate**, not the complete chapter bill. Subscription mode deliberately records no per-token API charge. Subscription fees, quotas, gateway fees, detection, OCR, source checks, storage and compute still need separate accounting. The model route in this sample differs from the template's GPT-5.4-mini setting. See the [sanitized measurement snapshot](docs/measurements.json).
+
+### A transparent API calculation
+
+For a direct GPT-5.4-mini API request, the published standard rates checked on **2026-11-07** are $0.75 / million input tokens, $0.075 / million cached input tokens and $4.50 / million output tokens. [Official model pricing](https://developers.openai.com/api/docs/models/gpt-5.4-mini).
+
+```text
+translation USD = ((input − cached) × input_rate
+                   + cached × cached_rate
+                   + output × output_rate) / 1,000,000
 ```
 
-Drop your raw page images into the `input/` folder (already exists in the
-repo, empty), then run:
+**Illustration, not a measured chapter:** 10,000 uncached input + 2,000 output tokens would cost **$0.0165 for translation alone** at those rates. Another model or gateway needs its own rates. Detection/OCR/vision calls, retries, R2 requests/storage and hosting are additional; local cleanup has no model API charge but uses your machine.
 
-```bash
-python scripts/local_batch.py
+Configure `OPENAI_USAGE_BILLING_MODE` and explicit price overrides in [.env.example](.env.example). Unknown/custom model routes should not rely on inferred prices. `LOG_OPENAI_USAGE=true` logs translation usage to `openai_usage_events` when a database is configured. `QWEN_GRID_OCR_USAGE_PATH` and `BATCH_TRANSLATE_USAGE_PATH` provide additional usage files; these are diagnostics, not provider invoices or complete billing for every auxiliary request.
+
+## Speed: a recovery example, not a promise
+
+One earlier completed recovery run processed **257 raw images → 169 recut pieces → 167 published images**, verified all 167 public URLs and took **996 seconds (16 min 36 sec)** in the worker. Existing caches were used; this run predates the latest layout fixes. It is neither a cold-start benchmark nor a throughput guarantee for the current code.
+
+Measure your own job:
+
+```powershell
+python scripts/job_timing_report.py YOUR_JOB_ID
 ```
 
-By default this reads everything in `input/`, translates it according to
-your `.env` settings, and writes translated pages into `output/`. You can
-point at different folders with `--input`/`--output`, or pass
-`--zip-output` (or set `ZIP_OUTPUT=true` in `.env`) to also produce an
-`output.zip` next to the output folder once the run finishes — handy if you
-just want one file to grab or share.
+Logs live in `work/job-logs/`, trace summaries in `work/job-timings/`. Parallel/nested stage durations overlap and must not be added as if they were sequential. See [timing documentation](PIPELINE_TIMING.md).
 
-Re-running with the same `output/` folder skips pages that were already
-translated, so you can stop and resume a large batch safely.
+## Run locally
 
-## Worker mode / database integration
+Requirements: **Python 3.12**, API access for the selected detection/OCR/translation route, and model downloads on first use. The supported CPU profile needs no CUDA GPU. PySide6 renders text offscreen; there is no desktop editor to operate.
 
-`scripts/worker.py` is **not** meant to be run as-is against an empty
-database — it's the exact code the original author runs in production,
-wired to their own site's existing `Manga`/`Chapter` tables. Treat it as a
-reference implementation to adapt, not a turnkey component.
+```powershell
+python -m venv .venv
+.venv/Scripts/python.exe -m pip install -r requirements.txt
+Copy-Item .env.example .env
+```
 
-**Important: the worker never creates jobs by itself.** It only *polls* a
-queue table and processes whatever is already sitting in it with
-`status = 'QUEUED'`. Something else — your own site/admin panel — has to
-`INSERT` a row into that queue (e.g. the moment an admin uploads a new raw
-chapter). Wiring that part up is on you; it's straightforward enough that
-an AI coding assistant (Claude, GPT, etc.) can write it for you once it has
-this section and `scripts/worker.py` as context — just point it at this
-file and the table list below and ask it to generate the matching
-migration + the "create a job" code for your own backend/admin panel.
+Edit `.env` before running:
 
-### How the queue loop actually behaves
+- Set `OPENAI_API_KEY` and a vision-capable `OPENAI_MODEL`; use `OPENAI_BASE_URL` for an OpenAI-compatible provider.
+- Set `SOURCE_LANG` / `TARGET_LANG`. The reviewed profile is English → Turkish.
+- For folder-only use, clear the template's placeholder `DATABASE_URL` and set `LOG_OPENAI_USAGE=false`.
+- Keep the CV2/API profile below. Detection, OCR and vision requests send relevant image data to your configured provider.
 
-Optional warm mode: `WORKER_INPROCESS=true` runs chapters inside one long-lived child (`scripts/warm_runner.py`) so the detector, YOLO and LaMa stay loaded between jobs (saves the ~30 s model load per chapter); it recycles after `WORKER_RECYCLE_JOBS` jobs / `WORKER_RECYCLE_RSS_MB` / `WORKER_RECYCLE_VRAM_MB`, frees the GPU after `WORKER_MODEL_IDLE_SECONDS` idle, and `WORKER_DRY_RUN=<dir>` runs fake jobs offline for testing (see `.env.example`).
+Put pages in `input/`, then run:
 
-Every `WORKER_IDLE_SECONDS` (default 15s), the worker:
+```powershell
+.venv/Scripts/python.exe scripts/local_batch.py --input input --output output
+```
 
-1. Claims one `QUEUED` row from `pipeline_jobs`, ordered by `priority` then
-   `created_at` (`FOR UPDATE SKIP LOCKED`, so you can safely run more than
-   one worker process against the same queue without double-processing a
-   job).
-2. Looks at `job_type` and does one of:
-   - `TRANSLATE_PROJECT` — finds every untranslated chapter for a manga and
-     splits the work into one `TRANSLATE_CHAPTER` job per chapter (so
-     multiple workers can pick them up in parallel), then exits.
-   - `TRANSLATE_CHAPTER` / `RETRANSLATE_CHAPTER` — translates a single
-     chapter: looks up the chapter/manga row, finds the raw images' R2
-     prefix, runs `local_batch.py` against it exactly like Scenario A
-     above, then writes the results back to the database (see below).
-   - `CLEANUP_RAW_CHAPTER` — deletes the raw (untranslated) images for a
-     chapter from R2 once you no longer need them.
-3. Marks the job `DONE` or `FAILED` (with an `error_message`), or
-   `CANCELLED` if your app set its status to `CANCEL_REQUESTED` while it
-   was running.
+Read translated images from `output/`. `--output-format png` changes format; `--zip-output` creates an archive. For macOS/Linux, activate the virtual environment, use `cp .env.example .env`, and run the same Python entry point.
 
-A background tick also reaps jobs stuck in `RUNNING` for >20 minutes
-(crashed worker), expires stale `CANCEL_REQUESTED` rows, and deletes old
-finished jobs after a few days — so the queue table doesn't grow forever.
+### Current template profile
 
-### What a finished chapter translation writes back
-
-Once a chapter's pages are translated and uploaded to R2, the worker:
-
-- Inserts one `chapter_assets` row per page (`asset_type = 'TRANSLATED'`)
-  with the R2 object key, public URL, and size.
-- Inserts one `"ChapterPage"` row per page with the image URL plus
-  SEO `altText`/`titleText` built from `SEO_TITLE_TEMPLATE` (see
-  [Branding and SEO](#branding-and-seo-are-fully-overridable)).
-- Sets `"Chapter"."publishStatus"` and `"Manga"."publishStatus"` to
-  `PUBLISHED`, and bumps `"Manga"."latestChapterNo"`.
-- Optionally deletes the raw assets, if the chapter/manga is configured to
-  auto-delete after translation.
-- Optionally calls a webhook (`WEB_INTERNAL_URL` + `INTERNAL_API_KEY`) so
-  your frontend can invalidate its cache for that manga.
-
-### Tables you need
-
-| Table | Purpose | Key columns `worker.py` reads/writes |
+| Setting | Value | Purpose |
 |---|---|---|
-| `pipeline_jobs` | The queue itself | `id`, `manga_id`, `chapter_id`, `job_type` (`TRANSLATE_PROJECT`/`TRANSLATE_CHAPTER`/`RETRANSLATE_CHAPTER`/`CLEANUP_RAW_CHAPTER`), `status` (`QUEUED`/`RUNNING`/`DONE`/`FAILED`/`CANCEL_REQUESTED`/`CANCELLED`), `priority`, `payload` (jsonb), `progress`, `error_message`, `created_at`, `updated_at`, `started_at`, `finished_at` |
-| `"Manga"` / `"Chapter"` | Your existing content tables | manga: `id`, `slug`, `publishStatus`, `publishedAt`, `latestChapterNo`; chapter: `id`, `mangaId`, `number`, `slug`, `publishStatus`, `publishedAt` |
-| `chapter_assets` | Tracks uploaded image batches per chapter | `id`, `chapter_id`, `page_index`, `asset_type` (`RAW`/`TRANSLATED`), `storage_provider`, `bucket`, `object_key`, `public_url`, `mime_type`, `size_bytes` |
-| `"ChapterPage"` | Per-page rows your frontend reads to render a chapter | `id`, `"chapterId"`, `"pageIndex"`, `"imageUrl"`, `"altText"`, `"titleText"`, `"r2Key"` |
-| `worker_heartbeats` | Lets you monitor that a worker process is alive | `worker_id`, `last_seen_at`, `jobs_processed` |
-| `project_automations` (optional) | Per-manga automation settings | `manga_id`, `auto_delete_raw_after_translate` — if this table/row doesn't exist, the worker defaults to deleting raw assets after translation |
+| `DETECTION_BACKEND` | `api` | Remote region detection; API failure has no silent local fallback. |
+| `OCR` | `9Router Vision Grid OCR` | Vision OCR through an OpenAI-compatible endpoint. |
+| `OPENAI_MODEL` | `gpt-5.4-mini` | Template model; deployment overrides may choose another model. |
+| `CLEAN_ENGINE` / `CLEAN_POSTPROCESS` | `cv2` / `false` | CV2 fill; no neural inpainting or post-clean rescan loop. |
+| `BATCH_WORKERS` / `BATCH_WORKERS_AUTO` | `1` / `false` | Bound heavy local work. |
+| `BATCH_OCR_WORKERS` / `OCR_CONCURRENCY` | `2` / `2` | Network-bound page pool / OCR request limit. |
+| `DETECTION_API_CONCURRENCY` | `4` | Remote detection capacity. |
+| `R2_UPLOAD_WORKERS` | `4` | Ordered uploads through a shared client. |
+| `PIPELINE_KEEP_CHECKPOINTS` | `true` | Keep recovery files after success. |
 
-Read through `scripts/worker.py` top to bottom — every SQL statement names
-the exact columns it expects — and adjust the queries to match your schema
-before pointing `DATABASE_URL` at a real database. The piece you still need
-to build yourself is whatever inserts `TRANSLATE_CHAPTER`/`TRANSLATE_PROJECT`
-rows into `pipeline_jobs` when you actually want something translated.
+Old LaMa/hybrid cleaner settings are unsupported. GPU availability does not turn CV2 fill into neural inpainting. See [the CPU profile](CV2-CLEANER.md) and [all environment settings](.env.example), including fonts, branding, SFX policy and storage.
 
-```bash
-pip install -r requirements.txt
-cp .env.example .env   # fill in DATABASE_URL, storage backend, etc.
+## Queue worker and deployment
 
-python scripts/worker.py
+```powershell
+.venv/Scripts/python.exe scripts/worker.py
 ```
 
-### Docker
+Worker mode needs the expected PostgreSQL tables, storage credentials and externally created jobs. The repository does not create your website's database or admin panel. It handles `TRANSLATE_PROJECT`, `TRANSLATE_CHAPTER`, `RETRANSLATE_CHAPTER` and `CLEANUP_RAW_CHAPTER`. See the [database/publication contract](docs/worker-integration.md).
 
-```bash
-docker build -t manga-translation .
-docker run --env-file .env manga-translation
+For CPU Docker deployment:
+
+```sh
+docker compose --env-file .env.server -f compose.cpu.yml build
+docker compose --env-file .env.server -f compose.cpu.yml up -d
 ```
 
-The image runs Qt in offscreen mode (`QT_QPA_PLATFORM=offscreen`), so no
-display server is required.
+Preserve secrets and the persistent work volume; let an active chapter finish before deployment. Deployment details and verification limits are in [CV2-CLEANER.md](CV2-CLEANER.md).
 
-## Configuration
+## Development and verification
 
-All configuration lives in environment variables — see `.env.example` for
-the full list with defaults and comments. The major groups:
-
-| Group | Variables |
-|---|---|
-| Database | `DATABASE_URL` |
-| Storage backend | `STORAGE_BACKEND` (`r2` or `local`), `LOCAL_STORAGE_ROOT`, `R2_*` |
-| Branding / SEO | `SEO_SITE_NAME`, `SEO_LANGUAGE_PHRASE`, `SEO_TITLE_TEMPLATE`, `SEO_IMAGE_BRAND`, `SEO_FILENAME_LANGUAGE_SLUG`, `SEO_FILENAME_TEMPLATE` |
-| Languages | `SOURCE_LANG`, `TARGET_LANG` |
-| Engine selection | `DETECTOR`, `OCR`, `TRANSLATOR`, `OPENAI_API_KEY`, `OPENAI_MODEL` |
-| Font / rendering | `FONT_FAMILY`, `FONT_FILE`, `MIN_FONT_SIZE`, `MAX_FONT_SIZE`, `UPPERCASE`, `NO_OUTLINE` |
-| Output | `OUTPUT_SUFFIX`, `OUTPUT_FORMAT`, `IMAGE_QUALITY`, `WEBP_MAX_DIMENSION` |
-| Cleanup tuning | `BUBBLE_*`, `LIGHT_*`, `CROP_CLEAN_*`, `PANEL_SKIP_*` heuristics |
-
-### Branding and SEO are fully overridable
-
-Both the alt-text written to your database and the uploaded image filenames
-are built from templates, not hardcoded strings:
-
-- `seo_alt()` in `worker.py` formats `SEO_TITLE_TEMPLATE` with
-  `{site_name}`, `{language_phrase}`, `{slug}`, `{number}`, `{page}`.
-- `seo_upload_name()` in `local_batch.py` formats `SEO_FILENAME_TEMPLATE`
-  with `{brand}`, `{language_slug}`, `{series}`, `{chapter}`, `{page}`,
-  `{ext}`.
-
-Change `SEO_SITE_NAME`/`SEO_LANGUAGE_PHRASE`/`SEO_IMAGE_BRAND` (or the
-templates themselves) to rebrand for a different site or language without
-touching code.
-
-### Storage backends
-
-- `STORAGE_BACKEND=r2` (default): reads/writes through Cloudflare R2 or any
-  S3-compatible bucket, configured via `R2_*` variables. This is required
-  for worker mode, since the worker needs public URLs to write into the
-  database.
-- `STORAGE_BACKEND=local`: reads/writes plain files under
-  `LOCAL_STORAGE_ROOT`. Works with `local_batch.py` for fully offline runs;
-  not used by `worker.py`'s database write-back path.
-
-### Fonts
-
-A font is bundled at `assets/Comic Geek.ttf` and used by default
-(`FONT_FILE` in `.env.example`). Swap in your own `.ttf`/`.otf` for a
-different look, or clear `FONT_FILE` and set `FONT_FAMILY` to a font already
-installed on the host/container. Offscreen Qt has no real system-font
-fallback, so leaving `FONT_FILE` empty without a usable `FONT_FAMILY`
-installed will render non-ASCII text as missing-glyph boxes.
-
-
-#### Placing fonts
-
-The extra comic fonts used by the style-aware renderer are not committed, because their redistribution licences are unknown (`FONT KLASÖR/` is git-ignored). Put your own `.ttf`/`.otf` files in a `FONT KLASÖR/` folder at the project root; without it the renderer falls back to `assets/Comic Geek.ttf` or the host font.
-
-## GPU
-
-The GPU is **on by default when CUDA is available** and falls back to CPU otherwise (`USE_GPU=auto`). It covers the RT-DETR detector (`USE_GPU` / `--gpu` / `--no-gpu`), and the YOLO text segmenter and LaMa inpainting (`SEG_DEVICE` / `LAMA_DEVICE`, `auto|cuda|cpu`, default `auto`). `USE_GPU=false` or `--no-gpu` turns everything to CPU (unless `SEG_DEVICE`/`LAMA_DEVICE` are set explicitly); `USE_GPU=true` forces it on but still falls back to CPU when CUDA is missing. OCR and translation are remote API calls and do not use the local GPU. `requirements.txt` is the CPU baseline. To switch a venv to GPU:
-
-```
-pip uninstall -y onnxruntime torch torchvision
-pip install -r requirements-gpu.txt
+```powershell
+.venv/Scripts/python.exe -m unittest discover -s tests
 ```
 
-This installs CUDA 13 builds of torch/torchvision and `onnxruntime-gpu` (needs an NVIDIA driver with CUDA 13 support). Never keep `onnxruntime` and `onnxruntime-gpu` installed together. At startup the log shows `[BATCH] detector device: cuda`, `[clean] segmenter device: cuda` and `[clean] LaMa device: cuda` when the GPU is used. The TensorRT execution provider is not used unless `USE_TENSORRT=true`.
+The local suite passed **573 tests on 2026-11-07**. That snapshot includes real-image regressions for joined balloons, font sizing, spiky paragraphs and black captions, plus OCR completeness, recovery and upload checks. Local tests do not prove a live provider call or production deployment.
 
-## Defaults
-
-Out of the box `local_batch.py` and the worker use:
-
-| Setting | Default | Notes |
-|---|---|---|
-| `USE_GPU` | `auto` | GPU when CUDA is available, else CPU; `--no-gpu` to opt out |
-| `OUTPUT_FORMAT` | `webp` | quality `IMAGE_QUALITY=95` (about 230 KB per 800x1600 page vs about 1.2 MB PNG); the worker always uploads webp |
-| `OUTPUT_SUFFIX` | `_translated` | may be empty: `--suffix=` or `OUTPUT_SUFFIX=` (a bare `--suffix ""` is dropped by some shells) |
-| `BATCH_PIPELINE` | `true` | 3-phase batch pipeline |
-| `BATCH_WORKERS` | `3` | thread-pool base for detect+OCR and clean phases |
-| `BATCH_WORKERS_AUTO` / `BATCH_WORKERS_MAX` | `true` / `4` | with auto on, the base goes +1 when the CPU is idle (<35%) and -1 when busy (>80%), never above `BATCH_WORKERS_MAX`; the log shows `[CPU n%] worker: 3 -> 4`. Set `BATCH_WORKERS_AUTO=false` for exactly `BATCH_WORKERS` |
-| `BATCH_TRANSLATE_CONCURRENCY` | `3` | parallel GPT translate calls (each call is 3 pages); `1` = sequential; drops to 1 while the gateway breaker is open |
-| `GATEWAY_CACHE` | `true` | on-disk answer cache (`GATEWAY_CACHE_DIR`, default `work/cache/gateway`, `GATEWAY_CACHE_TTL_DAYS` 30) for OCR / translate / vision calls keyed by the exact request; retries and re-runs of the same pages send no request and spend no tokens. Only accepted answers are stored; no secrets |
-| `OCR_CONCURRENCY` | `2` | process-wide cap of OCR requests in flight (independent of `BATCH_WORKERS`) |
-| `GATEWAY_BACKOFFS` | `3,8,20` | retry delays (s, with jitter) for 5xx/429/timeouts on OCR, translate and vision calls; 3 consecutive failures open a shared 20 s -> 60 s cool-down |
-| `OCR_MAX_FAIL_RATIO` | `0.0` | share of pages that may fail OCR/translation; above it the job exits 3 (`FAILED: OCR failed on N pages: [...]`) before publishing, raw pages kept, job retried. Raw is never deleted if any page failed |
-| `PASSTHROUGH_SUSPECT_RATIO` | `0.5` | fails the job when more than this share of pages with detected text bubbles ended with 0 blocks (OCR returned nothing) |
-| `WATERMARK_PATTERNS` extra | | built-in rules also cover scan-group credit strips without a domain (`XXXSCANS`, `... SCANS TEAM`, `PRODUCE BY ... TEAM`); matching blocks are treated as ads (not translated) and erased whole |
-| `WATERMARK_POLICY` | `clean` | `clean` erases competitor watermarks/banners whole (never the site's own brand); `keep` leaves them untouched |
-| `CLEAN_FILL_QA` | `true` | after LaMa, every filled component is measured against its untouched ring; objectively bad fills (dithered blue "static", pink/green speckle, grey stipple) get a calmer fill (tuning: `CLEAN_FILL_QA_NOISE/_NOISE_ABS/_CHROMA/_CHROMA_ABS/_BLOBS/_BLOB_RATIO/_MIN_AREA/_RING`) |
-| `CLEAN_RESIDUAL_PASS` | `true` | segments the cleaned page again and cleans text-like leftovers near cleaned blocks (small / rotated / UI text); `CLEAN_RESIDUAL_PASSES` (max 2), `_NEAR`, `_CONF`, `_MAX_FRAC`, `_MIN_CONTRAST`, `_GROW` |
-| `CLEAN_FRINGE_PASS` | `true` | also removes small cut-off glyph pieces next to the cleaned area that sit on a flat background (`CLEAN_FRINGE_REACH`, `_MAX`, `_CONTRAST`) |
-| `CLEAN_OUTLINE_GLYPHS` | `true` | letters glued to a balloon outline are erased (the outline is fitted as a circular arc / cubic, only ink off the curve is removed) and the outline is redrawn along the fitted curve over the repaired stretch |
-| `CLEAN_BOX_LEFTOVERS` | `true` | letter-sized ink left inside a translated block's box within `CLEAN_BOX_REACH` (40) px of the cleaned area is removed (`CLEAN_BOX_CONTRAST` 30): low-contrast specks / ghosts |
-| `CLEAN_RESTORE_UNTOUCHED` | `true` | an untranslated block (kept as drawn) that a neighbour's mask half-erased gets its original letters back instead of fragments |
-| `CLEAN_FLAT_SNAP` | `true` | removes the faint ghost of the old text inside flat balloons: filled pixels snap to the ring's flat colour(s) (`CLEAN_FLAT_TOL`, `_COVER`, `_HALO`) |
-| `WATERMARK_PLATES`, `CLEAN_SFX_REVERT`, `CLEAN_FLAT_GRADIENT_GUARD`, `CLEAN_OUTLINE_LINE_CHECK` | `true` | audit guards: chapter watermark plates learned from their repetition and erased whole (logo included); half-erased untranslated SFX restored; no flat snap / blurred QA fill on gradients or next to dark art; the outline pass only acts on clean single outlines inside translated boxes (see `.env.example`) |
-| `RENDER_V2`, `RENDER_STYLE_TAGS` | `true` | balloon- and style-aware typesetting |
-| `RENDER_BALLOON_UNIFY` | `true` | blocks sharing one balloon use one font and one size band (`RENDER_BALLOON_BAND`, default `0.12` = +-12% of the balloon median; blocks whose source cap height differs by more than `RENDER_EMPHASIS_RATIO`, default `1.4`, keep their size) and every line must lie inside the balloon interior; `false` = old per-block sizing |
-| `RENDER_MERGE_BALLOON` | `true` | a sentence the OCR split over several blocks of one balloon is laid out as one centred paragraph (separate speech, shouts/SFX and emphasis stay separate); also drops words repeated across the block boundary |
-| `RENDER_DEDUPE_TRANSLATIONS` | `true` | a block in the same balloon / overlapping another block whose translation is a substring or near-duplicate of the longer neighbour is not drawn again; back-to-back repeated phrases are collapsed |
-| `RENDER_GROUP_ROBUST` | `true` | tolerant balloon grouping: balloon boxes of different size that hold each other's text, or text boxes lying inside each other, share one balloon |
-| `RENDER_ABSORB_STRAYS` | `true` | a tiny 1-2 word block (clearly smaller source lettering) inside a balloon joins the balloon's main text instead of being drawn tiny |
-| `RENDER_MERGE_NARRATION` | `true` | stacked narration/caption lines of one box become one paragraph |
-| `RENDER_HARD_GUARD` | `true` | every balloon block keeps all line boxes (+2% clearance) inside the interior mask, shrinking the block (and so the balloon band) if needed |
-| `RENDER_OUTLINE_MARGIN` | `0.05` | clearance between each line and the balloon outline (share of balloon width, min 8 px, 0 = off); `RENDER_LEAK_ELLIPSE` (`true`) uses the inscribed ellipse for dashed/open outlines, `RENDER_TILT_FIT` (`true`) keeps tilted text inside its box; QA: `scripts/replay_chapter.py fit` |
-| `BLOCK_CONTAINMENT_PRUNE`, `BLOCK_CONTAINMENT_RATIO`, `BLOCK_TEXT_COVER` | `true`, `0.6`, `0.8` | before translation: a block >= 60% inside another block whose OCR words (>= 80%) the other already contains is dropped (the same text read twice at another scale; saves translation tokens) |
-| `RENDER_RESOLVE_OVERLAP` | `true` | rendered text boxes that overlap are pushed apart / shrunk; halo-text is drawn under other blocks |
-| `RENDER_MERGE_OCR_ECHO` | `true` | stacked OCR windows whose texts overlap at the seam (one paragraph read in overlapping pieces) become ONE paragraph, repeated leading words dropped |
-| `RENDER_STRIP_NEIGHBOR_LINES` | `true` | a piece cut from a merged UI block that repeats a neighbouring block's whole translation (title detected twice) is not drawn again |
-| `RENDER_STRICT_FIT`, `RENDER_STRICT_FLOOR` | `true`, `14` | crowded sign/phone/narration blocks (touching another block or cut from a merged OCR block) stay inside their OWN original box: shrink only, no growth, never pushed into neighbours; below the floor size they fall back to the normal fit |
-| `RENDER_TILT_FALLBACK` | `true` | diagonal source text stays diagonal: the tilt is read from the original ink when the cleaned-page mask gives none |
-| `RENDER_TINY_PX` | `14` | balloon text that ends below this size (at 800 px width) retries on its original text box inside the balloon box (`0` disables) |
-| `RENDER_PAGE_FONT_ANCHOR` (+ `RENDER_SHOUT_DEMOTE`, `FONT_ITALIC_MIN_SLANT`, `RENDER_SIGN_STRICT`, `RENDER_SPLIT_ALIGN`, `RENDER_FIRST_PERSON_FIX` ...) | `true` | visual-audit fixes: one font per voice per page, 'shout' only with `!` + bigger letters, thought in the speech font, italic only above slant 0.17, hyphen-free rewrap, '...' balloons kept, printed signs stay on their plate, merged news blocks mapped per row, OCR-dropped 'I' -> 1st-person verb |
-| `RENDER_OCR_FRAGMENT_SKIP` | `true` | an OCR window that starts with the cut tail of a word still counts as an echo of the previous window (merged into one paragraph) |
-| `RENDER_GROUP_NESTED` | `true` | a thin "balloon" (<= 35% as tall) inside another balloon box is the same balloon (text written over the rim) |
-| `RENDER_ABSORB_RIM` | `true` | a short block whose source lettering sits on the balloon outline joins the balloon's main text |
-| `RENDER_ABSORB_TAIL` | `true` | the last 1-2 words of an unfinished sentence, right below it, join the balloon's main text |
-| `RENDER_MERGE_SHOUT` | `true` | blocks of one burst (shout) balloon read as one paragraph (shout only, never mixed with speech) |
-| `RENDER_UNIFY_REPEAT_COLORS` | `true` | the same lettering printed twice on a page (repeated sound effect) gets one typeface and colour scheme |
-| `RENDER_TINY_KEEP` | `0.8` | the tiny-size retry also fires below this share of the source size (was fixed 0.6) |
-| `RENDER_SPIKY_GUARD` | `true` | a spiky / non-convex balloon interior (low convex-hull ratio) is trusted for the hard line-inside check, so lettering cannot cross its outline (never shrunk below 70%) |
-| `LIGHT_RENDER_CLEAR_PAD_X`, `LIGHT_RENDER_CLEAR_PAD_Y` | `16`, `10` | padding of the free-text white wipe around a block's box |
-| `LIGHT_RENDER_CLEAR_LOCAL_BG`, `LIGHT_RENDER_CLEAR_MAX_STD`, `LIGHT_RENDER_CLEAR_BG_SIGMA` | `true`, `22`, `18` | the wipe repaints with the local backdrop colour (follows gradients, no grey rectangle), skips non-plain zones and never paints over long thin lines / big dark areas; `LOCAL_BG=false` = old single-median fill |
-
-Set the matching environment variable to override any of them, for example `BATCH_PIPELINE=false`.
+`scripts/review_layout.py` replays saved OCR/translations offline by default. Its `--reocr` mode calls the configured provider; `--blocks-from` uses supplied expected blocks and must not be presented as automated OCR verification. Recovery data is stored in `work/resume/` (recut geometry) and `work/stages/` (processing generations); it can grow substantially.
 
 ## License
 
-See `LICENSE`.
-
-
-### Worker recovery and chapter boundaries
-
-R2 folder operations require a trailing slash: chapter 2 never reads/deletes chapters 20–29.
-Safe recutting prefers blank gutters; oversized illustration spans can use rows outside all
-padded detected text and balloon regions. Pixels are verified before OCR; protected spans
-that still exceed the hard limit fail without uploading or deleting source images.
-
-Each batch writes `work/job-logs/<job-id>.log`. The worker updates its heartbeat and stage
-progress every five seconds and stops the process tree after 600 seconds without new output
-(configurable with `TRANSLATION_STALL_SECONDS`). Cancellation also stops the batch tree.
-Account usage-limit errors persist their reset deadline in `work/gateway-quota.json`, pause
-job claiming and requeue the current job without consuming a retry. Jobs resume after reset.
-
-- Render safety net (`RENDER_SAFETY_NET`): an OCR block with a translation that never reaches the page is logged as `[render-miss]` and rendered anyway; the white wipe keeps neighbouring balloon outlines (`LIGHT_RENDER_CLEAR_PROTECT_OUTLINES`); one-word balloons are not hyphenated (`RENDER_SINGLE_WORD_HYPHEN_PREF`). `replay_chapter.py run/render/styles --log JOB.log` re-applies the job's page crops. `replay_chapter.py fit` also prints a per-page QA table (untranslated, render-miss, near-outline, overflow, size spread, overlap, tiny, page size band) and writes `qa.csv`.
+Code: [Apache-2.0](LICENSE). Model weights, fonts and example artwork may have separate terms.
