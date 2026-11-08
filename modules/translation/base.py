@@ -179,7 +179,7 @@ class LLMTranslation(TranslationEngine):
                 "(discord.gg/xxx, /AbCdEf123), a QR/scan instruction, or it pitches reading chapters elsewhere "
                 "('read/continue at...', 'premium/advance chapters', 'more at our site', 'join/support us'). "
                 "THIS APPLIES EVEN IF the text is phrased like in-story dialogue - real comic dialogue NEVER "
-                f"contains real-world website domains or invite links. '{own_brand or 'TrendManga'}' is our OWN brand; "
+                f"contains real-world website domains or invite links. '{own_brand or 'MangaKoru'}' is our OWN brand; "
                 "never mark our own brand as an ad."
             )
 

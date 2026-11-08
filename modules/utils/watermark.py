@@ -26,7 +26,7 @@ WATERMARK_PATTERNS = (
 
 
 def own_brand_keys() -> list[str]:
-    keys = {os.environ.get("SEO_SITE_NAME", "TrendManga"), os.environ.get("SEO_IMAGE_BRAND", ""), "TrendManga"}
+    keys = {os.environ.get("SEO_SITE_NAME", "MangaKoru"), os.environ.get("SEO_IMAGE_BRAND", ""), "MangaKoru", "mangakoru.lol", "TrendManga"}
     return [re.sub(r"\s+", "", k).lower() for k in keys if k.strip()]
 
 

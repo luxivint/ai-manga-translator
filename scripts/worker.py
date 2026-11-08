@@ -439,7 +439,7 @@ SEO_TITLE_TEMPLATE = os.environ.get(
     "SEO_TITLE_TEMPLATE",
     "{site_name} {language_phrase} {slug} bÃ¶lÃ¼m {number} sayfa {page}",
 )
-SEO_SITE_NAME = os.environ.get("SEO_SITE_NAME", "TrendManga")
+SEO_SITE_NAME = "MangaKoru"
 SEO_LANGUAGE_PHRASE = os.environ.get("SEO_LANGUAGE_PHRASE", "TÃ¼rkÃ§e manga oku")
 
 
@@ -447,10 +447,13 @@ def seo_alt(manga_slug: str, number, page_index: int) -> str:
     """Build the image alt/title text used for SEO. Fully driven by env vars
     (SEO_SITE_NAME, SEO_LANGUAGE_PHRASE, SEO_TITLE_TEMPLATE) so deployments can
     rebrand without touching code."""
-    number_text = str(number).rstrip("0").rstrip(".")
-    return SEO_TITLE_TEMPLATE.format(
-        site_name=SEO_SITE_NAME,
-        language_phrase=SEO_LANGUAGE_PHRASE,
+    number_text = str(number)
+    if "." in number_text:
+        number_text = number_text.rstrip("0").rstrip(".")
+    return os.environ.get("SEO_TITLE_TEMPLATE", "{site_name} | {slug} Bölüm {number}, sayfa {page} — {language_phrase} | {site_url}").format(
+        site_name=os.environ.get("SEO_SITE_NAME", SEO_SITE_NAME),
+        site_url=os.environ.get("SEO_SITE_URL", "https://mangakoru.lol").rstrip("/"),
+        language_phrase=os.environ.get("SEO_LANGUAGE_PHRASE", "Türkçe manga oku"),
         slug=manga_slug,
         number=number_text,
         page=page_index,

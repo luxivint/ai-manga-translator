@@ -2221,7 +2221,7 @@ def _batch_translate_all(page_results: list, args: argparse.Namespace) -> None:
     engine = Translator(main, args.source_lang, args.target_lang).engine
     if not hasattr(engine, "translate_keyed"):
         raise RuntimeError(f"batch translation needs an LLM engine, got {type(engine).__name__}")
-    own_brand = os.environ.get("SEO_SITE_NAME", "TrendManga")
+    own_brand = os.environ.get("SEO_SITE_NAME", "MangaKoru")
     use_images = os.environ.get("BATCH_TRANSLATE_IMAGES", "true").lower() == "true"
     pages_per_call = max(1, int(os.environ.get("BATCH_TRANSLATE_PAGES", "3")))
 
@@ -2323,7 +2323,7 @@ def _batch_translate_all(page_results: list, args: argparse.Namespace) -> None:
     # Güvenlik ağı: GPT bir reklamı kaçırsa bile, blok metninde açık bir
     # domain / URL / davet kodu varsa reklam say (kendi markamız hariç).
     # Gerçek çizgi roman diyaloğunda gerçek site adresleri geçmez.
-    own_key = os.environ.get("SEO_IMAGE_BRAND", os.environ.get("SEO_SITE_NAME", "trendmanga")).lower()
+    own_key = os.environ.get("SEO_IMAGE_BRAND", os.environ.get("SEO_SITE_NAME", "mangakoru")).lower()
 
     def _apply_results(pi: int, blocks: list, page_results_for_page: dict) -> None:
         for bi, blk in enumerate(blocks):
@@ -3077,7 +3077,7 @@ def seo_upload_name(prefix: str, page_number: int, extension: str) -> str:
     parts = normalize_key(prefix).split("/")
     series_slug = parts[-2] if len(parts) >= 2 else "manga"
     chapter_slug = parts[-1] if parts else "chapter"
-    brand = os.environ.get("SEO_IMAGE_BRAND", "trendmanga").strip().lower() or "trendmanga"
+    brand = os.environ.get("SEO_IMAGE_BRAND", "mangakoru").strip().lower() or "mangakoru"
     language_slug = os.environ.get("SEO_FILENAME_LANGUAGE_SLUG", "turkce-manga-oku").strip().lower()
     template = os.environ.get(
         "SEO_FILENAME_TEMPLATE",
