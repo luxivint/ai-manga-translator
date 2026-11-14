@@ -3096,7 +3096,11 @@ def seo_upload_name(prefix: str, page_number: int, extension: str) -> str:
 @trace.traced("storage.prepare_upload")
 def prepare_seo_upload_dir(output_dir: Path, out_prefix: str, work_dir: Path,
                            expected_stems: set[str] | None = None) -> Path:
-    seo_dir = work_dir / "seo-upload"
+    # Keep the full SEO filename but stage outside the long per-chapter path.
+    # Windows Python can raise FileNotFoundError when a copied path exceeds MAX_PATH.
+    # The chapter-specific digest prevents different chapters from sharing a folder.
+    work_id = hashlib.sha256(str(work_dir.resolve()).encode('utf-8')).hexdigest()[:24]
+    seo_dir = Path(tempfile.gettempdir()) / "trendmanga-upload" / work_id
     if seo_dir.exists():
         shutil.rmtree(seo_dir)
     seo_dir.mkdir(parents=True, exist_ok=True)
